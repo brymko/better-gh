@@ -65,11 +65,17 @@ access = "read-write"
 Listens on HTTPS with a self-signed cert. Each client gets a **proxy token** with its own scoped policy. Clients send the proxy token in the `Authorization` header.
 
 ```bash
-# Create a token scoped to one repo
+# On the proxy host: create a token scoped to one repo
 bgh-proxy token create --name ci-bot --default deny --repo my-org/my-repo=read
+# prints: bgh_xxxxxxxxxxxx
 
-# Client uses the printed secret
-curl -H "Authorization: token <secret>" https://localhost:7843/api/v3/repos/my-org/my-repo/pulls
+# On the client: trust the proxy's CA and authenticate
+cp ca.pem /usr/local/share/ca-certificates/bgh.crt && update-ca-certificates  # or add to keychain on macOS
+gh auth login --hostname localhost:7843 --with-token <<< "bgh_xxxxxxxxxxxx"
+
+# All gh commands now go through the proxy, policy-checked and audited:
+gh pr list -R my-org/my-repo
+gh issue list -R my-org/my-repo
 ```
 
 ## Policy specification
