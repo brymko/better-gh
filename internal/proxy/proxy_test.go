@@ -29,8 +29,28 @@ func mockGitHub() *httptest.Server {
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]any{"number": 42, "title": "created"})
 	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/runs", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "workflow_runs": []any{}})
+	})
+	mux.HandleFunc("POST /repos/{owner}/{repo}/issues", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{"number": 1, "title": "test"})
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{{"number": 1, "title": "test"}})
+	})
 	mux.HandleFunc("GET /user", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"login": "testuser"})
+	})
+	mux.HandleFunc("POST /user/repos", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]any{"name": "test"})
+	})
+	mux.HandleFunc("GET /gists", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]any{})
+	})
+	mux.HandleFunc("GET /search/repositories", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"total_count": 0, "items": []any{}})
 	})
 	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -444,6 +464,358 @@ func TestNodeCacheEnrichesMutation(t *testing.T) {
 
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("mutation with cached node ID should be allowed, got %d: %s", resp2.StatusCode, resp2Body)
+	}
+}
+
+func setupWithPerms(t *testing.T) *testEnv {
+	t.Helper()
+
+	mock := mockGitHub()
+	tmpDir := t.TempDir()
+	auditPath := filepath.Join(tmpDir, "audit.jsonl")
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("bgh-perm-test-%d.sock", os.Getpid()))
+
+	storePath := filepath.Join(tmpDir, "tokens.json")
+	tokenStore, err := store.Open(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pol := policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Org:      []policy.OrgRule{{Name: "allowed-org", Access: policy.AccessRead}},
+		Repo: []policy.RepoRule{
+			{
+				Name:   "allowed-org/rw-repo",
+				Access: policy.AccessRead,
+				Permissions: map[string]policy.Access{
+					"pulls":   policy.AccessReadWrite,
+					"actions": policy.AccessNone,
+				},
+			},
+		},
+	}
+	_, secret, err := tokenStore.Create("perm-token", pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	auditLogger := audit.NewLogger(auditPath)
+	client := &http.Client{Transport: &http.Transport{}}
+	nodeCache := nodecache.New(30 * time.Minute)
+
+	gheHandler := &Handler{
+		GithubToken: "fake-gh-token",
+		Store:       tokenStore,
+		Audit:       auditLogger,
+		AdminSecret: "admin-secret",
+		Client:      client,
+		Mode:        GHEMode,
+		UpstreamURL: mock.URL,
+		NodeCache:   nodeCache,
+	}
+
+	socketPol := &policy.Policy{
+		Defaults: policy.Defaults{
+			Mode: policy.ModeDeny,
+			Unscoped: map[string]policy.Access{
+				"user":   policy.AccessRead,
+				"search": policy.AccessRead,
+			},
+		},
+		Org:  []policy.OrgRule{{Name: "allowed-org", Access: policy.AccessRead}},
+		Repo: []policy.RepoRule{{Name: "allowed-org/rw-repo", Access: policy.AccessReadWrite}},
+	}
+
+	socketHandler := &Handler{
+		GithubToken:  "fake-gh-token",
+		Store:        tokenStore,
+		Audit:        auditLogger,
+		AdminSecret:  "admin-secret",
+		Client:       client,
+		Mode:         SocketMode,
+		SocketPolicy: socketPol,
+		UpstreamURL:  mock.URL,
+		NodeCache:    nodeCache,
+	}
+
+	gheServer := httptest.NewServer(gheHandler)
+
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socketServer := &http.Server{Handler: socketHandler}
+	go socketServer.Serve(ln)
+
+	t.Cleanup(func() {
+		gheServer.Close()
+		socketServer.Close()
+		mock.Close()
+		nodeCache.Stop()
+		os.Remove(socketPath)
+	})
+
+	return &testEnv{
+		gheServer:    gheServer,
+		socketServer: socketServer,
+		socketPath:   socketPath,
+		secret:       secret,
+		tmpDir:       tmpDir,
+		mockGH:       mock,
+		store:        tokenStore,
+		nodeCache:    nodeCache,
+	}
+}
+
+func TestGHE_RepoPermAllowsPullsWrite(t *testing.T) {
+	env := setupWithPerms(t)
+	client := gheClient(env.secret)
+
+	resp, err := client.Post(
+		env.gheServer.URL+"/api/v3/repos/allowed-org/rw-repo/pulls",
+		"application/json",
+		strings.NewReader(`{"title":"test"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("pulls=read-write should allow POST to /pulls")
+	}
+}
+
+func TestGHE_RepoPermBlocksActionsRead(t *testing.T) {
+	env := setupWithPerms(t)
+	client := gheClient(env.secret)
+
+	resp, err := client.Get(env.gheServer.URL + "/api/v3/repos/allowed-org/rw-repo/actions/runs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("actions=none should deny even GET, got %d", resp.StatusCode)
+	}
+}
+
+func TestGHE_RepoPermFallsBackForIssues(t *testing.T) {
+	env := setupWithPerms(t)
+	client := gheClient(env.secret)
+
+	resp, err := client.Post(
+		env.gheServer.URL+"/api/v3/repos/allowed-org/rw-repo/issues",
+		"application/json",
+		strings.NewReader(`{"title":"bug"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("issues not in permissions, base access=read should deny POST, got %d", resp.StatusCode)
+	}
+}
+
+func TestSocket_UnscopedUserReadAllowed(t *testing.T) {
+	env := setupWithPerms(t)
+	client := socketClient(env.socketPath)
+
+	resp, err := client.Get("http://localhost/user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("unscoped user=read should allow GET /user")
+	}
+}
+
+func TestSocket_UnscopedUserWriteDenied(t *testing.T) {
+	env := setupWithPerms(t)
+	client := socketClient(env.socketPath)
+
+	resp, err := client.Post("http://localhost/user/repos", "application/json", strings.NewReader(`{"name":"test"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("unscoped user=read should deny POST /user/repos, got %d", resp.StatusCode)
+	}
+}
+
+func TestSocket_UnscopedGistsDenied(t *testing.T) {
+	env := setupWithPerms(t)
+	client := socketClient(env.socketPath)
+
+	resp, err := client.Get("http://localhost/gists")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("gists not in unscoped map, should be denied, got %d", resp.StatusCode)
+	}
+}
+
+func TestSocket_UnscopedGraphQLViewerAllowed(t *testing.T) {
+	env := setupWithPerms(t)
+	client := socketClient(env.socketPath)
+
+	resp, err := client.Post(
+		"http://localhost/graphql",
+		"application/json",
+		strings.NewReader(`{"query":"query { viewer { login } }"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("unscoped user=read should allow viewer query")
+	}
+}
+
+func TestAuditEntryContainsResourceAndCategory(t *testing.T) {
+	env := setupWithPerms(t)
+	client := socketClient(env.socketPath)
+
+	client.Get("http://localhost/repos/allowed-org/rw-repo/pulls")
+	client.Get("http://localhost/user")
+
+	time.Sleep(100 * time.Millisecond)
+
+	auditPath := filepath.Join(env.tmpDir, "audit.jsonl")
+	data, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("reading audit log: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	foundResource := false
+	foundCategory := false
+	for _, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if r, ok := entry["resource"].(string); ok && r == "pulls" {
+			foundResource = true
+		}
+		if c, ok := entry["unscoped_category"].(string); ok && c == "user" {
+			foundCategory = true
+		}
+	}
+	if !foundResource {
+		t.Error("audit log missing resource=pulls entry")
+	}
+	if !foundCategory {
+		t.Error("audit log missing unscoped_category=user entry")
+	}
+}
+
+func TestGHE_OrgPermAllowsPullsWrite(t *testing.T) {
+	env := setup(t)
+
+	orgPermPol := policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Org: []policy.OrgRule{{
+			Name:   "allowed-org",
+			Access: policy.AccessRead,
+			Permissions: map[string]policy.Access{
+				"pulls": policy.AccessReadWrite,
+			},
+		}},
+	}
+	_, secret, err := env.store.Create("org-perm-token", orgPermPol)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := gheClient(secret)
+
+	resp, err := client.Post(
+		env.gheServer.URL+"/api/v3/repos/allowed-org/rw-repo/pulls",
+		"application/json",
+		strings.NewReader(`{"title":"test"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("org pulls=read-write should allow POST to /pulls")
+	}
+
+	resp2, err := client.Post(
+		env.gheServer.URL+"/api/v3/repos/allowed-org/rw-repo/issues",
+		"application/json",
+		strings.NewReader(`{"title":"bug"}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Fatalf("org issues should fall back to org access=read, deny POST, got %d", resp2.StatusCode)
+	}
+}
+
+func TestGHE_UnscopedInTokenPolicy(t *testing.T) {
+	env := setup(t)
+
+	unscopedPol := policy.Policy{
+		Defaults: policy.Defaults{
+			Mode: policy.ModeDeny,
+			Unscoped: map[string]policy.Access{
+				"search": policy.AccessRead,
+			},
+		},
+	}
+	_, secret, err := env.store.Create("unscoped-token", unscopedPol)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := gheClient(secret)
+
+	resp, err := client.Get(env.gheServer.URL + "/api/v3/search/repositories?q=test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("unscoped search=read in token policy should allow GET /search/repositories")
+	}
+
+	resp2, err := client.Get(env.gheServer.URL + "/api/v3/gists")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Fatalf("gists not in unscoped map, should be denied, got %d", resp2.StatusCode)
+	}
+}
+
+func TestGHE_GraphQLResourcePermissions(t *testing.T) {
+	env := setupWithPerms(t)
+	client := gheClient(env.secret)
+
+	queryBody := `{"query":"query { repository(owner: \"allowed-org\", name: \"rw-repo\") { pullRequests(first: 10) { nodes { title } } } }"}`
+	resp, err := client.Post(
+		env.gheServer.URL+"/api/graphql",
+		"application/json",
+		strings.NewReader(queryBody),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("GraphQL pullRequests query on repo with pulls=read-write should be allowed")
 	}
 }
 

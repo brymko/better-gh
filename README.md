@@ -47,7 +47,10 @@ Policy is loaded from `~/.config/bgh/policy.toml`:
 ```toml
 [defaults]
 mode = "deny"
-allow_unscoped_reads = true   # let /user/repos etc. through
+
+[defaults.unscoped]
+user = "read"       # let /user, viewer{} etc. through
+search = "read"     # allow search endpoints
 
 [[org]]
 name = "brymko"
@@ -87,11 +90,18 @@ Policy files use TOML. In socket mode, the policy is loaded from `~/.config/bgh/
 ```toml
 [defaults]
 mode = "deny"                    # "deny" or "allow"
-allow_unscoped_reads = true      # allow reads with no identifiable repo/org
+
+[defaults.unscoped]
+user = "read"                    # allow /user, viewer{} reads
+search = "read"                  # allow search endpoints
+gists = "read-write"             # allow gist reads and writes
 
 [[org]]
 name = "my-company"
 access = "read"                  # default for all repos in this org
+
+[org.permissions]
+pulls = "read-write"             # allow PR writes across org
 
 [[org]]
 name = "personal"
@@ -106,6 +116,14 @@ name = "my-company/deploy-infra"
 access = "none"                  # block completely, even reads
 
 [[repo]]
+name = "my-company/backend"
+access = "read"
+
+[repo.permissions]
+pulls = "read-write"             # allow PR writes on this repo
+actions = "none"                 # block actions even for reads
+
+[[repo]]
 name = "personal/dotfiles"
 access = "read-write"
 ```
@@ -115,7 +133,23 @@ access = "read-write"
 | Field | Values | Description |
 |---|---|---|
 | `mode` | `"deny"` (default), `"allow"` | Fallback decision when no rule matches. |
-| `allow_unscoped_reads` | `true`, `false` (default) | Allow unscoped read requests under deny-default. See [Unscoped requests](#unscoped-requests). Has no effect when `mode = "allow"`. |
+
+### `[defaults.unscoped]` section
+
+Controls access to endpoints with no identifiable repo or org, on a per-category basis. Each key is a category name and the value is an access level.
+
+| Category | REST endpoints | GraphQL |
+|---|---|---|
+| `user` | `/user`, `/user/repos`, `/user/orgs`, ... | `viewer { ... }` |
+| `search` | `/search/repositories`, `/search/issues`, ... | `search(query: ...) { ... }` (no `repo:` qualifier) |
+| `gists` | `/gists`, `/gists/{id}` | — |
+| `notifications` | `/notifications` | — |
+| `events` | `/events` | — |
+| `meta` | `/rate_limit`, `/feeds`, `/meta`, `/octocat`, `/zen`, `/emojis`, `/` | `rateLimit { ... }` |
+
+Categories not listed in `[defaults.unscoped]` fall through to `[defaults].mode`.
+
+This replaces the old `allow_unscoped_reads` boolean. To migrate: replace `allow_unscoped_reads = true` with a `[defaults.unscoped]` section listing the categories you want to allow.
 
 ### `[[org]]` rules
 
@@ -123,6 +157,7 @@ access = "read-write"
 |---|---|---|
 | `name` | string | Org login, e.g. `"my-company"`. Exact match only, no globs. |
 | `access` | `"none"`, `"read"`, `"read-write"` | Access granted to any repo in this org that doesn't have its own `[[repo]]` rule. |
+| `[org.permissions]` | map of resource → access | Per-resource overrides. See [Resource types](#resource-types). |
 
 Org matching uses the `owner` segment from REST paths (`/repos/{owner}/...`) or the `owner` argument from GraphQL `repository(owner:, name:)`. For org-scoped endpoints (`/orgs/{org}/...`), the org name is used directly.
 
@@ -132,6 +167,31 @@ Org matching uses the `owner` segment from REST paths (`/repos/{owner}/...`) or 
 |---|---|---|
 | `name` | string | Full `owner/repo` name, e.g. `"my-company/frontend"`. Exact match only. |
 | `access` | `"none"`, `"read"`, `"read-write"` | Access granted to this specific repo. Takes priority over `[[org]]` rules. |
+| `[repo.permissions]` | map of resource → access | Per-resource overrides. See [Resource types](#resource-types). |
+
+### Resource types
+
+When the classifier identifies a specific resource within a repo-scoped request, per-resource permissions are checked before the rule's base `access` level.
+
+| Resource | REST segments | GraphQL fields |
+|---|---|---|
+| `pulls` | `pulls` | `pullRequest`, `pullRequests`, mutations containing `PullRequest` |
+| `issues` | `issues` | `issue`, `issues`, `pinnedIssues`, mutations containing `Issue` |
+| `contents` | `contents`, `readme`, `zipball`, `tarball` | `object`, `blob`, `tree` |
+| `actions` | `actions` | — |
+| `releases` | `releases` | `releases`, `release`, `latestRelease`, mutations containing `Release` |
+| `git` | `git` | — |
+| `commits` | `commits`, `compare` | `commit`, `commitComments` |
+| `branches` | `branches` | `refs`, `ref`, `defaultBranchRef`, mutations containing `Ref`/`Branch` |
+| `checks` | `check-runs`, `check-suites`, `statuses` | mutations containing `Check` |
+| `comments` | `comments` | — |
+| `hooks` | `hooks` | — |
+| `deployments` | `deployments`, `environments` | `deployments`, mutations containing `Deployment` |
+| `pages` | `pages` | — |
+| `keys` | `keys`, `deploy-keys` | — |
+| `metadata` | `stargazers`, `subscribers`, `topics`, `languages`, `tags`, `forks`, `contributors`, `collaborators`, `teams`, `license`, `community`, `traffic`, repo root | `name`, `owner`, `url`, `id`, `isPrivate`, `stargazers`, etc. |
+
+If the resource cannot be determined (unknown REST segment, ambiguous GraphQL query), the rule's base `access` level is used.
 
 ### Access levels
 
@@ -145,19 +205,21 @@ Aliases: `"write"` and `"readwrite"` are accepted as synonyms for `"read-write"`
 
 ### Evaluation order
 
-For each request, the classifier extracts `(repo, org, access_level)`. The policy engine evaluates rules in this order:
+For each request, the classifier extracts `(repo, org, access_level, resource, unscoped_category)`. The policy engine evaluates rules in this order:
 
 ```
 1. Exact [[repo]] match on "owner/repo"
-   → found: check access level → allow or deny
+   → found + resource + permissions[resource] exists → check permissions[resource]
+   → found → check rule access level → allow or deny
    → not found: continue
 
 2. [[org]] match on org name
-   → found: check access level → allow or deny
+   → found + resource + permissions[resource] exists → check permissions[resource]
+   → found → check rule access level → allow or deny
    → not found: continue
 
-3. allow_unscoped_reads check
-   → if enabled AND repo="" AND org="" AND access=read → allow
+3. [defaults.unscoped] check
+   → if repo="" AND org="" AND unscoped[category] exists → check category access
    → otherwise: continue
 
 4. [defaults].mode
@@ -165,7 +227,7 @@ For each request, the classifier extracts `(repo, org, access_level)`. The polic
    → "deny"  → deny
 ```
 
-Evaluation stops at the first matching rule. A `[[repo]]` rule always takes priority over an `[[org]]` rule for the same org, and both take priority over the default.
+Evaluation stops at the first matching rule. A `[[repo]]` rule always takes priority over an `[[org]]` rule for the same org, and both take priority over the default. Within a rule, per-resource permissions take priority over the rule's base access level.
 
 ### Request classification
 
@@ -233,77 +295,74 @@ Note: `/users/{user}` endpoints use the username as the org for policy matching.
 
 #### Unscoped requests
 
-These requests have no identifiable repo or org. Under `mode = "deny"`, they are **denied by default**. Setting `allow_unscoped_reads = true` permits the read-only ones.
+These requests have no identifiable repo or org. Under `mode = "deny"`, they are **denied by default** unless `[defaults.unscoped]` grants access for their category.
 
 This matters because `gh` needs several of these endpoints to function — `gh auth status` calls `/user`, `gh repo list` (without an owner) calls `/user/repos`, and many commands start with a `{ viewer { login } }` GraphQL query.
 
-**REST endpoints — reads (allowed by `allow_unscoped_reads`):**
+**REST endpoints by category:**
 
-| Path | `gh` command | Purpose |
+| Category | Paths | `gh` commands |
 |---|---|---|
-| `GET /user` | `gh auth status` | Current authenticated user |
-| `GET /user/repos` | `gh repo list` (no owner) | List your repos |
-| `GET /user/orgs` | `gh org list` | List your orgs |
-| `GET /user/starred` | `gh api user/starred` | List starred repos |
-| `GET /user/subscriptions` | `gh api user/subscriptions` | List watched repos |
-| `GET /gists` | `gh gist list` | List your gists |
-| `GET /notifications` | `gh api notifications` | List notifications |
-| `GET /search/repositories` | `gh search repos ...` | Search repos |
-| `GET /search/issues` | `gh search issues ...` | Search issues/PRs |
-| `GET /search/code` | `gh search code ...` | Search code |
-| `GET /rate_limit` | `gh api rate_limit` | Check rate limit |
-| `GET /feeds` | `gh api feeds` | Timeline feeds |
-| `GET /events` | `gh api events` | Public events |
-| `GET /` | (GHE handshake) | API root |
+| `user` | `/user`, `/user/repos`, `/user/orgs`, `/user/starred` | `gh auth status`, `gh repo list`, `gh org list` |
+| `search` | `/search/repositories`, `/search/issues`, `/search/code` | `gh search repos`, `gh search issues`, `gh search code` |
+| `gists` | `/gists`, `/gists/{id}` | `gh gist list`, `gh gist create` |
+| `notifications` | `/notifications` | `gh api notifications` |
+| `events` | `/events` | `gh api events` |
+| `meta` | `/rate_limit`, `/feeds`, `/meta`, `/octocat`, `/zen`, `/emojis`, `/` | `gh api rate_limit`, GHE handshake |
 
-**REST endpoints — writes (always denied under deny-default, even with `allow_unscoped_reads`):**
+**GraphQL by category:**
 
-| Path | `gh` command | Purpose |
+| Category | Pattern | `gh` commands |
 |---|---|---|
-| `POST /gists` | `gh gist create` | Create a gist |
-| `POST /user/repos` | `gh repo create` (personal) | Create a repo |
-| `PATCH /user` | `gh api -X PATCH user` | Update your profile |
-| `PUT /notifications` | `gh api -X PUT notifications` | Mark all notifications read |
-| `DELETE /notifications/threads/{id}` | — | Delete notification subscription |
+| `user` | `viewer { ... }` | most `gh` commands |
+| `search` | `search(query: ...) { ... }` (no `repo:` qualifier) | `gh search ...` |
+| `meta` | `rateLimit { ... }` | — |
 
-**GraphQL — reads (allowed by `allow_unscoped_reads`):**
-
-| Query | `gh` command | Purpose |
-|---|---|---|
-| `{ viewer { login } }` | most `gh` commands | Identify current user |
-| `{ viewer { repositories(...) } }` | `gh repo list` | List your repos |
-| `{ rateLimit { ... } }` | — | Check rate limit |
-| `{ search(...) }` (no `repo:` qualifier) | `gh search ...` | Cross-repo search |
-
-**GraphQL — writes (denied unless node ID cache resolves a repo):**
-
-| Mutation | `gh` command | Purpose |
-|---|---|---|
-| `addStar(input: {starrableId: $id})` | `gh api graphql -f query='mutation...'` | Star a repo |
-| `mergePullRequest(input: {pullRequestId: $id})` | `gh pr merge` | Merge a PR (resolved via node cache) |
-| `closePullRequest(input: {pullRequestId: $id})` | `gh pr close` | Close a PR (resolved via node cache) |
-| `addComment(input: {subjectId: $id, body: ...})` | `gh pr comment`, `gh issue comment` | Add a comment (resolved via node cache) |
-
-Unscoped write mutations that reference a node ID will be resolved to a repo via the node ID cache if a previous query cached that ID. If the ID is not in the cache, the mutation is denied.
+**Node ID cache** — GraphQL mutations that reference objects by opaque node ID (e.g. `mergePullRequest(input: {pullRequestId: "PR_kwDO..."})`) have no repo in the query itself. The proxy caches `node_id → owner/repo` mappings from previous repo-scoped query responses (30 min TTL) and uses them to resolve scope for subsequent mutations. Unscoped mutations not resolved by the cache fall through to `[defaults.unscoped]` or `[defaults].mode`.
 
 ### Examples
 
-**Deny-default, read one org, write one repo:**
+**Deny-default, read one org, write PRs only:**
 ```toml
 [defaults]
 mode = "deny"
-allow_unscoped_reads = true
+
+[defaults.unscoped]
+user = "read"
+search = "read"
 
 [[org]]
 name = "my-company"
 access = "read"
+
+[org.permissions]
+pulls = "read-write"
 
 [[repo]]
 name = "my-company/frontend"
 access = "read-write"
 ```
 
-Result: `gh pr list -R my-company/backend` works (read, org rule). `gh pr merge -R my-company/frontend` works (write, repo rule). `gh pr merge -R my-company/backend` denied (write > org read). `gh pr list -R other/repo` denied (default deny).
+Result: `gh pr list -R my-company/backend` works (read, org rule). `gh pr merge -R my-company/backend` works (write, org pulls=read-write). `gh pr merge -R my-company/frontend` works (write, repo rule). `gh issue create -R my-company/backend` denied (write, no issues perm, org=read). `gh pr list -R other/repo` denied (default deny).
+
+**Granular repo permissions:**
+```toml
+[defaults]
+mode = "deny"
+
+[defaults.unscoped]
+user = "read"
+
+[[repo]]
+name = "my-company/frontend"
+access = "read"
+
+[repo.permissions]
+pulls = "read-write"
+actions = "none"
+```
+
+Result: can read most things in `my-company/frontend`. Can create/merge PRs (pulls=read-write). Cannot access actions at all (actions=none). Cannot write to issues, releases, etc. (falls back to access=read).
 
 **Allow-default, block sensitive repos:**
 ```toml
@@ -327,8 +386,11 @@ Result: everything allowed except `my-company/secrets` (fully blocked) and `my-c
 
 ```bash
 bgh-proxy token create --name <name> [--default deny|allow] \
-  [--org <org>=read|read-write|none]... \
-  [--repo <owner/repo>=read|read-write|none]...
+  [--org <org>=<access>]... \
+  [--repo <owner/repo>=<access>]... \
+  [--org-perm <org>:<resource>=<access>]... \
+  [--repo-perm <owner/repo>:<resource>=<access>]... \
+  [--unscoped <category>=<access>]...
 bgh-proxy token list
 bgh-proxy token show <name-or-id>
 bgh-proxy token revoke <name-or-id>
@@ -392,8 +454,9 @@ policy_file = "~/.config/bgh/policy.toml"
 Every request is logged to `~/.config/bgh/audit.jsonl`:
 
 ```json
-{"ts":"2026-05-26T14:30:00Z","method":"GET","path":"/repos/brymko/better-gh/pulls","repo":"brymko/better-gh","access":"read","policy_result":"allowed","github_status":200,"duration_ms":142,"mode":"socket","token_name":"(socket)"}
-{"ts":"2026-05-26T14:30:01Z","method":"POST","path":"/repos/unknown/repo/pulls","repo":"unknown/repo","access":"write","policy_result":"denied: default policy is deny","github_status":null,"duration_ms":5,"mode":"ghe","token_name":"ci-bot"}
+{"ts":"2026-05-26T14:30:00Z","method":"GET","path":"/repos/brymko/better-gh/pulls","repo":"brymko/better-gh","resource":"pulls","access":"read","policy_result":"allowed","github_status":200,"duration_ms":142,"mode":"socket","token_name":"(socket)"}
+{"ts":"2026-05-26T14:30:01Z","method":"POST","path":"/repos/unknown/repo/pulls","repo":"unknown/repo","resource":"pulls","access":"write","policy_result":"denied: default policy is deny","github_status":null,"duration_ms":5,"mode":"ghe","token_name":"ci-bot"}
+{"ts":"2026-05-26T14:30:02Z","method":"GET","path":"/user","unscoped_category":"user","access":"read","policy_result":"allowed","github_status":200,"duration_ms":45,"mode":"socket","token_name":"(socket)"}
 ```
 
 ## Undoing

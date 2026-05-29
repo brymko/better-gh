@@ -8,16 +8,18 @@ import (
 )
 
 type Entry struct {
-	Timestamp    time.Time `json:"ts"`
-	Method       string    `json:"method"`
-	Path         string    `json:"path"`
-	Repo         string    `json:"repo,omitempty"`
-	Access       string    `json:"access"`
-	PolicyResult string    `json:"policy_result"`
-	GitHubStatus *int      `json:"github_status"`
-	DurationMs   int64     `json:"duration_ms"`
-	Mode         string    `json:"mode"`
-	TokenName    string    `json:"token_name,omitempty"`
+	Timestamp        time.Time `json:"ts"`
+	Method           string    `json:"method"`
+	Path             string    `json:"path"`
+	Repo             string    `json:"repo,omitempty"`
+	Resource         string    `json:"resource,omitempty"`
+	UnscopedCategory string    `json:"unscoped_category,omitempty"`
+	Access           string    `json:"access"`
+	PolicyResult     string    `json:"policy_result"`
+	GitHubStatus     *int      `json:"github_status"`
+	DurationMs       int64     `json:"duration_ms"`
+	Mode             string    `json:"mode"`
+	TokenName        string    `json:"token_name,omitempty"`
 }
 
 type Logger struct {

@@ -3,6 +3,7 @@ package web
 import (
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"net/http"
 	"strings"
@@ -86,14 +87,16 @@ type createReq struct {
 }
 
 type createReqPolicy struct {
-	Default string           `json:"default"`
-	Org     []createReqRule  `json:"org"`
-	Repo    []createReqRule  `json:"repo"`
+	Default  string            `json:"default"`
+	Unscoped map[string]string `json:"unscoped,omitempty"`
+	Org      []createReqRule   `json:"org"`
+	Repo     []createReqRule   `json:"repo"`
 }
 
 type createReqRule struct {
-	Name   string `json:"name"`
-	Access string `json:"access"`
+	Name        string            `json:"name"`
+	Access      string            `json:"access"`
+	Permissions map[string]string `json:"permissions,omitempty"`
 }
 
 func (h *Handler) createToken(w http.ResponseWriter, r *http.Request) {
@@ -117,6 +120,19 @@ func (h *Handler) createToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var unscoped map[string]policy.Access
+	for cat, acc := range req.Policy.Unscoped {
+		var a policy.Access
+		if err := a.UnmarshalText([]byte(acc)); err != nil {
+			jsonResp(w, http.StatusBadRequest, map[string]string{"error": "invalid unscoped access for " + cat + ": " + acc})
+			return
+		}
+		if unscoped == nil {
+			unscoped = make(map[string]policy.Access)
+		}
+		unscoped[cat] = a
+	}
+
 	var orgRules []policy.OrgRule
 	for _, o := range req.Policy.Org {
 		var a policy.Access
@@ -124,7 +140,12 @@ func (h *Handler) createToken(w http.ResponseWriter, r *http.Request) {
 			jsonResp(w, http.StatusBadRequest, map[string]string{"error": "invalid org access: " + o.Access})
 			return
 		}
-		orgRules = append(orgRules, policy.OrgRule{Name: o.Name, Access: a})
+		perms, err := parsePermissions(o.Permissions)
+		if err != nil {
+			jsonResp(w, http.StatusBadRequest, map[string]string{"error": "invalid org permission: " + err.Error()})
+			return
+		}
+		orgRules = append(orgRules, policy.OrgRule{Name: o.Name, Access: a, Permissions: perms})
 	}
 
 	var repoRules []policy.RepoRule
@@ -134,11 +155,16 @@ func (h *Handler) createToken(w http.ResponseWriter, r *http.Request) {
 			jsonResp(w, http.StatusBadRequest, map[string]string{"error": "invalid repo access: " + r.Access})
 			return
 		}
-		repoRules = append(repoRules, policy.RepoRule{Name: r.Name, Access: a})
+		perms, err := parsePermissions(r.Permissions)
+		if err != nil {
+			jsonResp(w, http.StatusBadRequest, map[string]string{"error": "invalid repo permission: " + err.Error()})
+			return
+		}
+		repoRules = append(repoRules, policy.RepoRule{Name: r.Name, Access: a, Permissions: perms})
 	}
 
 	pol := policy.Policy{
-		Defaults: policy.Defaults{Mode: mode},
+		Defaults: policy.Defaults{Mode: mode, Unscoped: unscoped},
 		Org:      orgRules,
 		Repo:     repoRules,
 	}
@@ -173,6 +199,21 @@ func (h *Handler) revokeToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResp(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+func parsePermissions(m map[string]string) (map[string]policy.Access, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]policy.Access, len(m))
+	for resource, acc := range m {
+		var a policy.Access
+		if err := a.UnmarshalText([]byte(acc)); err != nil {
+			return nil, fmt.Errorf("%s=%s: %w", resource, acc, err)
+		}
+		out[resource] = a
+	}
+	return out, nil
 }
 
 func jsonResp(w http.ResponseWriter, status int, data any) {

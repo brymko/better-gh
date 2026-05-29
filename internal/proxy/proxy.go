@@ -109,33 +109,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		durationMs := time.Since(start).Milliseconds()
 		h.Audit.Log(audit.Entry{
-			Timestamp:    time.Now(),
-			Method:       r.Method,
-			Path:         path,
-			Repo:         repoName,
-			Access:       classified.Access.String(),
-			PolicyResult: "denied: no token provided",
-			DurationMs:   durationMs,
-			Mode:         h.Mode.String(),
+			Timestamp:        time.Now(),
+			Method:           r.Method,
+			Path:             path,
+			Repo:             repoName,
+			Resource:         classified.Resource,
+			UnscopedCategory: classified.UnscopedCategory,
+			Access:           classified.Access.String(),
+			PolicyResult:     "denied: no token provided",
+			DurationMs:       durationMs,
+			Mode:             h.Mode.String(),
 		})
 		jsonError(w, http.StatusForbidden, "bgh: denied — no token provided")
 		return
 	}
 
-	result := pol.Evaluate(repoName, org, classified.Access)
+	result := pol.Evaluate(repoName, org, classified.Access, classified.Resource, classified.UnscopedCategory)
 
 	if !result.Allowed {
 		durationMs := time.Since(start).Milliseconds()
 		h.Audit.Log(audit.Entry{
-			Timestamp:    time.Now(),
-			Method:       r.Method,
-			Path:         path,
-			Repo:         repoName,
-			Access:       classified.Access.String(),
-			PolicyResult: "denied: " + result.Reason,
-			DurationMs:   durationMs,
-			Mode:         h.Mode.String(),
-			TokenName:    tokenName,
+			Timestamp:        time.Now(),
+			Method:           r.Method,
+			Path:             path,
+			Repo:             repoName,
+			Resource:         classified.Resource,
+			UnscopedCategory: classified.UnscopedCategory,
+			Access:           classified.Access.String(),
+			PolicyResult:     "denied: " + result.Reason,
+			DurationMs:       durationMs,
+			Mode:             h.Mode.String(),
+			TokenName:        tokenName,
 		})
 		jsonError(w, http.StatusForbidden, fmt.Sprintf("bgh: denied — %s", result.Reason))
 		return
@@ -197,15 +201,28 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 	resp, err := h.Client.Do(req)
 	if err != nil {
 		durationMs := time.Since(start).Milliseconds()
+		errAuditAccess := "read"
+		errAuditRepo := ""
+		errAuditResource := ""
+		errAuditUnscopedCategory := ""
+		if classified != nil {
+			errAuditAccess = classified.Access.String()
+			errAuditRepo = classified.RepoFullName()
+			errAuditResource = classified.Resource
+			errAuditUnscopedCategory = classified.UnscopedCategory
+		}
 		h.Audit.Log(audit.Entry{
-			Timestamp:    time.Now(),
-			Method:       r.Method,
-			Path:         r.URL.Path,
-			Access:       "read",
-			PolicyResult: "allowed",
-			DurationMs:   durationMs,
-			Mode:         h.Mode.String(),
-			TokenName:    tokenName,
+			Timestamp:        time.Now(),
+			Method:           r.Method,
+			Path:             r.URL.Path,
+			Repo:             errAuditRepo,
+			Resource:         errAuditResource,
+			UnscopedCategory: errAuditUnscopedCategory,
+			Access:           errAuditAccess,
+			PolicyResult:     "allowed",
+			DurationMs:       durationMs,
+			Mode:             h.Mode.String(),
+			TokenName:        tokenName,
 		})
 		slog.Error("upstream request failed", "err", err)
 		jsonError(w, http.StatusBadGateway, fmt.Sprintf("bgh: upstream error — %v", err))
@@ -218,22 +235,28 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 
 	auditAccess := "read"
 	auditRepo := ""
+	auditResource := ""
+	auditUnscopedCategory := ""
 	if classified != nil {
 		auditAccess = classified.Access.String()
 		auditRepo = classified.RepoFullName()
+		auditResource = classified.Resource
+		auditUnscopedCategory = classified.UnscopedCategory
 	}
 
 	h.Audit.Log(audit.Entry{
-		Timestamp:    time.Now(),
-		Method:       r.Method,
-		Path:         r.URL.Path,
-		Repo:         auditRepo,
-		Access:       auditAccess,
-		PolicyResult: "allowed",
-		GitHubStatus: &status,
-		DurationMs:   durationMs,
-		Mode:         h.Mode.String(),
-		TokenName:    tokenName,
+		Timestamp:        time.Now(),
+		Method:           r.Method,
+		Path:             r.URL.Path,
+		Repo:             auditRepo,
+		Resource:         auditResource,
+		UnscopedCategory: auditUnscopedCategory,
+		Access:           auditAccess,
+		PolicyResult:     "allowed",
+		GitHubStatus:     &status,
+		DurationMs:       durationMs,
+		Mode:             h.Mode.String(),
+		TokenName:        tokenName,
 	})
 
 	for key, vals := range resp.Header {

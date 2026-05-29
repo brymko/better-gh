@@ -24,10 +24,12 @@ func (a AccessLevel) String() string {
 }
 
 type Result struct {
-	Owner  string
-	Repo   string
-	Org    string
-	Access AccessLevel
+	Owner            string
+	Repo             string
+	Org              string
+	Access           AccessLevel
+	Resource         string
+	UnscopedCategory string
 }
 
 func (r *Result) HasRepo() bool {
@@ -79,9 +81,10 @@ func Classify(method, path string, body []byte) Result {
 
 	if len(segments) >= 3 && segments[0] == "repos" {
 		return Result{
-			Owner:  segments[1],
-			Repo:   segments[2],
-			Access: access,
+			Owner:    segments[1],
+			Repo:     segments[2],
+			Access:   access,
+			Resource: restResource(segments),
 		}
 	}
 
@@ -99,7 +102,10 @@ func Classify(method, path string, body []byte) Result {
 		}
 	}
 
-	return Result{Access: access}
+	return Result{
+		Access:           access,
+		UnscopedCategory: restUnscopedCategory(segments),
+	}
 }
 
 func classifyGraphQL(body []byte) Result {
@@ -121,25 +127,93 @@ func classifyGraphQL(body []byte) Result {
 	}
 
 	access := Read
+	var mutationFieldName string
 	for _, op := range doc.Operations {
 		if op.Operation == ast.Mutation {
 			access = Write
+			for _, sel := range op.SelectionSet {
+				if f, ok := sel.(*ast.Field); ok && !isScopeField(f.Name) {
+					mutationFieldName = f.Name
+					break
+				}
+			}
 			break
 		}
 	}
 
 	result := Result{Access: access}
+	var repoField *ast.Field
 	for _, op := range doc.Operations {
-		extractGraphQLScope(op.SelectionSet, doc.Fragments, req.Variables, &result)
+		extractGraphQLScope(op.SelectionSet, doc.Fragments, req.Variables, &result, &repoField)
 		if result.HasRepo() || result.Org != "" {
 			break
 		}
 	}
 
+	if access == Write && mutationFieldName != "" {
+		result.Resource = gqlMutationResource(mutationFieldName)
+	} else if result.HasRepo() && repoField != nil {
+		result.Resource = gqlRepoResource(repoField)
+	} else if !result.HasRepo() && result.Org == "" {
+		result.UnscopedCategory = gqlUnscopedCategory(doc)
+	}
+
 	return result
 }
 
-func extractGraphQLScope(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, result *Result) {
+func isScopeField(name string) bool {
+	switch name {
+	case "repository", "organization", "repositoryOwner", "search", "viewer":
+		return true
+	}
+	return false
+}
+
+func gqlRepoResource(repoField *ast.Field) string {
+	found := ""
+	for _, sel := range repoField.SelectionSet {
+		f, ok := sel.(*ast.Field)
+		if !ok {
+			continue
+		}
+		if r, ok := gqlFieldToResource[f.Name]; ok {
+			if found != "" && found != r {
+				return ""
+			}
+			found = r
+		} else if !gqlMetadataFields[f.Name] && f.Name != "__typename" {
+			if found != "" && found != "metadata" {
+				return ""
+			}
+		}
+	}
+	if found == "" {
+		return "metadata"
+	}
+	return found
+}
+
+func gqlUnscopedCategory(doc *ast.QueryDocument) string {
+	for _, op := range doc.Operations {
+		for _, sel := range op.SelectionSet {
+			f, ok := sel.(*ast.Field)
+			if !ok {
+				continue
+			}
+			switch f.Name {
+			case "viewer":
+				return "user"
+			case "search":
+				return "search"
+			case "rateLimit":
+				return "meta"
+			}
+		}
+	}
+	return ""
+}
+
+func extractGraphQLScope(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, result *Result, repoField **ast.Field) {
 	for _, sel := range selections {
 		switch s := sel.(type) {
 		case *ast.Field:
@@ -150,6 +224,7 @@ func extractGraphQLScope(selections ast.SelectionSet, fragments ast.FragmentDefi
 				if owner != "" && name != "" {
 					result.Owner = owner
 					result.Repo = name
+					*repoField = s
 					return
 				}
 			case "organization", "repositoryOwner":
@@ -167,20 +242,20 @@ func extractGraphQLScope(selections ast.SelectionSet, fragments ast.FragmentDefi
 				}
 			}
 			if len(s.SelectionSet) > 0 {
-				extractGraphQLScope(s.SelectionSet, fragments, vars, result)
+				extractGraphQLScope(s.SelectionSet, fragments, vars, result, repoField)
 				if result.HasRepo() || result.Org != "" {
 					return
 				}
 			}
 		case *ast.InlineFragment:
-			extractGraphQLScope(s.SelectionSet, fragments, vars, result)
+			extractGraphQLScope(s.SelectionSet, fragments, vars, result, repoField)
 			if result.HasRepo() || result.Org != "" {
 				return
 			}
 		case *ast.FragmentSpread:
 			frag := fragments.ForName(s.Name)
 			if frag != nil {
-				extractGraphQLScope(frag.SelectionSet, fragments, vars, result)
+				extractGraphQLScope(frag.SelectionSet, fragments, vars, result, repoField)
 				if result.HasRepo() || result.Org != "" {
 					return
 				}
@@ -214,6 +289,136 @@ func parseSearchRepoQualifier(query string) (owner, repo string, ok bool) {
 		}
 	}
 	return "", "", false
+}
+
+var restResourceMap = map[string]string{
+	"pulls":        "pulls",
+	"issues":       "issues",
+	"contents":     "contents",
+	"readme":       "contents",
+	"zipball":      "contents",
+	"tarball":      "contents",
+	"actions":      "actions",
+	"releases":     "releases",
+	"git":          "git",
+	"commits":      "commits",
+	"compare":      "commits",
+	"branches":     "branches",
+	"check-runs":   "checks",
+	"check-suites": "checks",
+	"statuses":     "checks",
+	"comments":     "comments",
+	"hooks":        "hooks",
+	"deployments":  "deployments",
+	"environments": "deployments",
+	"pages":        "pages",
+	"keys":         "keys",
+	"deploy-keys":  "keys",
+}
+
+var restMetadataSegments = map[string]bool{
+	"stargazers": true, "subscribers": true, "topics": true,
+	"languages": true, "tags": true, "forks": true,
+	"contributors": true, "collaborators": true, "teams": true,
+	"license": true, "community": true, "traffic": true,
+}
+
+func restResource(segments []string) string {
+	if len(segments) <= 3 {
+		return "metadata"
+	}
+	seg := segments[3]
+	if r, ok := restResourceMap[seg]; ok {
+		return r
+	}
+	if restMetadataSegments[seg] {
+		return "metadata"
+	}
+	return ""
+}
+
+var restUnscopedMap = map[string]string{
+	"user":          "user",
+	"search":        "search",
+	"gists":         "gists",
+	"notifications": "notifications",
+	"events":        "events",
+	"rate_limit":    "meta",
+	"feeds":         "meta",
+	"meta":          "meta",
+	"octocat":       "meta",
+	"zen":           "meta",
+	"emojis":        "meta",
+}
+
+func restUnscopedCategory(segments []string) string {
+	if len(segments) == 0 {
+		return "meta"
+	}
+	if c, ok := restUnscopedMap[segments[0]]; ok {
+		return c
+	}
+	return ""
+}
+
+var gqlFieldToResource = map[string]string{
+	"pullRequest":  "pulls",
+	"pullRequests": "pulls",
+
+	"issue":        "issues",
+	"issues":       "issues",
+	"pinnedIssues": "issues",
+
+	"object": "contents",
+	"blob":   "contents",
+	"tree":   "contents",
+
+	"refs":             "branches",
+	"ref":              "branches",
+	"defaultBranchRef": "branches",
+
+	"releases":      "releases",
+	"release":       "releases",
+	"latestRelease": "releases",
+
+	"commit":         "commits",
+	"commitComments": "commits",
+
+	"deployments": "deployments",
+}
+
+var gqlMetadataFields = map[string]bool{
+	"name": true, "owner": true, "url": true, "id": true,
+	"isPrivate": true, "isFork": true, "isArchived": true,
+	"stargazers": true, "watchers": true, "description": true,
+	"licenseInfo": true, "repositoryTopics": true, "languages": true,
+	"forkCount": true, "stargazerCount": true, "visibility": true,
+	"createdAt": true, "updatedAt": true,
+}
+
+func gqlMutationResource(name string) string {
+	if strings.Contains(name, "PullRequest") ||
+		name == "mergeBranch" ||
+		name == "enablePullRequestAutoMerge" ||
+		name == "disablePullRequestAutoMerge" {
+		return "pulls"
+	}
+	if strings.Contains(name, "Issue") {
+		return "issues"
+	}
+	if strings.Contains(name, "Ref") || strings.Contains(name, "Branch") {
+		return "branches"
+	}
+	if strings.Contains(name, "Release") {
+		return "releases"
+	}
+	if strings.Contains(name, "Deployment") {
+		return "deployments"
+	}
+	if strings.Contains(name, "Check") {
+		return "checks"
+	}
+	return ""
 }
 
 func splitPath(path string) []string {

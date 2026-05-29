@@ -72,11 +72,19 @@ Usage:
   bgh-proxy token <subcommand>      Manage proxy tokens
 
 Token subcommands:
-  token create --name <name> [--default deny|allow] [--org <org>=read|read-write|none]... [--repo <owner/repo>=read|read-write|none]...
+  token create --name <name> [--default deny|allow]
+    [--org <org>=<access>]...
+    [--repo <owner/repo>=<access>]...
+    [--org-perm <org>:<resource>=<access>]...
+    [--repo-perm <owner/repo>:<resource>=<access>]...
+    [--unscoped <category>=<access>]...
   token list
   token show <name-or-id>
   token revoke <name-or-id>
   token delete <name-or-id>
+
+Resources: pulls, issues, contents, actions, releases, git, commits, branches, checks, comments, hooks, deployments, pages, keys, metadata
+Unscoped categories: user, search, gists, notifications, events, meta
 
 `)
 }
@@ -96,6 +104,10 @@ func cmdInit() error {
 		example := `[defaults]
 mode = "deny"
 
+# [defaults.unscoped]
+# user = "read"
+# search = "read"
+
 # [[org]]
 # name = "my-company"
 # access = "read"
@@ -103,6 +115,9 @@ mode = "deny"
 # [[repo]]
 # name = "my-company/frontend"
 # access = "read-write"
+# [repo.permissions]
+# pulls = "read-write"
+# actions = "none"
 `
 		if err := os.WriteFile(policyPath, []byte(example), 0o644); err != nil {
 			return err
@@ -363,10 +378,15 @@ func tokenCreate(c *adminClient, args []string) error {
 	name := ""
 	defaultMode := "deny"
 	type rule struct {
-		Name   string `json:"name"`
-		Access string `json:"access"`
+		Name        string            `json:"name"`
+		Access      string            `json:"access"`
+		Permissions map[string]string `json:"permissions,omitempty"`
 	}
 	var orgRules, repoRules []rule
+	unscopedMap := map[string]string{}
+
+	orgPerms := map[string]map[string]string{}
+	repoPerms := map[string]map[string]string{}
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -402,6 +422,42 @@ func tokenCreate(c *adminClient, args []string) error {
 				return fmt.Errorf("--repo: %w", err)
 			}
 			repoRules = append(repoRules, rule{Name: n, Access: a})
+		case "--org-perm":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--org-perm requires a value (org:resource=access)")
+			}
+			i++
+			scope, resource, access, err := parsePermStr(args[i])
+			if err != nil {
+				return fmt.Errorf("--org-perm: %w", err)
+			}
+			if orgPerms[scope] == nil {
+				orgPerms[scope] = map[string]string{}
+			}
+			orgPerms[scope][resource] = access
+		case "--repo-perm":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--repo-perm requires a value (owner/repo:resource=access)")
+			}
+			i++
+			scope, resource, access, err := parsePermStr(args[i])
+			if err != nil {
+				return fmt.Errorf("--repo-perm: %w", err)
+			}
+			if repoPerms[scope] == nil {
+				repoPerms[scope] = map[string]string{}
+			}
+			repoPerms[scope][resource] = access
+		case "--unscoped":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--unscoped requires a value (category=access)")
+			}
+			i++
+			cat, acc, err := parseRuleStr(args[i])
+			if err != nil {
+				return fmt.Errorf("--unscoped: %w", err)
+			}
+			unscopedMap[cat] = acc
 		default:
 			return fmt.Errorf("unknown flag: %s", args[i])
 		}
@@ -411,13 +467,38 @@ func tokenCreate(c *adminClient, args []string) error {
 		return fmt.Errorf("--name is required")
 	}
 
+	for i := range orgRules {
+		if p, ok := orgPerms[orgRules[i].Name]; ok {
+			orgRules[i].Permissions = p
+			delete(orgPerms, orgRules[i].Name)
+		}
+	}
+	for orgName, p := range orgPerms {
+		orgRules = append(orgRules, rule{Name: orgName, Access: "read", Permissions: p})
+	}
+
+	for i := range repoRules {
+		if p, ok := repoPerms[repoRules[i].Name]; ok {
+			repoRules[i].Permissions = p
+			delete(repoPerms, repoRules[i].Name)
+		}
+	}
+	for repoName, p := range repoPerms {
+		repoRules = append(repoRules, rule{Name: repoName, Access: "read", Permissions: p})
+	}
+
+	polBody := map[string]any{
+		"default": defaultMode,
+		"org":     orgRules,
+		"repo":    repoRules,
+	}
+	if len(unscopedMap) > 0 {
+		polBody["unscoped"] = unscopedMap
+	}
+
 	body := map[string]any{
-		"name": name,
-		"policy": map[string]any{
-			"default": defaultMode,
-			"org":     orgRules,
-			"repo":    repoRules,
-		},
+		"name":   name,
+		"policy": polBody,
 	}
 
 	resp, err := c.do("POST", "/api/tokens", body)
@@ -494,13 +575,27 @@ func tokenShow(c *adminClient, idOrName string) error {
 
 	defaultStr, _ := tok.Policy.Defaults.Mode.MarshalText()
 	fmt.Printf("Default:  %s\n", defaultStr)
+	if len(tok.Policy.Defaults.Unscoped) > 0 {
+		for cat, acc := range tok.Policy.Defaults.Unscoped {
+			accessStr, _ := acc.MarshalText()
+			fmt.Printf("Unscoped: %s=%s\n", cat, accessStr)
+		}
+	}
 	for _, o := range tok.Policy.Org {
 		accessStr, _ := o.Access.MarshalText()
 		fmt.Printf("Org:      %s=%s\n", o.Name, accessStr)
+		for res, acc := range o.Permissions {
+			permStr, _ := acc.MarshalText()
+			fmt.Printf("  Perm:   %s=%s\n", res, permStr)
+		}
 	}
 	for _, r := range tok.Policy.Repo {
 		accessStr, _ := r.Access.MarshalText()
 		fmt.Printf("Repo:     %s=%s\n", r.Name, accessStr)
+		for res, acc := range r.Permissions {
+			permStr, _ := acc.MarshalText()
+			fmt.Printf("  Perm:   %s=%s\n", res, permStr)
+		}
 	}
 	return nil
 }
@@ -527,6 +622,27 @@ func tokenDelete(c *adminClient, idOrName string) error {
 	}
 	fmt.Fprintf(os.Stderr, "token deleted\n")
 	return nil
+}
+
+func parsePermStr(s string) (scope, resource, access string, err error) {
+	colonIdx := strings.LastIndex(s, ":")
+	if colonIdx < 0 {
+		return "", "", "", fmt.Errorf("expected scope:resource=access, got %q", s)
+	}
+	scope = s[:colonIdx]
+	rest := s[colonIdx+1:]
+	parts := strings.SplitN(rest, "=", 2)
+	if len(parts) != 2 {
+		return "", "", "", fmt.Errorf("expected scope:resource=access, got %q", s)
+	}
+	resource = parts[0]
+	access = parts[1]
+	switch access {
+	case "none", "read", "read-write", "readwrite", "write":
+	default:
+		return "", "", "", fmt.Errorf("unknown access level: %q", access)
+	}
+	return scope, resource, access, nil
 }
 
 func parseRuleStr(s string) (string, string, error) {

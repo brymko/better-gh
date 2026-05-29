@@ -70,18 +70,20 @@ type Policy struct {
 }
 
 type Defaults struct {
-	Mode               DefaultMode `toml:"mode" json:"mode"`
-	AllowUnscopedReads bool        `toml:"allow_unscoped_reads" json:"allow_unscoped_reads,omitempty"`
+	Mode     DefaultMode       `toml:"mode" json:"mode"`
+	Unscoped map[string]Access `toml:"unscoped,omitempty" json:"unscoped,omitempty"`
 }
 
 type OrgRule struct {
-	Name   string `toml:"name" json:"name"`
-	Access Access `toml:"access" json:"access"`
+	Name        string            `toml:"name" json:"name"`
+	Access      Access            `toml:"access" json:"access"`
+	Permissions map[string]Access `toml:"permissions,omitempty" json:"permissions,omitempty"`
 }
 
 type RepoRule struct {
-	Name   string `toml:"name" json:"name"`
-	Access Access `toml:"access" json:"access"`
+	Name        string            `toml:"name" json:"name"`
+	Access      Access            `toml:"access" json:"access"`
+	Permissions map[string]Access `toml:"permissions,omitempty" json:"permissions,omitempty"`
 }
 
 type Result struct {
@@ -101,10 +103,20 @@ func LoadFromFile(path string) (*Policy, error) {
 	return &p, nil
 }
 
-func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel) Result {
+func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resource, unscopedCategory string) Result {
 	if repo != "" {
 		for _, r := range p.Repo {
 			if r.Name == repo {
+				if resource != "" && r.Permissions != nil {
+					if permAccess, ok := r.Permissions[resource]; ok {
+						if permits(permAccess, access) {
+							return Result{Allowed: true}
+						}
+						return Result{
+							Reason: fmt.Sprintf("repo '%s' resource '%s' policy is %s, requested %s", repo, resource, accessStr(permAccess), access),
+						}
+					}
+				}
 				if permits(r.Access, access) {
 					return Result{Allowed: true}
 				}
@@ -118,6 +130,16 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel) Resul
 	if org != "" {
 		for _, o := range p.Org {
 			if o.Name == org {
+				if resource != "" && o.Permissions != nil {
+					if permAccess, ok := o.Permissions[resource]; ok {
+						if permits(permAccess, access) {
+							return Result{Allowed: true}
+						}
+						return Result{
+							Reason: fmt.Sprintf("org '%s' resource '%s' policy is %s, requested %s", org, resource, accessStr(permAccess), access),
+						}
+					}
+				}
 				if permits(o.Access, access) {
 					return Result{Allowed: true}
 				}
@@ -128,8 +150,15 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel) Resul
 		}
 	}
 
-	if p.Defaults.AllowUnscopedReads && repo == "" && org == "" && access == classifier.Read {
-		return Result{Allowed: true}
+	if repo == "" && org == "" && unscopedCategory != "" && p.Defaults.Unscoped != nil {
+		if catAccess, ok := p.Defaults.Unscoped[unscopedCategory]; ok {
+			if permits(catAccess, access) {
+				return Result{Allowed: true}
+			}
+			return Result{
+				Reason: fmt.Sprintf("unscoped category '%s' policy is %s, requested %s", unscopedCategory, accessStr(catAccess), access),
+			}
+		}
 	}
 
 	switch p.Defaults.Mode {
