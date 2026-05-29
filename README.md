@@ -1,4 +1,5 @@
-> **Note**: This project was built with Claude (Anthropic) assistance. Review the code before trusting it with your GitHub tokens.
+> [!WARNING]
+> This project was built with Claude (Anthropic) assistance. Review the code before trusting it with your GitHub tokens.
 
 # bgh-proxy
 
