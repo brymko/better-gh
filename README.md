@@ -109,7 +109,7 @@ access = "read-write"
 | Field | Values | Description |
 |---|---|---|
 | `mode` | `"deny"` (default), `"allow"` | Fallback decision when no rule matches. |
-| `allow_unscoped_reads` | `true`, `false` (default) | When `true`, read requests that have no identifiable repo or org (e.g. `GET /user`, `GET /user/repos`, GraphQL `{ viewer { login } }`) are allowed even under deny-default. Has no effect when `mode = "allow"`. |
+| `allow_unscoped_reads` | `true`, `false` (default) | Allow unscoped read requests under deny-default. See [Unscoped requests](#unscoped-requests). Has no effect when `mode = "allow"`. |
 
 ### `[[org]]` rules
 
@@ -163,23 +163,122 @@ Evaluation stops at the first matching rule. A `[[repo]]` rule always takes prio
 
 ### Request classification
 
-The proxy classifies every request to determine `(owner, repo, org, access_level)`:
+The proxy classifies every request to extract scope `(owner, repo, org)` and access level `(read, write)`.
 
-**REST** — parsed from URL path:
-- `/repos/{owner}/{repo}/**` → repo = `owner/repo`
-- `/orgs/{org}/**` → org only
-- `/users/{user}/**` → org = user
-- Everything else → unscoped
+Access level is determined by:
+- **REST**: `GET`/`HEAD` = read, all other methods (`POST`, `PUT`, `PATCH`, `DELETE`) = write
+- **GraphQL**: `query` operations = read, `mutation` operations = write
 
-Access from HTTP method: `GET`/`HEAD` = read, everything else = write.
+#### Repo-scoped requests
 
-**GraphQL** — parsed from the query AST:
-- `repository(owner: "x", name: "y")` → repo = `x/y`
-- `organization(login: "x")` / `repositoryOwner(login: "x")` → org = `x`
-- `search(query: "repo:owner/name ...")` → repo = `owner/name`
-- Operation type: `mutation` = write, `query` = read
+These requests are matched against `[[repo]]` rules, falling back to `[[org]]` rules using the owner as the org name.
 
-**Node ID cache** — GraphQL mutations that reference objects by opaque node ID (e.g. `mergePullRequest(input: {pullRequestId: "PR_kwDO..."})`) have no repo in the request. The proxy caches `node_id → owner/repo` mappings from previous query responses (30 min TTL) and uses them to resolve scope for subsequent mutations.
+**REST endpoints** — any path under `/repos/{owner}/{repo}/`:
+
+| Path pattern | Example | `gh` command |
+|---|---|---|
+| `/repos/{owner}/{repo}` | `/repos/my-org/frontend` | `gh repo view my-org/frontend` |
+| `/repos/{owner}/{repo}/pulls` | `/repos/my-org/frontend/pulls` | `gh pr list -R my-org/frontend` |
+| `/repos/{owner}/{repo}/pulls/{n}` | `/repos/my-org/frontend/pulls/42` | `gh pr view 42` |
+| `/repos/{owner}/{repo}/issues` | `/repos/my-org/frontend/issues` | `gh issue list -R my-org/frontend` |
+| `/repos/{owner}/{repo}/issues/{n}` | `/repos/my-org/frontend/issues/7` | `gh issue view 7` |
+| `/repos/{owner}/{repo}/git/refs` | `/repos/my-org/frontend/git/refs` | `gh api repos/my-org/frontend/git/refs` |
+| `/repos/{owner}/{repo}/contents/{path}` | `/repos/my-org/frontend/contents/README.md` | `gh api repos/.../contents/README.md` |
+| `/repos/{owner}/{repo}/actions/runs` | `/repos/my-org/frontend/actions/runs` | `gh run list` |
+| `/repos/{owner}/{repo}/releases` | `/repos/my-org/frontend/releases` | `gh release list` |
+| `/repos/{owner}/{repo}/comments` | `/repos/my-org/frontend/comments` | `gh api repos/.../comments` |
+| `/repos/{owner}/{repo}/**` | any sub-path | any repo-scoped API call |
+
+**GraphQL** — scope extracted from the query AST:
+
+| Pattern | Example | Scope |
+|---|---|---|
+| `repository(owner:, name:)` | `repository(owner: "my-org", name: "frontend")` | repo = `my-org/frontend` |
+| `search(query: "repo:...")` | `search(query: "repo:my-org/frontend is:open")` | repo = `my-org/frontend` |
+
+Variables are resolved: `repository(owner: $owner, name: $name)` with `{"owner": "my-org", "name": "frontend"}` works.
+
+**Node ID cache** — GraphQL mutations that reference objects by opaque node ID (e.g. `mergePullRequest(input: {pullRequestId: "PR_kwDO..."})`) have no repo in the query itself. The proxy caches `node_id → owner/repo` mappings from previous repo-scoped query responses (30 min TTL) and uses them to resolve scope for subsequent mutations. This is how `gh pr merge 123` works — `gh pr view 123` first queries the PR (repo-scoped), the response contains the node ID, and the merge mutation uses that cached mapping.
+
+#### Org-scoped requests
+
+These requests are matched against `[[org]]` rules only. No `[[repo]]` rule can match since there is no repo.
+
+**REST endpoints:**
+
+| Path pattern | Example | `gh` command |
+|---|---|---|
+| `/orgs/{org}` | `/orgs/my-org` | `gh api orgs/my-org` |
+| `/orgs/{org}/repos` | `/orgs/my-org/repos` | `gh repo list my-org` |
+| `/orgs/{org}/members` | `/orgs/my-org/members` | `gh api orgs/my-org/members` |
+| `/orgs/{org}/**` | any sub-path | any org-scoped API call |
+| `/users/{user}` | `/users/octocat` | `gh api users/octocat` |
+| `/users/{user}/repos` | `/users/octocat/repos` | `gh repo list octocat` |
+| `/users/{user}/**` | any sub-path | any user-scoped API call |
+
+Note: `/users/{user}` endpoints use the username as the org for policy matching. This means an `[[org]]` rule for `"octocat"` covers both `/orgs/octocat/...` and `/users/octocat/...`.
+
+**GraphQL:**
+
+| Pattern | Example | Scope |
+|---|---|---|
+| `organization(login:)` | `organization(login: "my-org")` | org = `my-org` |
+| `repositoryOwner(login:)` | `repositoryOwner(login: "my-org")` | org = `my-org` |
+
+#### Unscoped requests
+
+These requests have no identifiable repo or org. Under `mode = "deny"`, they are **denied by default**. Setting `allow_unscoped_reads = true` permits the read-only ones.
+
+This matters because `gh` needs several of these endpoints to function — `gh auth status` calls `/user`, `gh repo list` (without an owner) calls `/user/repos`, and many commands start with a `{ viewer { login } }` GraphQL query.
+
+**REST endpoints — reads (allowed by `allow_unscoped_reads`):**
+
+| Path | `gh` command | Purpose |
+|---|---|---|
+| `GET /user` | `gh auth status` | Current authenticated user |
+| `GET /user/repos` | `gh repo list` (no owner) | List your repos |
+| `GET /user/orgs` | `gh org list` | List your orgs |
+| `GET /user/starred` | `gh api user/starred` | List starred repos |
+| `GET /user/subscriptions` | `gh api user/subscriptions` | List watched repos |
+| `GET /gists` | `gh gist list` | List your gists |
+| `GET /notifications` | `gh api notifications` | List notifications |
+| `GET /search/repositories` | `gh search repos ...` | Search repos |
+| `GET /search/issues` | `gh search issues ...` | Search issues/PRs |
+| `GET /search/code` | `gh search code ...` | Search code |
+| `GET /rate_limit` | `gh api rate_limit` | Check rate limit |
+| `GET /feeds` | `gh api feeds` | Timeline feeds |
+| `GET /events` | `gh api events` | Public events |
+| `GET /` | (GHE handshake) | API root |
+
+**REST endpoints — writes (always denied under deny-default, even with `allow_unscoped_reads`):**
+
+| Path | `gh` command | Purpose |
+|---|---|---|
+| `POST /gists` | `gh gist create` | Create a gist |
+| `POST /user/repos` | `gh repo create` (personal) | Create a repo |
+| `PATCH /user` | `gh api -X PATCH user` | Update your profile |
+| `PUT /notifications` | `gh api -X PUT notifications` | Mark all notifications read |
+| `DELETE /notifications/threads/{id}` | — | Delete notification subscription |
+
+**GraphQL — reads (allowed by `allow_unscoped_reads`):**
+
+| Query | `gh` command | Purpose |
+|---|---|---|
+| `{ viewer { login } }` | most `gh` commands | Identify current user |
+| `{ viewer { repositories(...) } }` | `gh repo list` | List your repos |
+| `{ rateLimit { ... } }` | — | Check rate limit |
+| `{ search(...) }` (no `repo:` qualifier) | `gh search ...` | Cross-repo search |
+
+**GraphQL — writes (denied unless node ID cache resolves a repo):**
+
+| Mutation | `gh` command | Purpose |
+|---|---|---|
+| `addStar(input: {starrableId: $id})` | `gh api graphql -f query='mutation...'` | Star a repo |
+| `mergePullRequest(input: {pullRequestId: $id})` | `gh pr merge` | Merge a PR (resolved via node cache) |
+| `closePullRequest(input: {pullRequestId: $id})` | `gh pr close` | Close a PR (resolved via node cache) |
+| `addComment(input: {subjectId: $id, body: ...})` | `gh pr comment`, `gh issue comment` | Add a comment (resolved via node cache) |
+
+Unscoped write mutations that reference a node ID will be resolved to a repo via the node ID cache if a previous query cached that ID. If the ID is not in the cache, the mutation is denied.
 
 ### Examples
 
