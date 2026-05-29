@@ -1,3 +1,5 @@
+> **Note**: This project was built with Claude (Anthropic) assistance. Review the code before trusting it with your GitHub tokens.
+
 # bgh-proxy
 
 Transparent GitHub API proxy with per-repo/per-org access control and audit logging.
@@ -69,25 +71,149 @@ bgh-proxy token create --name ci-bot --default deny --repo my-org/my-repo=read
 curl -H "Authorization: token <secret>" https://localhost:7843/api/v3/repos/my-org/my-repo/pulls
 ```
 
-## Policy evaluation
+## Policy specification
+
+Policy files use TOML. In socket mode, the policy is loaded from `~/.config/bgh/policy.toml`. In GHE mode, each proxy token carries its own embedded policy.
+
+### Full example
+
+```toml
+[defaults]
+mode = "deny"                    # "deny" or "allow"
+allow_unscoped_reads = true      # allow reads with no identifiable repo/org
+
+[[org]]
+name = "my-company"
+access = "read"                  # default for all repos in this org
+
+[[org]]
+name = "personal"
+access = "read-write"
+
+[[repo]]
+name = "my-company/frontend"
+access = "read-write"            # overrides org default
+
+[[repo]]
+name = "my-company/deploy-infra"
+access = "none"                  # block completely, even reads
+
+[[repo]]
+name = "personal/dotfiles"
+access = "read-write"
+```
+
+### `[defaults]` section
+
+| Field | Values | Description |
+|---|---|---|
+| `mode` | `"deny"` (default), `"allow"` | Fallback decision when no rule matches. |
+| `allow_unscoped_reads` | `true`, `false` (default) | When `true`, read requests that have no identifiable repo or org (e.g. `GET /user`, `GET /user/repos`, GraphQL `{ viewer { login } }`) are allowed even under deny-default. Has no effect when `mode = "allow"`. |
+
+### `[[org]]` rules
+
+| Field | Values | Description |
+|---|---|---|
+| `name` | string | Org login, e.g. `"my-company"`. Exact match only, no globs. |
+| `access` | `"none"`, `"read"`, `"read-write"` | Access granted to any repo in this org that doesn't have its own `[[repo]]` rule. |
+
+Org matching uses the `owner` segment from REST paths (`/repos/{owner}/...`) or the `owner` argument from GraphQL `repository(owner:, name:)`. For org-scoped endpoints (`/orgs/{org}/...`), the org name is used directly.
+
+### `[[repo]]` rules
+
+| Field | Values | Description |
+|---|---|---|
+| `name` | string | Full `owner/repo` name, e.g. `"my-company/frontend"`. Exact match only. |
+| `access` | `"none"`, `"read"`, `"read-write"` | Access granted to this specific repo. Takes priority over `[[org]]` rules. |
+
+### Access levels
+
+| Level | Permits | REST methods | GraphQL |
+|---|---|---|---|
+| `none` | Nothing | All blocked | All blocked |
+| `read` | Read-only | `GET`, `HEAD` | Queries only |
+| `read-write` | Everything | All methods | Queries and mutations |
+
+Aliases: `"write"` and `"readwrite"` are accepted as synonyms for `"read-write"`.
+
+### Evaluation order
+
+For each request, the classifier extracts `(repo, org, access_level)`. The policy engine evaluates rules in this order:
 
 ```
-Request for: my-org/frontend (write)
+1. Exact [[repo]] match on "owner/repo"
+   → found: check access level → allow or deny
+   → not found: continue
 
-  1. Exact repo rule match?
-     └─ my-org/frontend → read-write ✓ ALLOWED
+2. [[org]] match on org name
+   → found: check access level → allow or deny
+   → not found: continue
 
-  2. Org rule match?
-     └─ my-org → read ✗ DENIED (write > read)
+3. allow_unscoped_reads check
+   → if enabled AND repo="" AND org="" AND access=read → allow
+   → otherwise: continue
 
-  3. Unscoped read? (allow_unscoped_reads)
-     └─ only for requests with no repo/org
-
-  4. Global default
-     └─ deny ✗ DENIED
+4. [defaults].mode
+   → "allow" → allow
+   → "deny"  → deny
 ```
 
-Access levels: `none` (block all), `read` (GET/HEAD only), `read-write` (all methods).
+Evaluation stops at the first matching rule. A `[[repo]]` rule always takes priority over an `[[org]]` rule for the same org, and both take priority over the default.
+
+### Request classification
+
+The proxy classifies every request to determine `(owner, repo, org, access_level)`:
+
+**REST** — parsed from URL path:
+- `/repos/{owner}/{repo}/**` → repo = `owner/repo`
+- `/orgs/{org}/**` → org only
+- `/users/{user}/**` → org = user
+- Everything else → unscoped
+
+Access from HTTP method: `GET`/`HEAD` = read, everything else = write.
+
+**GraphQL** — parsed from the query AST:
+- `repository(owner: "x", name: "y")` → repo = `x/y`
+- `organization(login: "x")` / `repositoryOwner(login: "x")` → org = `x`
+- `search(query: "repo:owner/name ...")` → repo = `owner/name`
+- Operation type: `mutation` = write, `query` = read
+
+**Node ID cache** — GraphQL mutations that reference objects by opaque node ID (e.g. `mergePullRequest(input: {pullRequestId: "PR_kwDO..."})`) have no repo in the request. The proxy caches `node_id → owner/repo` mappings from previous query responses (30 min TTL) and uses them to resolve scope for subsequent mutations.
+
+### Examples
+
+**Deny-default, read one org, write one repo:**
+```toml
+[defaults]
+mode = "deny"
+allow_unscoped_reads = true
+
+[[org]]
+name = "my-company"
+access = "read"
+
+[[repo]]
+name = "my-company/frontend"
+access = "read-write"
+```
+
+Result: `gh pr list -R my-company/backend` works (read, org rule). `gh pr merge -R my-company/frontend` works (write, repo rule). `gh pr merge -R my-company/backend` denied (write > org read). `gh pr list -R other/repo` denied (default deny).
+
+**Allow-default, block sensitive repos:**
+```toml
+[defaults]
+mode = "allow"
+
+[[repo]]
+name = "my-company/secrets"
+access = "none"
+
+[[repo]]
+name = "my-company/deploy-infra"
+access = "read"
+```
+
+Result: everything allowed except `my-company/secrets` (fully blocked) and `my-company/deploy-infra` (read-only).
 
 ## Token management
 
