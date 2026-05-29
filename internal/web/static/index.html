@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bgh-proxy — Token Management</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>bgh-proxy</h1>
+    <div id="auth-bar">
+      <input type="password" id="admin-token" placeholder="Admin token">
+      <button onclick="loadTokens()">Connect</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="token-list-section" style="display:none">
+      <div class="section-header">
+        <h2>Tokens</h2>
+        <button onclick="showCreate()">+ Create Token</button>
+      </div>
+      <table id="token-table">
+        <thead>
+          <tr><th>Name</th><th>ID</th><th>Status</th><th>Created</th><th>Last Used</th><th>Actions</th></tr>
+        </thead>
+        <tbody id="token-tbody"></tbody>
+      </table>
+    </section>
+
+    <section id="create-section" style="display:none">
+      <h2>Create Token</h2>
+      <form id="create-form" onsubmit="return createToken(event)">
+        <label>Name <input type="text" id="c-name" required></label>
+        <label>Default
+          <select id="c-default">
+            <option value="deny">deny</option>
+            <option value="allow">allow</option>
+          </select>
+        </label>
+        <fieldset>
+          <legend>Org Rules</legend>
+          <div id="org-rules"></div>
+          <button type="button" onclick="addOrgRule()">+ Add Org</button>
+        </fieldset>
+        <fieldset>
+          <legend>Repo Rules</legend>
+          <div id="repo-rules"></div>
+          <button type="button" onclick="addRepoRule()">+ Add Repo</button>
+        </fieldset>
+        <div class="form-actions">
+          <button type="submit">Create</button>
+          <button type="button" onclick="hideCreate()">Cancel</button>
+        </div>
+      </form>
+    </section>
+
+    <div id="secret-banner" style="display:none">
+      <strong>Token created. Copy the secret now — it won't be shown again:</strong>
+      <code id="secret-value"></code>
+      <button onclick="copySecret()">Copy</button>
+      <button onclick="dismissSecret()">Dismiss</button>
+    </div>
+
+    <section id="detail-section" style="display:none">
+      <h2>Token Detail</h2>
+      <pre id="detail-content"></pre>
+      <button onclick="hideDetail()">Back</button>
+    </section>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
