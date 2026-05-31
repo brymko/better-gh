@@ -108,7 +108,7 @@ Any node that cannot be resolved (unknown ID, upstream error, unrecognized type,
 - **Proxy tokens** (GHE mode): random 256-bit secrets, stored as SHA-256 hashes in `tokens.json` (`0600`), each carrying an embedded policy. Looked up in constant time; revocation and hard-deletion both go through the running server so they take effect immediately. `tokens.json` is written atomically (temp + rename).
 - **Admin secret**: gates the token-minting API/UI; generated once and reused across restarts; file `0600`.
 - **Socket**: created with a restrictive umask so it is `0600` from the moment it exists; only the owning user can connect.
-- **Real GitHub token**: the proxy's single upstream credential, resolved from `BGH_GITHUB_TOKEN`, then `github_token` in config, then the file written by `bgh-proxy login`. Held only on the proxy host, never sent to clients. `bgh-proxy login` runs GitHub's OAuth **device flow** (`internal/oauth`) — using an operator-registered OAuth App's client id — and stores the resulting token at `~/.config/bgh/github-token` (`0600`). Storage is plaintext (encrypted-at-rest is a non-goal).
+- **Real GitHub token**: the proxy's single upstream credential, resolved from `BGH_GITHUB_TOKEN`, then `github_token` in config, then the file written by `bgh-proxy login`. Held only on the proxy host, never sent to clients. `bgh-proxy login` runs GitHub's OAuth **device flow** (`internal/oauth`) — by default with the GitHub CLI's public OAuth app client id, so it works with no registration like `gh auth login` (override with `--client-id` for your own app) — and stores the resulting token at `~/.config/bgh/github-token` (`0600`). Storage is plaintext (encrypted-at-rest is a non-goal).
 
 ## Security properties & threat model
 

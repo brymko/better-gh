@@ -141,10 +141,10 @@ mode = "both"          # "socket", "ghe", or "both"
 # Upstream GitHub token (one of):
 #   - set BGH_GITHUB_TOKEN env var, or
 #   - github_token = "ghp_..." below, or
-#   - run 'bgh-proxy login' (device flow) after setting oauth_client_id
+#   - run 'bgh-proxy login' (device flow, like gh — no setup needed)
 # github_token = "ghp_..."
-# oauth_client_id = "Iv1...."   # a GitHub OAuth App (Device Flow enabled) for 'bgh-proxy login'
-# oauth_scopes = "repo read:org"
+# oauth_client_id = "Iv1...."   # optional: your own OAuth App for 'bgh-proxy login' (defaults to gh's)
+# oauth_scopes = "repo read:org gist workflow"
 
 audit_log = "~/.config/bgh/audit.jsonl"
 policy_file = "~/.config/bgh/policy.toml"
@@ -158,6 +158,13 @@ policy_file = "~/.config/bgh/policy.toml"
 	fmt.Fprintf(os.Stderr, "\nbgh-proxy: initialization complete\n")
 	return nil
 }
+
+// ghCLIClientID is the GitHub CLI's public OAuth App client id. Using it makes
+// `bgh-proxy login` behave like `gh auth login` with no OAuth App to register — the
+// device flow authorizes the same "GitHub CLI" app and yields the same kind of token.
+// Override with --client-id / BGH_OAUTH_CLIENT_ID / oauth_client_id to use your own app.
+const ghCLIClientID = "178c6fc778ccc68e1d6a"
+const ghCLIScopes = "repo read:org gist workflow"
 
 func cmdLogin(args []string) error {
 	clientID, scopes := "", ""
@@ -200,9 +207,11 @@ func cmdLogin(args []string) error {
 		}
 	}
 	if clientID == "" {
-		return fmt.Errorf("no OAuth client id. Register a GitHub OAuth App with Device Flow enabled\n" +
-			"(https://github.com/settings/applications/new), then pass --client-id, set\n" +
-			"BGH_OAUTH_CLIENT_ID, or add oauth_client_id to config.toml")
+		// No app configured: mimic the gh CLI using its public OAuth app.
+		clientID = ghCLIClientID
+		if scopes == "" {
+			scopes = ghCLIScopes
+		}
 	}
 	if scopes == "" {
 		scopes = "repo read:org"
