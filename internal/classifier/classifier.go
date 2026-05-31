@@ -203,12 +203,20 @@ func classifyGraphQL(body []byte) Result {
 		scopes = append(scopes, s)
 	}
 	tooComplex := false
+	escapes := false
 	for _, op := range ops {
-		collectGraphQLScopes(op.SelectionSet, doc.Fragments, req.Variables, add, 0, &tooComplex)
+		collectGraphQLScopes(op.SelectionSet, doc.Fragments, req.Variables, add, 0, &tooComplex, &escapes)
 	}
 	if tooComplex {
 		// A query too deep/cyclic to fully walk could hide a denied scope past the
 		// recursion bound. Fail closed by treating it like an unparseable query.
+		return Result{Access: Write}
+	}
+	if escapes {
+		// The query enters through a repository/node scope but then navigates to OTHER
+		// repositories via fields (owner.repositories, forks, headRepository, ...). The
+		// classifier can't bound that, and the proxy streams responses unfiltered, so a
+		// scoped entry point would otherwise leak arbitrary repos. Fail closed.
 		return Result{Access: Write}
 	}
 
@@ -316,13 +324,57 @@ func gqlUnscopedCategory(doc *ast.QueryDocument) string {
 // than this bound; exceeding it sets *tooComplex and the caller fails closed.
 const maxGraphQLDepth = 200
 
+// gqlCrossRepoNavFields are fields that navigate from one repository/object to a
+// DIFFERENT repository. GitHub executes them and the proxy streams the response
+// unfiltered, so when any appears inside a scoped repository()/node() selection the
+// classifier cannot bound which repos the response touches — it fails closed.
+var gqlCrossRepoNavFields = map[string]bool{
+	"repositories":       true, // owner.repositories — enumerate all of an owner's repos
+	"repository":         true, // owner.repository(name:) — navigate to a named repo
+	"forks":              true,
+	"parent":             true,
+	"source":             true, // fork source / cross-referenced object
+	"templateRepository": true,
+	"headRepository":     true,
+	"baseRepository":     true,
+}
+
+// scanCrossRepoNav reports (via *escapes) whether a selection subtree navigates to
+// another repository. It is run on the children of a resolved repository()/node()
+// scope, which are otherwise not policy-checked.
+func scanCrossRepoNav(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, escapes *bool, depth int, tooComplex *bool) {
+	if *escapes {
+		return
+	}
+	if depth > maxGraphQLDepth {
+		*tooComplex = true
+		return
+	}
+	for _, sel := range sels {
+		switch s := sel.(type) {
+		case *ast.Field:
+			if gqlCrossRepoNavFields[s.Name] {
+				*escapes = true
+				return
+			}
+			scanCrossRepoNav(s.SelectionSet, fragments, escapes, depth+1, tooComplex)
+		case *ast.InlineFragment:
+			scanCrossRepoNav(s.SelectionSet, fragments, escapes, depth+1, tooComplex)
+		case *ast.FragmentSpread:
+			if frag := fragments.ForName(s.Name); frag != nil {
+				scanCrossRepoNav(frag.SelectionSet, fragments, escapes, depth+1, tooComplex)
+			}
+		}
+	}
+}
+
 // collectGraphQLScopes walks the selection set and emits a Scope for every
-// repository/organization/search/unscoped target it finds — not just the first.
-// A resolved repository/search field is not descended into: its own resource is
-// captured by gqlRepoResource, and cross-referenced foreign objects beneath it
-// must not be mistaken for additional top-level targets.
-func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(Scope), depth int, tooComplex *bool) {
-	if *tooComplex {
+// repository/organization/search/unscoped target it finds — not just the first. A
+// resolved repository/search field is not descended into for scope collection (its
+// resource is captured by gqlRepoResource), but its subtree IS scanned for cross-repo
+// navigation, which would otherwise reach repos the entry scope doesn't cover.
+func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(Scope), depth int, tooComplex *bool, escapes *bool) {
+	if *tooComplex || *escapes {
 		return
 	}
 	if depth > maxGraphQLDepth {
@@ -338,6 +390,7 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 				name := resolveStringArg(s.Arguments, "name", vars)
 				if owner != "" && name != "" {
 					add(Scope{Owner: owner, Repo: name, Resource: gqlRepoResource(s)})
+					scanCrossRepoNav(s.SelectionSet, fragments, escapes, depth+1, tooComplex)
 					continue
 				}
 			case "organization", "repositoryOwner":
@@ -363,15 +416,20 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 			case "rateLimit":
 				add(Scope{UnscopedCategory: "meta"})
 				continue
+			case "node", "nodes":
+				// Addressed by node ID (resolved + policy-checked by the proxy); scan
+				// the selection so navigation off the node also fails closed.
+				scanCrossRepoNav(s.SelectionSet, fragments, escapes, depth+1, tooComplex)
+				continue
 			}
 			if len(s.SelectionSet) > 0 {
-				collectGraphQLScopes(s.SelectionSet, fragments, vars, add, depth+1, tooComplex)
+				collectGraphQLScopes(s.SelectionSet, fragments, vars, add, depth+1, tooComplex, escapes)
 			}
 		case *ast.InlineFragment:
-			collectGraphQLScopes(s.SelectionSet, fragments, vars, add, depth+1, tooComplex)
+			collectGraphQLScopes(s.SelectionSet, fragments, vars, add, depth+1, tooComplex, escapes)
 		case *ast.FragmentSpread:
 			if frag := fragments.ForName(s.Name); frag != nil {
-				collectGraphQLScopes(frag.SelectionSet, fragments, vars, add, depth+1, tooComplex)
+				collectGraphQLScopes(frag.SelectionSet, fragments, vars, add, depth+1, tooComplex, escapes)
 			}
 		}
 	}

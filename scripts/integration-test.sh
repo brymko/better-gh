@@ -51,6 +51,8 @@ w("multiroot",f'query{{a:repository(owner:"{o}",name:"{allow}"){{name}} b:reposi
 w("nodeid",   f'query{{node(id:"{node}"){{... on Issue{{title body}}}}}}')
 w("search",   f'query{{search(query:"repo:{o}/{deny} {mark}",type:ISSUE,first:5){{nodes{{... on Issue{{title body}}}}}}}}')
 w("mutation", f'mutation{{addComment(input:{{subjectId:"{node}",body:"x"}}){{clientMutationId}}}}')
+w("nav_repos",f'query{{repository(owner:"{o}",name:"{allow}"){{owner{{repositories(first:100){{nodes{{name issues(first:10){{nodes{{body}}}}}}}}}}}}}}')
+w("nav_byname",f'query{{repository(owner:"{o}",name:"{allow}"){{owner{{repository(name:"{deny}"){{issues(first:5){{nodes{{body}}}}}}}}}}}}')
 w("allowed",  f'query{{repository(owner:"{o}",name:"{allow}"){{issue(number:1){{title}}}}}}')
 PY
 
@@ -92,6 +94,8 @@ gql  "GraphQL multi-root"     multiroot
 gql  "GraphQL node(id) read"  nodeid
 gql  "GraphQL search repo:"   search
 gql  "GraphQL node-id mutation" mutation
+gql  "GraphQL nav owner.repositories" nav_repos
+gql  "GraphQL nav owner.repository(denied)" nav_byname
 echo "== the allowed repo must still work =="
 code "REST allowed issue"  200 "http://localhost/repos/$OWNER/$ALLOW/issues/1"
 code "GraphQL allowed"     200 -X POST http://localhost/graphql -d @"$BODYDIR/allowed.json"

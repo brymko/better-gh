@@ -510,8 +510,10 @@ The proxy holds one **powerful upstream GitHub token** and hands out **narrow ac
 - Names match case-insensitively (GitHub routes them that way), so a re-cased path can't dodge a rule.
 - Requests with `.`/`..` path segments (including `%2F`-encoded) are rejected `400`.
 - Unparseable, over-deep, or cyclic GraphQL fails closed (denied), and never crashes the proxy.
+- GraphQL reads that enter via an allowed `repository()`/`node()` but then **navigate to other repos** via fields (`owner.repositories`, `owner.repository(name:)`, `forks`, `parent`, `headRepository`, …) are **denied** — the classifier scans for these and fails closed, since the proxy streams responses unfiltered.
 
 **What is *not* a boundary** — read these before trusting it:
+- **The upstream token sees everything, so GraphQL isolation is best-effort.** The proxy denies the *known* cross-repo navigation fields (above), but that is a denylist, not a proof: org-scoped enumeration, `search` results, and cross-reference fields can still reach data the upstream token can see. **The only hard boundary is the upstream token's own scope** — for real isolation between repos, give the proxy a **fine-grained PAT** limited to the repos it should reach (then GitHub itself blocks the rest), rather than relying on per-repo policy over a broad token.
 - **`search` and `user` are powerful.** They run against the real token, so enabling `search = "read"` lets a client search across *every* repo the upstream token can see (including repos you `none`'d), and `user = "read"` allows `viewer { repositories { … } }`, which enumerates them. Leave these denied unless that exposure is acceptable.
 - The proxy is **allow/deny per request**, not a response filter — it does not redact fields or rewrite bodies.
 - It does not authenticate *which* local process uses the socket, only that it is your user.

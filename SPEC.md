@@ -116,7 +116,9 @@ The adversary is a holder of a proxy token (GHE) or any local process running as
 
 Enforced: deny-by-default; per-repo/org/resource read/write; multi-scope GraphQL (every touched repo checked); authoritative mutation scoping (no mis-attribution); case-insensitive name matching; path-traversal rejection; fail-closed on parse/resolve/complexity failures; no token leakage to clients; constant-time secret comparison; least-privilege file modes.
 
-Explicitly **not** boundaries (see README → Security model): the `search` and `user` unscoped categories run against the powerful token and can expose data from otherwise-denied repos; the proxy filters whole requests, not response fields; socket mode authenticates the user, not the process; mutation extraction is bounded by a node-ID prefix allowlist (unknown types fail closed).
+GraphQL reads that enter via an allowed `repository()`/`node()` and then navigate to other repos via fields (`owner.repositories`, `forks`, `headRepository`, …) are detected by `scanCrossRepoNav` and fail closed.
+
+Explicitly **not** boundaries (see README → Security model): the upstream token sees everything, so GraphQL isolation is a denylist, not a proof (org enumeration, `search` results, and cross-references can still reach token-visible data — a fine-grained upstream PAT is the only hard boundary); the `search` and `user` unscoped categories run against the powerful token; the proxy filters whole requests, not response fields; socket mode authenticates the user, not the process; mutation extraction is bounded by a node-ID prefix allowlist (unknown types fail closed).
 
 ## Technology
 

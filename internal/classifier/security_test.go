@@ -5,6 +5,7 @@ package classifier
 // it, the test fails.
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -139,6 +140,50 @@ func TestSec_NodeIDReadExtracted(t *testing.T) {
 	if got["U_user"] {
 		t.Fatalf("user node id must not be extracted, got %v", r2.NodeIDs)
 	}
+}
+
+// FINDING 9 (CRITICAL): GraphQL field-navigation cross-repo read. A query enters via
+// an allowed repository() but then navigates to OTHER repos via fields
+// (owner.repositories, owner.repository(name:), forks, headRepository, ...). GitHub
+// executes it and the proxy streams the response, so a scoped entry point leaked
+// arbitrary repos. The classifier now scans repository()/node() subtrees for such
+// navigation and fails closed (returns Write → unscoped → denied).
+func TestSec_GraphQLCrossRepoNavFailsClosed(t *testing.T) {
+	escaping := []string{
+		`query{repository(owner:"o",name:"r"){owner{repositories(first:50){nodes{name}}}}}`,
+		`query{repository(owner:"o",name:"r"){owner{repository(name:"other"){issues{nodes{body}}}}}}`,
+		`query{repository(owner:"o",name:"r"){pullRequest(number:1){headRepository{nameWithOwner}}}}`,
+		`query{repository(owner:"o",name:"r"){forks(first:5){nodes{nameWithOwner}}}}`,
+		`query{repository(owner:"o",name:"r"){parent{nameWithOwner}}}`,
+		`query{node(id:"R_kgDOx"){... on Repository{owner{repositories(first:5){nodes{name}}}}}}`,
+	}
+	for _, q := range escaping {
+		r := Classify("POST", "/api/graphql", []byte(`{"query":`+jsonStr(q)+`}`))
+		if r.HasRepo() || len(r.Additional) > 0 {
+			t.Errorf("cross-repo nav must NOT yield an allowable repo scope; query=%s scope=%s+%v", q, r.RepoFullName(), r.Additional)
+		}
+		if r.Access != Write {
+			t.Errorf("cross-repo nav should fail closed (Write→unscoped deny); got %v for %s", r.Access, q)
+		}
+	}
+
+	// Legit in-repo queries (including owner.login) must NOT be flagged.
+	legit := []string{
+		`query{repository(owner:"o",name:"r"){issue(number:1){title body}}}`,
+		`query{repository(owner:"o",name:"r"){name owner{login} pullRequests(first:1){nodes{title}}}}`,
+		`query{repository(owner:"o",name:"r"){defaultBranchRef{name target{... on Commit{oid}}}}}`,
+	}
+	for _, q := range legit {
+		r := Classify("POST", "/api/graphql", []byte(`{"query":`+jsonStr(q)+`}`))
+		if r.RepoFullName() != "o/r" || r.Access != Read {
+			t.Errorf("legit in-repo query mis-handled: query=%s repo=%q access=%v", q, r.RepoFullName(), r.Access)
+		}
+	}
+}
+
+func jsonStr(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 func scopesContainRepo(r Result, owner, repo string) bool {
