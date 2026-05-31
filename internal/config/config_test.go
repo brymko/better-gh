@@ -57,6 +57,7 @@ func TestLoadEnvVarOverridesFile(t *testing.T) {
 
 func TestLoadMissingTokenReturnsError(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("HOME", dir) // isolate DefaultDir so no stray github-token file is found
 	cfgPath := filepath.Join(dir, "config.toml")
 	os.WriteFile(cfgPath, []byte(`mode = "socket"`), 0o644)
 
@@ -64,6 +65,40 @@ func TestLoadMissingTokenReturnsError(t *testing.T) {
 	_, err := Load(cfgPath)
 	if err == nil {
 		t.Fatal("expected error for missing github token")
+	}
+}
+
+func TestLoadTokenFromLoginFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("BGH_GITHUB_TOKEN", "")
+	bghDir := filepath.Join(home, ".config", "bgh")
+	os.MkdirAll(bghDir, 0o700)
+	os.WriteFile(filepath.Join(bghDir, "github-token"), []byte("gho_fromlogin\n"), 0o600)
+
+	cfg, err := Load(filepath.Join(bghDir, "config.toml")) // no such file → defaults
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GithubToken != "gho_fromlogin" {
+		t.Fatalf("expected token from login file, got %q", cfg.GithubToken)
+	}
+}
+
+func TestLoadEnvOverridesLoginFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("BGH_GITHUB_TOKEN", "gho_fromenv")
+	bghDir := filepath.Join(home, ".config", "bgh")
+	os.MkdirAll(bghDir, 0o700)
+	os.WriteFile(filepath.Join(bghDir, "github-token"), []byte("gho_fromlogin"), 0o600)
+
+	cfg, err := Load(filepath.Join(bghDir, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GithubToken != "gho_fromenv" {
+		t.Fatalf("env should override login file, got %q", cfg.GithubToken)
 	}
 }
 

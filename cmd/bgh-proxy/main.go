@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"better-gh/internal/auth"
 	"better-gh/internal/config"
 	"better-gh/internal/nodecache"
+	"better-gh/internal/oauth"
 	"better-gh/internal/policy"
 	"better-gh/internal/proxy"
 	"better-gh/internal/store"
@@ -41,6 +43,8 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		err = cmdInit()
+	case "login":
+		err = cmdLogin(os.Args[2:])
 	case "serve":
 		configPath := ""
 		for i := 2; i < len(os.Args); i++ {
@@ -68,6 +72,8 @@ func usage() {
 
 Usage:
   bgh-proxy init                    Generate config, policy, and TLS certs
+  bgh-proxy login [--client-id ID] [--scopes "repo read:org"]
+                                    Obtain the upstream GitHub token via device flow
   bgh-proxy serve [--config path]   Start the proxy
   bgh-proxy token <subcommand>      Manage proxy tokens
 
@@ -131,7 +137,15 @@ mode = "deny"
 admin_bind = "127.0.0.1:7844"  # plain HTTP for admin UI
 socket = "~/.config/bgh/proxy.sock"
 mode = "both"          # "socket", "ghe", or "both"
-# github_token = "ghp_..."  # or set BGH_GITHUB_TOKEN env var
+
+# Upstream GitHub token (one of):
+#   - set BGH_GITHUB_TOKEN env var, or
+#   - github_token = "ghp_..." below, or
+#   - run 'bgh-proxy login' (device flow) after setting oauth_client_id
+# github_token = "ghp_..."
+# oauth_client_id = "Iv1...."   # a GitHub OAuth App (Device Flow enabled) for 'bgh-proxy login'
+# oauth_scopes = "repo read:org"
+
 audit_log = "~/.config/bgh/audit.jsonl"
 policy_file = "~/.config/bgh/policy.toml"
 `
@@ -142,6 +156,76 @@ policy_file = "~/.config/bgh/policy.toml"
 	}
 
 	fmt.Fprintf(os.Stderr, "\nbgh-proxy: initialization complete\n")
+	return nil
+}
+
+func cmdLogin(args []string) error {
+	clientID, scopes := "", ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--client-id":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--client-id requires a value")
+			}
+			i++
+			clientID = args[i]
+		case "--scopes":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--scopes requires a value")
+			}
+			i++
+			scopes = args[i]
+		default:
+			return fmt.Errorf("unknown flag: %s", args[i])
+		}
+	}
+
+	if clientID == "" {
+		clientID = os.Getenv("BGH_OAUTH_CLIENT_ID")
+	}
+	// Fall back to oauth_client_id / oauth_scopes in config.toml (without requiring a
+	// token, which cmdServe's config.Load would).
+	if data, err := os.ReadFile(filepath.Join(config.DefaultDir(), "config.toml")); err == nil {
+		var p struct {
+			OAuthClientID string `toml:"oauth_client_id"`
+			OAuthScopes   string `toml:"oauth_scopes"`
+		}
+		if toml.Unmarshal(data, &p) == nil {
+			if clientID == "" {
+				clientID = p.OAuthClientID
+			}
+			if scopes == "" {
+				scopes = p.OAuthScopes
+			}
+		}
+	}
+	if clientID == "" {
+		return fmt.Errorf("no OAuth client id. Register a GitHub OAuth App with Device Flow enabled\n" +
+			"(https://github.com/settings/applications/new), then pass --client-id, set\n" +
+			"BGH_OAUTH_CLIENT_ID, or add oauth_client_id to config.toml")
+	}
+	if scopes == "" {
+		scopes = "repo read:org"
+	}
+
+	token, err := oauth.DeviceFlow(context.Background(), oauth.Config{
+		ClientID: clientID,
+		Scopes:   scopes,
+		Client:   &http.Client{Timeout: 30 * time.Second},
+		Out:      os.Stderr,
+	})
+	if err != nil {
+		return err
+	}
+
+	path := config.GithubTokenFilePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(token), 0o600); err != nil {
+		return fmt.Errorf("storing token: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "\nbgh-proxy: authorized. Upstream token stored at %s\n  Start the proxy with: bgh-proxy serve\n", path)
 	return nil
 }
 

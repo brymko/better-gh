@@ -10,19 +10,26 @@ import (
 )
 
 type Config struct {
-	Bind        string `toml:"bind"`
-	AdminBind   string `toml:"admin_bind"`
-	Socket      string `toml:"socket"`
-	GithubToken string `toml:"github_token"`
-	AuditLog    string `toml:"audit_log"`
-	PolicyFile  string `toml:"policy_file"`
-	TLSDir      string `toml:"tls_dir"`
-	Mode        string `toml:"mode"`
+	Bind          string `toml:"bind"`
+	AdminBind     string `toml:"admin_bind"`
+	Socket        string `toml:"socket"`
+	GithubToken   string `toml:"github_token"`
+	OAuthClientID string `toml:"oauth_client_id"`
+	OAuthScopes   string `toml:"oauth_scopes"`
+	AuditLog      string `toml:"audit_log"`
+	PolicyFile    string `toml:"policy_file"`
+	TLSDir        string `toml:"tls_dir"`
+	Mode          string `toml:"mode"`
 }
 
 func DefaultDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "bgh")
+}
+
+// GithubTokenFilePath is where `bgh-proxy login` persists the upstream token.
+func GithubTokenFilePath() string {
+	return filepath.Join(DefaultDir(), "github-token")
 }
 
 func Load(path string) (*Config, error) {
@@ -43,12 +50,18 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// Upstream-token resolution order: env var, then github_token in config, then the
+	// token file written by `bgh-proxy login`.
 	if tok := os.Getenv("BGH_GITHUB_TOKEN"); tok != "" {
 		c.GithubToken = tok
+	} else if c.GithubToken == "" {
+		if data, err := os.ReadFile(GithubTokenFilePath()); err == nil {
+			c.GithubToken = strings.TrimSpace(string(data))
+		}
 	}
 
 	if c.GithubToken == "" {
-		return nil, fmt.Errorf("no GitHub token: set BGH_GITHUB_TOKEN or github_token in config")
+		return nil, fmt.Errorf("no GitHub token: run `bgh-proxy login`, set BGH_GITHUB_TOKEN, or set github_token in config")
 	}
 
 	if c.AuditLog == "" {
