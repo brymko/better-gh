@@ -55,6 +55,46 @@ func TestLookupNotFound(t *testing.T) {
 	}
 }
 
+// Lookup must return a COPY, not a pointer into the token slice: a request uses the
+// result after releasing the lock, and Delete shifts the slice in place. A live pointer
+// would be clobbered — repointed to a different token's policy. This reproduces the bug
+// deterministically (no timing): tokens created AFTER the victim mean deleting tokens
+// created BEFORE it overwrites, in place, the slot Lookup pointed at.
+func TestLookupReturnsCopyNotSlicePointer(t *testing.T) {
+	s := openTestStore(t)
+	var before []string
+	for i := 0; i < 8; i++ {
+		tok, _, err := s.Create(fmt.Sprintf("before-%d", i), testPolicy())
+		if err != nil {
+			t.Fatal(err)
+		}
+		before = append(before, tok.ID)
+	}
+	victim, secret, err := s.Create("victim", policy.Policy{Defaults: policy.Defaults{Mode: policy.ModeAllow}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	victimID := victim.ID // copy the value now; Create also returns a slice pointer
+	for i := 0; i < 8; i++ { // tokens AFTER victim so its slot is overwritten on shift
+		if _, _, err := s.Create(fmt.Sprintf("after-%d", i), testPolicy()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := s.Lookup(secret)
+	if got == nil || got.Name != "victim" {
+		t.Fatalf("setup: victim lookup failed: %#v", got)
+	}
+
+	for _, id := range before {
+		s.Delete(id) // shifts the slice in place, over the slot victim occupied
+	}
+
+	if got.Name != "victim" || got.ID != victimID || got.Policy.Defaults.Mode != policy.ModeAllow {
+		t.Fatalf("Lookup result was clobbered by Delete (got %q/%s) — Lookup must return a copy", got.Name, got.ID)
+	}
+}
+
 func TestList(t *testing.T) {
 	s := openTestStore(t)
 

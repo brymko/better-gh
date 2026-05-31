@@ -91,7 +91,9 @@ func (s *Store) Create(name string, pol policy.Policy) (*ProxyToken, string, err
 		s.tokens = s.tokens[:len(s.tokens)-1]
 		return nil, "", err
 	}
-	return &s.tokens[len(s.tokens)-1], secret, nil
+	// Return a copy of the local value, not &s.tokens[...]: a later append/Delete can
+	// reallocate or shift the slice, clobbering a pointer into it.
+	return &tok, secret, nil
 }
 
 func (s *Store) Lookup(secret string) *ProxyToken {
@@ -102,7 +104,11 @@ func (s *Store) Lookup(secret string) *ProxyToken {
 	defer s.mu.RUnlock()
 	for i := range s.tokens {
 		if subtle.ConstantTimeCompare([]byte(s.tokens[i].SecretHash), []byte(hexHash)) == 1 && !s.tokens[i].Revoked {
-			return &s.tokens[i]
+			// Return a COPY, not &s.tokens[i]: the caller uses the result after releasing
+			// the lock, and a concurrent Delete shifts the slice in place — a live pointer
+			// into it could be repointed to a different token's policy. (Get does the same.)
+			tok := s.tokens[i]
+			return &tok
 		}
 	}
 	return nil
