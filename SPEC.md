@@ -1,216 +1,129 @@
-# better-gh
+# bgh-proxy — design & architecture
 
-A transparent GitHub API proxy that adds per-repo/per-org read/write access policies, audit logging, and token custody — so the real token never leaves the server. Works with the stock `gh` CLI and any GitHub API client.
+A transparent GitHub API proxy that adds per-repo/per-org/per-resource read/write access policy, audit logging, and token custody — so the powerful GitHub token never leaves the proxy host. Works with the stock `gh` CLI and any GitHub API client.
+
+This document describes how the proxy is built and the security properties it aims to provide. For configuration, the policy language, and operational guidance see [README.md](README.md).
 
 ## Problem
 
-The `gh` CLI has fundamental security design flaws:
+The `gh` CLI's token model is coarse: `gh auth login` mints a token with `repo` (full read/write to every private repo you can see), `read:org`, and `gist`; it never expires; and it lives on the client (keychain, or plaintext `~/.config/gh/hosts.yml`). There is no read-only scope for private code, no per-repo granularity, and no audit trail. A compromised laptop means full access to everything.
 
-1. **Overly broad default permissions** — `gh auth login` requests `repo` (full read/write to all private repos), `read:org`, and `gist`. There is no read-only OAuth scope for private repository code. Users who only need to read PRs still get write access to every repo they can see.
-
-2. **Long-lived token on client machines** — The OAuth token (`gho_*`) is stored in the system keychain or, on fallback, in plaintext at `~/.config/gh/hosts.yml`. This token never expires and grants full access. A compromised laptop means full repository access.
-
-3. **No per-repo/per-org granularity** — The token is all-or-nothing. You cannot say "read-only for org X, read-write for repo Y, no access to org Z." Every `gh` invocation carries the same god-mode token.
-
-4. **No audit trail** — There is no record of which CLI invocations hit which API endpoints.
+`bgh-proxy` keeps the real token on a server and gives each client a narrowly-scoped credential plus an audit log.
 
 ## Architecture
 
-The proxy impersonates the GitHub API. Clients (`gh`, `curl`, libraries) connect to it as if it were a GitHub Enterprise instance. The proxy evaluates policy, swaps in the real token, forwards to `api.github.com`, and returns the response.
+The proxy impersonates the GitHub API. Clients (`gh`, `curl`, libraries) connect to it as if it were GitHub Enterprise. The proxy classifies the request, evaluates policy, swaps in the real token, forwards to `api.github.com`, and streams the response back.
 
 ```
-┌──────────────┐  /api/v3/repos/o/r/pulls  ┌──────────────┐  real token  ┌──────────────┐
-│  gh CLI      │ ─────────────────────────▶ │  bgh-proxy   │ ──────────▶ │  GitHub API  │
-│  curl        │  Auth: Bearer <proxy-secret>│              │             │              │
-│  any client  │ ◀───────────────────────── │  ┌────────┐  │ ◀────────── │              │
-└──────────────┘    passthrough response    │  │ policy │  │  response   └──────────────┘
-                                            │  │ engine │  │
-  No real GitHub token                      │  ├────────┤  │
-  ever reaches the client.                  │  │ audit  │  │
-                                            │  │ log    │  │
-                                            │  └────────┘  │
-                                            └──────────────┘
+┌────────────┐  /api/v3/repos/o/r/pulls   ┌─────────── bgh-proxy ───────────┐   real token   ┌────────────┐
+│ gh / curl  │ ─────────────────────────▶ │ auth → classify → policy → fwd  │ ─────────────▶ │ GitHub API │
+│ any client │  Authorization: <proxy tok>│        │           │            │                │            │
+└────────────┘ ◀───────────────────────── │      audit       node          │ ◀───────────── └────────────┘
+                  passthrough response     │      log         resolver      │   response
+                                           └─────────────────────────────────┘
 ```
 
-### Client setup (stock `gh`)
+The real GitHub token never reaches the client.
 
-```bash
-# Point gh at the proxy as a "GitHub Enterprise" host
-gh auth login --hostname bgh.local
-# Enter the proxy-issued secret as the "token"
-# All gh commands now go through the proxy:
-gh pr list -R my-company/frontend   # proxied, policy-checked, audited
-```
+### Components (Go packages)
 
-No custom CLI required. Every `gh` command, extension, and alias works.
+| Package | Responsibility |
+|---|---|
+| `internal/proxy` | Request pipeline, header rewriting, response streaming, node resolver |
+| `internal/classifier` | Extract `(owner, repo, org, access, resource, …)` from REST paths and GraphQL bodies |
+| `internal/policy` | Evaluate a classified request against a TOML policy |
+| `internal/nodecache` | Verified node-ID → repository cache (populated only by the resolver) |
+| `internal/store` | Proxy-token persistence (`tokens.json`), SHA-256 hashed, constant-time lookup |
+| `internal/auth` | Client/admin secret extraction and generation |
+| `internal/audit` | Async JSONL audit logger |
+| `internal/config`, `internal/tlsgen`, `internal/web` | Config loading, self-signed TLS, admin UI/API |
+| `cmd/bgh-proxy` | CLI: `init`, `serve`, `token …` |
 
-## v1 Scope
+## Request pipeline
 
-v1 is a **single-user local proxy** with:
+`proxy.Handler.ServeHTTP` runs each request through:
 
-- One GitHub token (env var or plaintext config — encrypted storage is v2)
-- Local-only auth (shared secret on localhost)
-- REST request classification (URL path parsing)
-- GraphQL: mutation vs query detection only (mutations = write, queries = read). Repo extraction from GraphQL is v2 — v1 applies org/repo policy based on what can be extracted, falls back to the global default for unclassifiable GraphQL queries.
-- Per-org and per-repo `read` / `read-write` / `none` policy
-- JSONL audit log
-- No TLS required (localhost only)
+1. **Authenticate.** GHE mode requires a proxy token in `Authorization`; it is looked up (constant-time) in the store. Socket mode ignores the client token and uses the single socket policy.
+2. **GHE handshake shortcuts.** `GET /api/v3` returns a root document with `X-OAuth-Scopes`; `GET /api/v3/user` returns a synthetic identity. These let `gh auth login`/`status` complete without forwarding.
+3. **Reject path traversal.** Any request whose path contains a `.`/`..` segment (after percent-decoding) is rejected `400`, so the path the classifier sees is the path GitHub would route.
+4. **Classify** into one or more scopes (see below).
+5. **Resolve mutation scopes.** For a GraphQL mutation, resolve referenced node IDs to repositories via GitHub (see below). Skipped if the policy can never write.
+6. **Evaluate policy** for every scope; deny (`403`) if any scope is denied.
+7. **Forward.** Build a fresh upstream request: copy the client's headers (minus `Authorization`, `Host`, length, and hop-by-hop), set `Authorization: token <real-token>` and `X-GitHub-Api-Version`, default `Accept`/`User-Agent`/`Content-Type` only if absent. Stream status, headers, and body back verbatim.
+8. **Audit** the decision (allowed/denied + upstream status) as one JSONL line.
 
-### What v1 does NOT include
+## Classification
 
-- mTLS / team mode
-- Multi-token routing
-- Fine-grained per-resource-type policy (pull_requests vs issues vs contents) — v1 treats the whole repo as one unit
-- Encrypted token storage
-- Policy hot-reload
-- GraphQL repo extraction
+`classifier.Classify(method, path, body)` returns a primary scope plus any `Additional` scopes and, for mutations, the referenced node IDs. Access level: REST `GET`/`HEAD` = read, else write; GraphQL `query` = read, any `mutation` = write (fail-closed: unparseable/over-complex bodies are treated as write).
 
-## Components
+### REST
 
-### 1. Transparent Reverse Proxy
-
-- Listens on `127.0.0.1:7843` (configurable).
-- Catch-all handler for `/api/v3/*` and `/api/graphql`.
-- Request pipeline:
-  1. Validate client secret from `Authorization` header
-  2. Classify request (extract owner/repo, determine read vs write)
-  3. Evaluate policy
-  4. If denied: return 403 with `{ "message": "bgh: policy denied — ..." }`
-  5. If allowed: rewrite URL, swap auth header, forward to `https://api.github.com`
-- Stream GitHub's response back verbatim (status, headers, body).
-- Serve `GET /api/v3` root endpoint for `gh`'s GHE handshake.
-
-### 2. Request Classifier
-
-Extracts `(owner/repo, read|write)` from each request.
-
-#### REST
-
-URL path parsing — the GitHub REST API is regular:
+GitHub's REST API is path-regular:
 
 ```
-/api/v3/repos/{owner}/{repo}/**  →  repo = "{owner}/{repo}"
-/api/v3/orgs/{org}/**            →  org  = "{org}"
-/api/v3/user/**                  →  (no repo, user-level)
-/api/v3/search/**                →  (no repo, search)
+/repos/{owner}/{repo}/{seg}/…  → repo = owner/repo, resource from {seg}
+/orgs/{org}/…                  → org
+/users/{user}/…                → org = user
+everything else                → unscoped category from the first segment
 ```
 
-Access level from HTTP method: `GET`/`HEAD` → `read`, everything else → `write`.
+The `resource` maps the first sub-segment (`pulls`, `issues`, `actions`, …) to a permission key. An unrecognized sub-segment yields a distinct `ResourceUnknown` sentinel: for a **write** under a rule that defines per-resource permissions, the policy fails closed rather than inheriting the base grant (so an unmapped write endpoint can't escape a per-resource `none`).
 
-#### GraphQL (v1 — minimal)
+### GraphQL — multi-scope
 
-Parse the JSON body, extract the `query` string, check if it starts with `mutation` (after stripping leading whitespace and operation names). Mutations → `write`, everything else → `read`.
+A GraphQL document can touch many repositories/orgs in one operation, and GitHub executes all root fields. The classifier therefore walks the AST and collects **every** scope:
 
-v1 does **not** extract repo references from GraphQL. The policy decision uses:
-- The global default for GraphQL queries where no repo can be determined.
-- This is safe under deny-by-default: unclassifiable requests hit the default (deny).
+- `repository(owner:, name:)` → a repo scope (with resource inferred from its sub-selection);
+- `organization`/`repositoryOwner(login:)` → an org scope;
+- `search(query:)` → one repo scope per `repo:` qualifier, else an unscoped `search`;
+- `viewer` → unscoped `user`; `rateLimit` → unscoped `meta`.
 
-### 3. Policy Engine
+Variables are resolved. `operationName` is honored — only the executed operation is classified. The policy must allow **all** collected scopes. The AST walk is depth-bounded and fails closed on cyclic fragments / excessive nesting (an unbounded recursive walk would otherwise crash the process — `parser.ParseQuery` validates neither).
 
-Simple two-level policy: org defaults, repo overrides.
+### GraphQL mutations — authoritative node resolution
 
-```toml
-[defaults]
-mode = "deny"              # "deny" or "allow"
+Mutations carry no `repository()` scope; they address objects by opaque node ID. Guessing the repository from earlier reads is unsafe (a response for repo A can contain node IDs belonging to repo B via cross-references), so the proxy resolves authoritatively:
 
-[[org]]
-name = "my-company"
-access = "read"            # default for all repos in this org
+1. The classifier extracts repo-scoped node IDs from the mutation's inline arguments and variables (id-typed keys, filtered by a repo-scoped node-ID prefix allowlist so user/org IDs are excluded).
+2. `proxy.resolveNodeScopes` looks each up in the verified `nodecache`; on a miss it asks GitHub `query{ nodes(ids:){ … on RepositoryNode { repository { nameWithOwner } } … } }` and caches the verified mapping (30 min TTL).
+3. Each resolved repository becomes a scope; the policy must allow a write to all of them.
 
-[[repo]]
-name = "my-company/deploy-infra"
-access = "none"            # block completely
+Any node that cannot be resolved (unknown ID, upstream error, unrecognized type, or more than 100 IDs) leaves the request without a complete scope set and it is denied as an unscoped write. The `nodecache` only ever stores mappings the resolver verified — it is never populated by sniffing responses.
 
-[[repo]]
-name = "my-company/frontend"
-access = "read-write"      # allow writes
+## Policy engine
 
-[[repo]]
-name = "personal/dotfiles"
-access = "read-write"      # non-org repo
-```
+`policy.Evaluate(repo, org, access, resource, unscopedCategory)` resolves in order:
 
-**Access levels**:
-- `none` — 403, request never reaches GitHub
-- `read` — GET/HEAD/GraphQL queries allowed, writes rejected
-- `write` — alias for `read-write`, all operations allowed
+1. exact `[[repo]]` match (case-insensitive) → per-resource permission if present, else base `access`; unknown-resource writes under a permissioned rule fail closed;
+2. exact `[[org]]` match (case-insensitive) → same;
+3. `[defaults.unscoped][category]` when there is no repo/org;
+4. unscoped writes with no repo/org are denied unconditionally;
+5. `[defaults].mode` (`deny`/`allow`).
 
-**Resolution order**: exact repo match → org default → global default.
+`Access` levels: `none` (nothing), `read` (read only), `read-write` (everything). For multi-scope requests the proxy ANDs the per-scope decisions.
 
-No glob patterns in v1 — exact match only.
+## Token & secret model
 
-### 4. Audit Log
+- **Proxy tokens** (GHE mode): random 256-bit secrets, stored as SHA-256 hashes in `tokens.json` (`0600`), each carrying an embedded policy. Looked up in constant time; revocation and hard-deletion both go through the running server so they take effect immediately. `tokens.json` is written atomically (temp + rename).
+- **Admin secret**: gates the token-minting API/UI; generated once and reused across restarts; file `0600`.
+- **Socket**: created with a restrictive umask so it is `0600` from the moment it exists; only the owning user can connect.
+- **Real GitHub token**: from `BGH_GITHUB_TOKEN` (preferred) or `github_token` in config; held only in proxy memory/config, never sent to clients.
 
-Every request logged as JSONL, appended to a configured file:
+## Security properties & threat model
 
-```json
-{
-  "ts": "2026-05-26T14:30:00Z",
-  "method": "GET",
-  "path": "/repos/my-company/frontend/pulls",
-  "repo": "my-company/frontend",
-  "access": "read",
-  "policy_result": "allowed",
-  "github_status": 200,
-  "duration_ms": 142
-}
-```
+The adversary is a holder of a proxy token (GHE) or any local process running as the user (socket). The intended invariant: **a client cannot exceed its policy**, even though the upstream token can.
 
-Async writes via a channel + dedicated writer task. Denied requests logged with `github_status: null`.
+Enforced: deny-by-default; per-repo/org/resource read/write; multi-scope GraphQL (every touched repo checked); authoritative mutation scoping (no mis-attribution); case-insensitive name matching; path-traversal rejection; fail-closed on parse/resolve/complexity failures; no token leakage to clients; constant-time secret comparison; least-privilege file modes.
 
-### 5. Client Auth (local mode)
+Explicitly **not** boundaries (see README → Security model): the `search` and `user` unscoped categories run against the powerful token and can expose data from otherwise-denied repos; the proxy filters whole requests, not response fields; socket mode authenticates the user, not the process; mutation extraction is bounded by a node-ID prefix allowlist (unknown types fail closed).
 
-- On startup, generate random 256-bit secret, write to `~/.config/bgh/client-secret` (mode 0600).
-- Print setup instructions to stderr on first run.
-- Validate `Authorization: Bearer <secret>` or `Authorization: token <secret>` (both forms `gh` may send).
-- Regenerated on each proxy restart.
+## Technology
 
-### 6. Token Config
+- **Language**: Go (`net/http` server and client)
+- **GraphQL parsing**: `github.com/vektah/gqlparser/v2`
+- **Config/policy**: `github.com/BurntSushi/toml`
+- **Crypto/TLS**: standard library (`crypto/*`, self-signed CA + leaf for GHE mode)
 
-v1 uses a single GitHub token, configured via:
-- Environment variable: `BGH_GITHUB_TOKEN`
-- Config file field: `github_token` in `bgh-proxy.toml`
+## Non-goals (not implemented)
 
-Priority: env var > config file.
-
-No encrypted storage, no multi-token routing — single token, simple config.
-
-### 7. gh Compatibility
-
-The proxy must handle `gh`'s GHE expectations:
-
-- `GET /api/v3` — return root endpoint JSON with URLs pointing back to the proxy.
-- `GET /api/v3/user` — forward to GitHub (used by `gh auth status` / `gh auth login`).
-- Pass through `Link` headers for pagination.
-- Return 403 errors in a format `gh` displays cleanly.
-
-## Configuration
-
-Single config file `bgh-proxy.toml`:
-
-```toml
-bind = "127.0.0.1:7843"
-github_token = "ghp_..."        # or use BGH_GITHUB_TOKEN env var
-audit_log = "~/.config/bgh/audit.jsonl"
-policy_file = "~/.config/bgh/policy.toml"
-```
-
-## Technology Choices
-
-- **Language**: Rust
-- **HTTP**: `axum` (proxy server), `reqwest` (GitHub API client)
-- **Config**: `toml`
-- **CLI**: `clap`
-- **Serialization**: `serde` + `serde_json`
-- **Async**: `tokio`
-
-## v2 Roadmap
-
-- **Per-resource-type policy**: separate `pull_requests`, `issues`, `contents`, `actions` permissions per repo instead of single `access` level
-- **GraphQL repo extraction**: parse `repository(owner:, name:)` arguments to apply repo-level policy to GraphQL queries
-- **Glob patterns**: `my-company/test-*` in policy rules
-- **Multi-token routing**: multiple GitHub tokens, proxy selects narrowest-scoped per request
-- **mTLS team mode**: CA management, per-user client certs, per-identity policies
-- **Encrypted token storage**: master key + AES-256-GCM at rest
-- **Policy hot-reload**: file watch + atomic swap
-- **Audit query CLI**: `bgh-proxy audit query --repo X --since DATE`
+mTLS team mode and per-identity client certs; multi-token upstream routing; encrypted token storage; glob patterns in rules; policy hot-reload; response-body filtering; HA/clustering; an audit-query CLI.

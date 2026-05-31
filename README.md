@@ -155,7 +155,7 @@ This replaces the old `allow_unscoped_reads` boolean. To migrate: replace `allow
 
 | Field | Values | Description |
 |---|---|---|
-| `name` | string | Org login, e.g. `"my-company"`. Exact match only, no globs. |
+| `name` | string | Org login, e.g. `"my-company"`. Matched case-insensitively (GitHub routes names case-insensitively), no globs. |
 | `access` | `"none"`, `"read"`, `"read-write"` | Access granted to any repo in this org that doesn't have its own `[[repo]]` rule. |
 | `[org.permissions]` | map of resource → access | Per-resource overrides. See [Resource types](#resource-types). |
 
@@ -165,7 +165,7 @@ Org matching uses the `owner` segment from REST paths (`/repos/{owner}/...`) or 
 
 | Field | Values | Description |
 |---|---|---|
-| `name` | string | Full `owner/repo` name, e.g. `"my-company/frontend"`. Exact match only. |
+| `name` | string | Full `owner/repo` name, e.g. `"my-company/frontend"`. Matched case-insensitively, no globs. |
 | `access` | `"none"`, `"read"`, `"read-write"` | Access granted to this specific repo. Takes priority over `[[org]]` rules. |
 | `[repo.permissions]` | map of resource → access | Per-resource overrides. See [Resource types](#resource-types). |
 
@@ -191,7 +191,7 @@ When the classifier identifies a specific resource within a repo-scoped request,
 | `keys` | `keys`, `deploy-keys` | — |
 | `metadata` | `stargazers`, `subscribers`, `topics`, `languages`, `tags`, `forks`, `contributors`, `collaborators`, `teams`, `license`, `community`, `traffic`, repo root | `name`, `owner`, `url`, `id`, `isPrivate`, `stargazers`, etc. |
 
-If the resource cannot be determined (unknown REST segment, ambiguous GraphQL query), the rule's base `access` level is used.
+If the resource cannot be determined, the rule's base `access` level is used — **except** that a **write** to an unrecognized REST sub-resource is **denied** when the matching rule defines `[…permissions]` (fail-closed). This stops a per-resource `none` from being dodged via an unmapped sibling endpoint (e.g. `POST /repos/o/r/dispatches`, which can trigger workflows, escaping `actions = "none"`). Reads, and rules without per-resource permissions, still fall back to the base `access`.
 
 ### Access levels
 
@@ -227,7 +227,9 @@ For each request, the classifier extracts `(repo, org, access_level, resource, u
    → "deny"  → deny
 ```
 
-Evaluation stops at the first matching rule. A `[[repo]]` rule always takes priority over an `[[org]]` rule for the same org, and both take priority over the default. Within a rule, per-resource permissions take priority over the rule's base access level.
+Evaluation stops at the first matching rule. A `[[repo]]` rule always takes priority over an `[[org]]` rule for the same org, and both take priority over the default. Within a rule, per-resource permissions take priority over the rule's base access level. Repo/org names match case-insensitively.
+
+When a single request touches **multiple** scopes (a GraphQL query selecting several repositories, or a mutation resolving to several repositories), every scope is evaluated independently and the request is allowed only if **all** of them are allowed.
 
 ### Request classification
 
@@ -257,16 +259,24 @@ These requests are matched against `[[repo]]` rules, falling back to `[[org]]` r
 | `/repos/{owner}/{repo}/comments` | `/repos/my-org/frontend/comments` | `gh api repos/.../comments` |
 | `/repos/{owner}/{repo}/**` | any sub-path | any repo-scoped API call |
 
-**GraphQL** — scope extracted from the query AST:
+**GraphQL queries** — the classifier walks the AST and extracts **every** scope the query touches, not just the first:
 
 | Pattern | Example | Scope |
 |---|---|---|
 | `repository(owner:, name:)` | `repository(owner: "my-org", name: "frontend")` | repo = `my-org/frontend` |
-| `search(query: "repo:...")` | `search(query: "repo:my-org/frontend is:open")` | repo = `my-org/frontend` |
+| `organization(login:)` / `repositoryOwner(login:)` | `organization(login: "my-org")` | org = `my-org` |
+| `search(query: "repo:...")` | `search(query: "repo:my-org/frontend is:open")` | repo = `my-org/frontend` (one scope per `repo:` qualifier) |
+| `viewer { … }` / `rateLimit { … }` | — | unscoped `user` / `meta` |
 
-Variables are resolved: `repository(owner: $owner, name: $name)` with `{"owner": "my-org", "name": "frontend"}` works.
+Variables are resolved (`repository(owner: $owner, name: $name)`). A single GraphQL document can reference several repositories/orgs at once and GitHub executes all of them, so **the request is allowed only if policy allows every scope it touches** — a query that reads an allowed repo and a denied repo in the same operation is denied. `operationName` is honored (only the executed operation is classified). Queries too deeply nested or with cyclic fragments are rejected (fail-closed).
 
-**Node ID cache** — GraphQL mutations that reference objects by opaque node ID (e.g. `mergePullRequest(input: {pullRequestId: "PR_kwDO..."})`) have no repo in the query itself. The proxy caches `node_id → owner/repo` mappings from previous repo-scoped query responses (30 min TTL) and uses them to resolve scope for subsequent mutations. This is how `gh pr merge 123` works — `gh pr view 123` first queries the PR (repo-scoped), the response contains the node ID, and the merge mutation uses that cached mapping.
+**GraphQL mutations** are scoped by *authoritative node resolution*. A mutation references objects by opaque node ID (e.g. `mergePullRequest(input: {pullRequestId: "PR_kwDO..."})`) and carries no `repository()` scope. The proxy:
+
+1. extracts every repo-scoped node ID from the mutation (inline arguments and variables);
+2. resolves each ID to its **real** repository by asking GitHub (`nodes(ids:){ … repository { nameWithOwner } }`), caching the verified mapping (30 min TTL);
+3. requires policy to allow a **write** to every resolved repository.
+
+A mutation whose node IDs cannot all be resolved (unknown ID, upstream error) is **denied** as an unscoped write. The resolution call is skipped entirely for tokens whose policy can never write. This means `gh pr merge 123` works because the PR's node ID resolves to its repository, and a mutation cannot be misdirected to a repo the token can't write — the repository is confirmed by GitHub, never guessed from an earlier read.
 
 #### Org-scoped requests
 
@@ -318,7 +328,7 @@ This matters because `gh` needs several of these endpoints to function — `gh a
 | `search` | `search(query: ...) { ... }` (no `repo:` qualifier) | `gh search ...` |
 | `meta` | `rateLimit { ... }` | — |
 
-**Node ID cache** — GraphQL mutations that reference objects by opaque node ID (e.g. `mergePullRequest(input: {pullRequestId: "PR_kwDO..."})`) have no repo in the query itself. The proxy caches `node_id → owner/repo` mappings from previous repo-scoped query responses (30 min TTL) and uses them to resolve scope for subsequent mutations. Unscoped mutations not resolved by the cache fall through to `[defaults.unscoped]` or `[defaults].mode`.
+**Mutations** never fall through to the unscoped categories: a GraphQL mutation is always scoped by [authoritative node resolution](#repo-scoped-requests) (or denied if it has no resolvable repo-scoped node). `[defaults.unscoped]` with a `read-write` category (e.g. `gists = "read-write"`) only applies to genuinely unscoped *REST* writes such as `POST /gists`.
 
 ### Examples
 
@@ -411,13 +421,14 @@ Admin UI served on a separate plain HTTP port (default `127.0.0.1:7844`). Open i
 ### Admin API
 
 ```
-GET    /api/tokens          List all tokens
-POST   /api/tokens          Create token (JSON body)
-GET    /api/tokens/{id}     Get token detail
-DELETE /api/tokens/{id}     Revoke token
+GET    /api/tokens                 List all tokens
+POST   /api/tokens                 Create token (JSON body)
+GET    /api/tokens/{id}            Get token detail
+DELETE /api/tokens/{id}            Revoke token (mark revoked)
+DELETE /api/tokens/{id}?hard=true  Hard-delete token (remove entry)
 ```
 
-All endpoints require `Authorization: token <admin-secret>`.
+All endpoints require `Authorization: token <admin-secret>`. Token changes go through the running server, so `revoke`/`delete` take effect immediately (do not edit `tokens.json` by hand while the server is running — it rewrites the file on every allowed request).
 
 ## Configuration
 
@@ -458,6 +469,45 @@ Every request is logged to `~/.config/bgh/audit.jsonl`:
 {"ts":"2026-05-26T14:30:01Z","method":"POST","path":"/repos/unknown/repo/pulls","repo":"unknown/repo","resource":"pulls","access":"write","policy_result":"denied: default policy is deny","github_status":null,"duration_ms":5,"mode":"ghe","token_name":"ci-bot"}
 {"ts":"2026-05-26T14:30:02Z","method":"GET","path":"/user","unscoped_category":"user","access":"read","policy_result":"allowed","github_status":200,"duration_ms":45,"mode":"socket","token_name":"(socket)"}
 ```
+
+## Security model
+
+The proxy holds one **powerful upstream GitHub token** and hands out **narrow access** to clients. The goal: a client must not be able to exceed the policy it was given, even though the upstream token can do far more.
+
+**Trust boundaries**
+- **Socket mode** trusts the local user. The socket is created `0600` (owner-only connect), so only your user reaches it; `gh`'s own token is ignored and the single `policy.toml` applies to everything on the socket. Any process running as you gets that policy.
+- **GHE mode** trusts whoever holds a valid proxy token, plus whoever trusts the self-signed CA. Each proxy token carries its own embedded policy. Tokens are stored as SHA-256 hashes (`tokens.json`, `0600`) and compared in constant time.
+- The **admin API/UI** (token minting) is guarded by a separate `admin-secret`. Anyone with it can create full-access tokens.
+
+**What is enforced**
+- Per-repo / per-org / per-resource read vs write, deny-by-default.
+- GraphQL queries are scoped to **every** repository/org/search target they touch — a query touching a denied repo alongside an allowed one is denied. `operationName` is honored.
+- GraphQL mutations are scoped by **authoritative resolution**: each node ID is resolved to its real repository by GitHub before the write is authorized, so a mutation cannot be misdirected to a repo the token can't write.
+- Names match case-insensitively (GitHub routes them that way), so a re-cased path can't dodge a rule.
+- Requests with `.`/`..` path segments (including `%2F`-encoded) are rejected `400`.
+- Unparseable, over-deep, or cyclic GraphQL fails closed (denied), and never crashes the proxy.
+
+**What is *not* a boundary** — read these before trusting it:
+- **`search` and `user` are powerful.** They run against the real token, so enabling `search = "read"` lets a client search across *every* repo the upstream token can see (including repos you `none`'d), and `user = "read"` allows `viewer { repositories { … } }`, which enumerates them. Leave these denied unless that exposure is acceptable.
+- The proxy is **allow/deny per request**, not a response filter — it does not redact fields or rewrite bodies.
+- It does not authenticate *which* local process uses the socket, only that it is your user.
+- mTLS / per-identity client certs are not implemented; GHE-mode identity is the bearer proxy token.
+
+## Deployment & operations
+
+- **Token custody.** The real GitHub token sits on the proxy host (env var or `github_token` in config, **plaintext** — encrypted storage is not implemented). Whoever can read the host's memory/config has it. As defense-in-depth, give the proxy a **fine-grained PAT** scoped as narrowly as GitHub allows, so a host compromise is bounded.
+- **Bind loopback.** `admin_bind` is plain HTTP and the proxy `bind` (GHE) is HTTPS with a self-signed cert. Keep both on loopback unless you mean to expose them; a non-loopback `admin_bind` sends the admin secret in cleartext (the server logs a warning). For remote clients, front the GHE listener with your own TLS/network controls.
+- **Rate limits.** All proxied traffic *and* mutation node-resolution calls consume the single upstream token's rate limit. Mutations add one GraphQL `nodes(ids:)` call per uncached node (then cached 30 min). A token with any write grant can still spend GraphQL budget resolving node IDs in repos it can't write (capped at 100 IDs/request, skipped entirely for read-only tokens, but not otherwise throttled).
+- **Fail-closed effects.** When the resolver can't reach GitHub or is rate-limited, mutations are denied. Over-complex GraphQL and node types the resolver doesn't recognize are denied. Plan for "denied" being the safe failure during upstream trouble.
+- **Availability.** Single process, no HA. The audit log is async and **can drop entries under sustained overload** (bounded 1024-entry channel); a `SYSTEM` warning entry records how many were dropped. Treat the audit log as best-effort, not guaranteed.
+- **Restart behavior.** Proxy tokens, the admin secret, and TLS certs persist across restarts. The node-resolution cache is in-memory and repopulates lazily. **There is no policy hot-reload** — edit `policy.toml` (socket mode) and restart; for GHE tokens, a policy change means issuing a new token.
+
+## Limitations
+
+- Single process, single upstream token. No mTLS team mode, multi-token routing, encrypted token storage, glob patterns in rules, or policy hot-reload.
+- Mutation scoping relies on a repo-scoped node-ID **prefix allowlist**; a repo-scoped object type whose prefix isn't listed is denied (fail-closed) rather than mis-scoped.
+- A GraphQL query that reads `viewer`/`rateLimit` *alongside* a repository now also requires the `user`/`meta` unscoped category — grant them if your clients send such combined queries.
+- The proxy trusts GitHub's node→repository resolution; it does not independently re-verify GitHub's responses.
 
 ## Undoing
 
