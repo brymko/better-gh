@@ -534,6 +534,19 @@ The proxy holds one **powerful upstream GitHub token** and hands out **narrow ac
 - The proxy trusts GitHub's node→repository resolution; it does not independently re-verify GitHub's responses.
 - `mode = "allow"` permits anything the classifier cannot map to a deny rule. GraphQL node-ID reads/writes are resolved and checked, but a REST endpoint the classifier does not recognize as repo/org-scoped — e.g. repo-by-numeric-id `GET /repositories/{id}` — falls through to allow. **Use `mode = "deny"` for a safe baseline**; reserve `allow` for low-stakes setups where you accept that anything unmapped is permitted.
 
+## Testing against real GitHub
+
+Unit tests run against a mock; two scripts validate the parts a mock can't, using your token (read-only policy — they never write to your repos):
+
+- **`scripts/smoke-test.sh [owner/repo]`** — confirms the node-resolution GraphQL query is schema-valid on live GitHub and that media-type passthrough (`diff`/raw) works end to end.
+- **`scripts/integration-test.sh`** — the isolation proof: stands up the proxy with a policy that allows one private repo and denies another, then tries to reach the denied repo through **every bypass vector** (REST / case variant / `..` traversal; GraphQL `repository()` / multi-root / `node(id:)` / search / node-id mutation) and asserts each is blocked and the denied repo's secret marker never leaks — while the allowed repo still returns 200. Needs a token with `repo` scope; it creates/reuses two private `bgh-test-*` repos.
+
+```bash
+BGH_GITHUB_TOKEN=$(bgh-proxy ... ) ./scripts/integration-test.sh
+#   ... 11 passed, 0 failed
+#   isolation holds against real GitHub
+```
+
 ## Undoing
 
 ```bash
