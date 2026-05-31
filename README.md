@@ -23,8 +23,9 @@ go build -o bgh-proxy ./cmd/bgh-proxy/
 # Initialize (generates TLS certs, example config/policy)
 bgh-proxy init
 
-# Set your GitHub token
-export BGH_GITHUB_TOKEN=$(gh auth token)
+# Give the proxy an upstream GitHub token — either:
+export BGH_GITHUB_TOKEN=$(gh auth token)        # reuse an existing token, or
+bgh-proxy login --client-id <oauth-app-id>      # device flow (see "Upstream login" below)
 
 # Edit the policy
 $EDITOR ~/.config/bgh/policy.toml
@@ -35,6 +36,26 @@ bgh-proxy serve
 # Point gh at the proxy (socket mode)
 gh config set http_unix_socket ~/.config/bgh/proxy.sock
 ```
+
+> [!NOTE]
+> Don't run `gh auth login` while `gh` is pointed at the proxy — that flow tries to put a *real* GitHub token on the client, which is exactly what the proxy exists to avoid, and the proxy will deny the OAuth endpoint (403). Clients authenticate to the **proxy** (GHE mode, below); the proxy holds the one real token.
+
+## Upstream token
+
+The proxy needs exactly one real GitHub token to reach `api.github.com`. Resolution order: `BGH_GITHUB_TOKEN` env → `github_token` in config → the token written by `bgh-proxy login`. Three ways to provide it:
+
+1. **Reuse an existing token** — `export BGH_GITHUB_TOKEN=$(gh auth token)`. Quickest, but that token is as broad as your `gh` login.
+2. **A fine-grained PAT** — create one at *Settings → Developer settings → Fine-grained tokens*, scoped as narrowly as possible, and set it as `BGH_GITHUB_TOKEN` or `github_token`. **Narrowest option; recommended for anything real.**
+3. **`bgh-proxy login` (device flow)** — the proxy obtains its own token interactively:
+   ```bash
+   bgh-proxy login --client-id <oauth-app-client-id>
+   #   First copy your one-time code: ABCD-1234
+   #   Then open: https://github.com/login/device
+   #   ...authorized. Upstream token stored at ~/.config/bgh/github-token
+   ```
+   This requires a **GitHub OAuth App** you register once (*Settings → Developer settings → OAuth Apps → New*, with **Enable Device Flow** checked); pass its client id via `--client-id`, `BGH_OAUTH_CLIENT_ID`, or `oauth_client_id` in config. Default scopes are `repo read:org` (override with `--scopes`/`oauth_scopes`). Note this yields a broad classic OAuth token — fine for the proxy-as-custodian model, but a fine-grained PAT (option 2) is narrower.
+
+The token is stored in plaintext (`github-token`, mode `0600`), same as the env/config options — encrypted storage is not implemented. Whichever you choose, the proxy then narrows access per client via policy.
 
 ## Two modes
 
@@ -453,6 +474,7 @@ policy_file = "~/.config/bgh/policy.toml"
 ├── config.toml        # Server configuration
 ├── policy.toml        # Socket mode policy
 ├── tokens.json        # Proxy token store
+├── github-token       # Upstream token from `bgh-proxy login` (0600)
 ├── admin-secret       # Admin API/UI secret
 ├── audit.jsonl        # Request audit log
 ├── proxy.sock         # Unix socket
