@@ -86,14 +86,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	proxyToken := h.Store.Lookup(clientToken)
-	if h.Mode == GHEMode && proxyToken == nil {
-		jsonError(w, http.StatusUnauthorized, "bgh: unauthorized")
-		return
+	// Only GHE mode authenticates against the proxy-token store. Socket mode trusts the
+	// local user and ALWAYS applies the single SocketPolicy: a proxy token presented over
+	// the socket must not silently swap in a different (possibly broader) policy, and gh's
+	// own GitHub token isn't in the store anyway.
+	var proxyToken *store.ProxyToken
+	if h.Mode == GHEMode {
+		proxyToken = h.Store.Lookup(clientToken)
+		if proxyToken == nil {
+			jsonError(w, http.StatusUnauthorized, "bgh: unauthorized")
+			return
+		}
 	}
-
-	// Socket mode: if no proxy token matches, fall back to SocketPolicy
-	// (gh sends its own GitHub token which won't be in the proxy store)
 
 	if h.Mode == GHEMode && classifier.IsGHEAuthEndpoint(r.Method, path) {
 		norm := classifier.NormalizePath(path)
@@ -222,6 +226,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if result.Allowed && classified.NavEscapes && respFilter == nil {
 		result = policy.Result{Reason: "cross-repo navigation without a response filter"}
 	}
+	// When the filter IS configured but could not type this read (schema drift: the query
+	// uses a field newer than the embedded schema), a read that enumerates beyond explicit
+	// repository() scopes — viewer/search/org — cannot be redacted, so fail closed instead
+	// of forwarding it unfiltered. A read that types fine gets a respFilter (and is redacted);
+	// when the filter is disabled entirely GQLFilter is nil and this does not apply.
+	if result.Allowed && h.GQLFilter != nil && respFilter == nil &&
+		classified.Access == classifier.Read &&
+		(norm == "/graphql" || norm == "/graphql/") &&
+		graphQLReadReachesUnscopedRepos(&classified) {
+		result = policy.Result{Reason: "un-typeable read enumerates beyond scoped repos"}
+	}
 
 	if forceDenyReason != "" || !result.Allowed {
 		reason := forceDenyReason
@@ -296,6 +311,20 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 		return nil, false
 	}
 	return out, true
+}
+
+// graphQLReadReachesUnscopedRepos reports whether a GraphQL read can reach repositories
+// beyond the explicit repository() scopes the classifier enumerated — via viewer/search
+// unscoped enumeration or an organization()/repositoryOwner() entry. Such a read relies on
+// the response filter to redact denied repos, so the proxy must fail closed when the filter
+// could not type it. (rateLimit/meta reach no repos and are not flagged.)
+func graphQLReadReachesUnscopedRepos(c *classifier.Result) bool {
+	for _, s := range c.AllScopes() {
+		if s.UnscopedCategory == "user" || s.UnscopedCategory == "search" || s.Org != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // evaluateScopes allows a request only if EVERY scope it touches is allowed. A

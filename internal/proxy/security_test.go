@@ -116,6 +116,94 @@ func TestSec_OversizeBodyRejected(t *testing.T) {
 	}
 }
 
+// When the response filter is configured but cannot type a read (schema drift), a read
+// that enumerates beyond explicit repository() scopes (here viewer{...}) must fail closed
+// rather than be forwarded unfiltered. A read that types fine is still allowed + filtered.
+func TestSec_UntypeableEnumerationReadFailsClosed(t *testing.T) {
+	sch, err := gqlfilter.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hit int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hit, 1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":{"viewer":{"login":"u"}}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny, Unscoped: map[string]policy.Access{"user": policy.AccessRead}},
+	}
+	h := &Handler{
+		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol,
+		UpstreamURL: upstream.URL, GQLFilter: sch,
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	// Drift: a viewer field not in the embedded schema → augmentation fails → no filter.
+	// Policy allows user=read, so only the filter-availability guard can deny it.
+	drift := `{"query":"query{viewer{login someBrandNewField2030{x}}}"}`
+	resp, err := http.Post(srv.URL+"/graphql", "application/json", strings.NewReader(drift))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("un-typeable enumeration read must fail closed, got %d", resp.StatusCode)
+	}
+	if n := atomic.LoadInt32(&hit); n != 0 {
+		t.Fatalf("denied read must not reach upstream, got %d hits", n)
+	}
+
+	// Control: a valid viewer read types fine → filtered + allowed (reaches upstream).
+	ok := `{"query":"query{viewer{login}}"}`
+	resp2, err := http.Post(srv.URL+"/graphql", "application/json", strings.NewReader(ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode == http.StatusForbidden {
+		t.Fatalf("a valid viewer read with user=read should be allowed, got 403")
+	}
+}
+
+// Socket mode must ALWAYS apply SocketPolicy, never a proxy token from the store presented
+// over the socket — otherwise a broad token's secret could escalate past the socket policy.
+func TestSec_SocketIgnoresStoreToken(t *testing.T) {
+	st := mustStore(t)
+	// A store token that ALLOWS everything (broad).
+	_, broad, err := st.Create("broad", policy.Policy{Defaults: policy.Defaults{Mode: policy.ModeAllow}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("[]"))
+	}))
+	t.Cleanup(upstream.Close)
+	// Socket policy denies everything.
+	pol := &policy.Policy{Defaults: policy.Defaults{Mode: policy.ModeDeny}}
+	h := &Handler{
+		GithubToken: "t", Store: st, Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol, UpstreamURL: upstream.URL,
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	// Present the broad store token over the socket; SocketPolicy (deny) must still apply.
+	req, _ := http.NewRequest("GET", srv.URL+"/repos/o/r/pulls", nil)
+	req.Header.Set("Authorization", "token "+broad)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("socket mode must apply SocketPolicy, not a presented store token, got %d", resp.StatusCode)
+	}
+}
+
 func maybeGunzip(b []byte) []byte {
 	gr, err := gzip.NewReader(bytes.NewReader(b))
 	if err != nil {

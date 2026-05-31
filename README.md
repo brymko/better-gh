@@ -514,11 +514,10 @@ The proxy holds one **powerful upstream GitHub token** and hands out **narrow ac
 - **The filter sees plaintext and fails closed.** The proxy does **not** forward the client's `Accept-Encoding`, so upstream responses arrive decompressed and every body can be typed and redacted; a GraphQL response that cannot be parsed is **denied**, never passed through. A query that pre-declares the proxy's reserved marker alias (which could otherwise suppress a repository tag) is rejected (fail closed).
 
 **What is *not* a boundary** — read these before trusting it:
-- **The response filter is only as current as its embedded schema.** It is sound for any query it can type; a query using a field newer than the proxy's schema snapshot can't be tagged, so it **falls back to denial** (and the classifier's cross-repo-nav denylist). Keep the schema reasonably fresh (`internal/gqlfilter/schema.graphql`).
+- **The response filter is only as current as its embedded schema.** It is sound for any query it can type; a query using a field newer than the proxy's schema snapshot can't be tagged, so it **falls back to denial** — both the classifier's cross-repo-nav denylist *and*, for a read that enumerates beyond explicit `repository()` scopes (`viewer`/`search`/`organization`), a fail-closed deny rather than an unfiltered forward. Keep the schema reasonably fresh (`internal/gqlfilter/schema.graphql`).
 - **Redaction is repo-granular.** Within a repo that is readable at all, per-resource restrictions (e.g. `pulls = "none"`) are applied to the *entry point* by the classifier but not to objects reached by *navigation* — navigated repos are kept or redacted whole.
+- **Only response `data` is redacted, not GraphQL `errors`.** A denied/absent repo's *name* can still surface in an upstream error message (e.g. "Could not resolve to a Repository …"). This isolates repo *contents*, not the existence/names of repos a query already references.
 - As **defense-in-depth**, a **fine-grained upstream PAT** scoped to only the repos the proxy should reach still bounds what any query — typed or not — can touch, so GitHub itself enforces the floor. Recommended for high-stakes setups.
-- It does not authenticate *which* local process uses the socket, only that it is your user.
-- mTLS / per-identity client certs are not implemented; GHE-mode identity is the bearer proxy token.
 - It does not authenticate *which* local process uses the socket, only that it is your user.
 - mTLS / per-identity client certs are not implemented; GHE-mode identity is the bearer proxy token.
 
