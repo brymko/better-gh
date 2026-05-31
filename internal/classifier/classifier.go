@@ -182,7 +182,12 @@ func classifyGraphQL(body []byte) Result {
 		if mutationFieldName != "" {
 			result.Resource = gqlMutationResource(mutationFieldName)
 		}
-		result.NodeIDs = collectMutationNodeIDs(ops, req.Variables)
+		ids, ok := collectMutationNodeIDs(ops, req.Variables)
+		if !ok {
+			// Too complex to walk safely → no scope → unscoped write → denied.
+			return Result{Access: Write}
+		}
+		result.NodeIDs = ids
 		return result
 	}
 
@@ -197,8 +202,14 @@ func classifyGraphQL(body []byte) Result {
 		seen[s] = true
 		scopes = append(scopes, s)
 	}
+	tooComplex := false
 	for _, op := range ops {
-		collectGraphQLScopes(op.SelectionSet, doc.Fragments, req.Variables, add)
+		collectGraphQLScopes(op.SelectionSet, doc.Fragments, req.Variables, add, 0, &tooComplex)
+	}
+	if tooComplex {
+		// A query too deep/cyclic to fully walk could hide a denied scope past the
+		// recursion bound. Fail closed by treating it like an unparseable query.
+		return Result{Access: Write}
 	}
 
 	if len(scopes) == 0 {
@@ -285,12 +296,26 @@ func gqlUnscopedCategory(doc *ast.QueryDocument) string {
 	return ""
 }
 
+// maxGraphQLDepth bounds recursion over the parsed GraphQL AST. parser.ParseQuery does
+// not validate fragment cycles or limit nesting, so an unbounded recursive walk would
+// stack-overflow (an unrecoverable crash) on a crafted query — cyclic fragments, long
+// fragment chains, or deeply nested selections. Legitimate queries are far shallower
+// than this bound; exceeding it sets *tooComplex and the caller fails closed.
+const maxGraphQLDepth = 200
+
 // collectGraphQLScopes walks the selection set and emits a Scope for every
 // repository/organization/search/unscoped target it finds — not just the first.
 // A resolved repository/search field is not descended into: its own resource is
 // captured by gqlRepoResource, and cross-referenced foreign objects beneath it
 // must not be mistaken for additional top-level targets.
-func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(Scope)) {
+func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(Scope), depth int, tooComplex *bool) {
+	if *tooComplex {
+		return
+	}
+	if depth > maxGraphQLDepth {
+		*tooComplex = true
+		return
+	}
 	for _, sel := range selections {
 		switch s := sel.(type) {
 		case *ast.Field:
@@ -327,13 +352,13 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 				continue
 			}
 			if len(s.SelectionSet) > 0 {
-				collectGraphQLScopes(s.SelectionSet, fragments, vars, add)
+				collectGraphQLScopes(s.SelectionSet, fragments, vars, add, depth+1, tooComplex)
 			}
 		case *ast.InlineFragment:
-			collectGraphQLScopes(s.SelectionSet, fragments, vars, add)
+			collectGraphQLScopes(s.SelectionSet, fragments, vars, add, depth+1, tooComplex)
 		case *ast.FragmentSpread:
 			if frag := fragments.ForName(s.Name); frag != nil {
-				collectGraphQLScopes(frag.SelectionSet, fragments, vars, add)
+				collectGraphQLScopes(frag.SelectionSet, fragments, vars, add, depth+1, tooComplex)
 			}
 		}
 	}
@@ -393,7 +418,8 @@ func isIDKeyName(name string) bool {
 // from inline arguments (under id-typed argument/object-field names) and from
 // variables (under id-typed keys). Over-collection is safe — every collected ID is
 // independently resolved and policy-checked; missing one would be the dangerous case.
-func collectMutationNodeIDs(ops ast.OperationList, vars map[string]interface{}) []string {
+// ok is false if the input is too deep/cyclic to walk safely; the caller fails closed.
+func collectMutationNodeIDs(ops ast.OperationList, vars map[string]interface{}) (ids []string, ok bool) {
 	seen := make(map[string]bool)
 	var out []string
 	add := func(s string) {
@@ -402,30 +428,48 @@ func collectMutationNodeIDs(ops ast.OperationList, vars map[string]interface{}) 
 			out = append(out, s)
 		}
 	}
+	tooComplex := false
 	for _, op := range ops {
 		if op.Operation != ast.Mutation {
 			continue
 		}
-		walkSelectionArgs(op.SelectionSet, vars, add)
+		walkSelectionArgs(op.SelectionSet, vars, add, 0, &tooComplex)
 	}
-	walkVarsForIDs("", vars, add)
-	return out
+	walkVarsForIDs("", vars, add, 0, &tooComplex)
+	if tooComplex {
+		return nil, false
+	}
+	return out, true
 }
 
-func walkSelectionArgs(sels ast.SelectionSet, vars map[string]interface{}, add func(string)) {
+func walkSelectionArgs(sels ast.SelectionSet, vars map[string]interface{}, add func(string), depth int, tooComplex *bool) {
+	if *tooComplex {
+		return
+	}
+	if depth > maxGraphQLDepth {
+		*tooComplex = true
+		return
+	}
 	for _, sel := range sels {
 		if f, ok := sel.(*ast.Field); ok {
 			for _, arg := range f.Arguments {
-				walkArgValue(arg.Name, arg.Value, vars, add)
+				walkArgValue(arg.Name, arg.Value, vars, add, depth+1, tooComplex)
 			}
 			if len(f.SelectionSet) > 0 {
-				walkSelectionArgs(f.SelectionSet, vars, add)
+				walkSelectionArgs(f.SelectionSet, vars, add, depth+1, tooComplex)
 			}
 		}
 	}
 }
 
-func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add func(string)) {
+func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add func(string), depth int, tooComplex *bool) {
+	if *tooComplex {
+		return
+	}
+	if depth > maxGraphQLDepth {
+		*tooComplex = true
+		return
+	}
 	if v == nil {
 		return
 	}
@@ -442,16 +486,23 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 		}
 	case ast.ObjectValue:
 		for _, child := range v.Children {
-			walkArgValue(child.Name, child.Value, vars, add)
+			walkArgValue(child.Name, child.Value, vars, add, depth+1, tooComplex)
 		}
 	case ast.ListValue:
 		for _, child := range v.Children {
-			walkArgValue(name, child.Value, vars, add)
+			walkArgValue(name, child.Value, vars, add, depth+1, tooComplex)
 		}
 	}
 }
 
-func walkVarsForIDs(key string, v interface{}, add func(string)) {
+func walkVarsForIDs(key string, v interface{}, add func(string), depth int, tooComplex *bool) {
+	if *tooComplex {
+		return
+	}
+	if depth > maxGraphQLDepth {
+		*tooComplex = true
+		return
+	}
 	switch val := v.(type) {
 	case string:
 		if isIDKeyName(key) {
@@ -459,11 +510,11 @@ func walkVarsForIDs(key string, v interface{}, add func(string)) {
 		}
 	case map[string]interface{}:
 		for k, child := range val {
-			walkVarsForIDs(k, child, add)
+			walkVarsForIDs(k, child, add, depth+1, tooComplex)
 		}
 	case []interface{}:
 		for _, child := range val {
-			walkVarsForIDs(key, child, add)
+			walkVarsForIDs(key, child, add, depth+1, tooComplex)
 		}
 	}
 }

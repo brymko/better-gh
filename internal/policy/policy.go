@@ -186,6 +186,41 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 	}
 }
 
+// AllowsAnyWrite reports whether the policy could permit a write to anything. The
+// proxy uses it to skip the upstream node-resolution call for tokens that can never
+// write, so such a token cannot burn the real token's rate limit with doomed mutations.
+func (p *Policy) AllowsAnyWrite() bool {
+	if p.Defaults.Mode == ModeAllow {
+		return true
+	}
+	for _, a := range p.Defaults.Unscoped {
+		if a == AccessReadWrite {
+			return true
+		}
+	}
+	for _, o := range p.Org {
+		if o.Access == AccessReadWrite {
+			return true
+		}
+		for _, a := range o.Permissions {
+			if a == AccessReadWrite {
+				return true
+			}
+		}
+	}
+	for _, r := range p.Repo {
+		if r.Access == AccessReadWrite {
+			return true
+		}
+		for _, a := range r.Permissions {
+			if a == AccessReadWrite {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func permits(rule Access, requested classifier.AccessLevel) bool {
 	switch rule {
 	case AccessNone:

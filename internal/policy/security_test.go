@@ -86,3 +86,31 @@ func TestSec_UnknownWriteUsesBaseWithoutPermissions(t *testing.T) {
 		t.Fatalf("unknown write should use base read-write when no per-resource perms are set")
 	}
 }
+
+// AllowsAnyWrite drives the resolver gate: a token that can never write must report
+// false so the proxy skips the upstream node-resolution call entirely.
+func TestSec_AllowsAnyWrite(t *testing.T) {
+	cannotWrite := []*Policy{
+		{Defaults: Defaults{Mode: ModeDeny}},
+		{Defaults: Defaults{Mode: ModeDeny}, Org: []OrgRule{{Name: "o", Access: AccessRead}}},
+		{Defaults: Defaults{Mode: ModeDeny}, Repo: []RepoRule{{Name: "o/r", Access: AccessRead, Permissions: map[string]Access{"pulls": AccessRead}}}},
+		{Defaults: Defaults{Mode: ModeDeny, Unscoped: map[string]Access{"user": AccessRead}}},
+	}
+	for i, p := range cannotWrite {
+		if p.AllowsAnyWrite() {
+			t.Errorf("policy %d should not allow any write", i)
+		}
+	}
+
+	canWrite := []*Policy{
+		{Defaults: Defaults{Mode: ModeAllow}},
+		{Defaults: Defaults{Mode: ModeDeny}, Repo: []RepoRule{{Name: "o/r", Access: AccessReadWrite}}},
+		{Defaults: Defaults{Mode: ModeDeny}, Org: []OrgRule{{Name: "o", Access: AccessRead, Permissions: map[string]Access{"pulls": AccessReadWrite}}}},
+		{Defaults: Defaults{Mode: ModeDeny, Unscoped: map[string]Access{"gists": AccessReadWrite}}},
+	}
+	for i, p := range canWrite {
+		if !p.AllowsAnyWrite() {
+			t.Errorf("policy %d should allow some write", i)
+		}
+	}
+}

@@ -27,6 +27,18 @@ func GenerateSecret(path string) (string, error) {
 	return secret, nil
 }
 
+// LoadOrCreateSecret returns the secret stored at path, generating and persisting a
+// new one only if the file does not yet exist. This keeps a distributed admin secret
+// stable across restarts instead of invalidating it every time the server starts.
+func LoadOrCreateSecret(path string) (string, error) {
+	if data, err := os.ReadFile(path); err == nil {
+		if s := strings.TrimSpace(string(data)); s != "" {
+			return s, nil
+		}
+	}
+	return GenerateSecret(path)
+}
+
 func ExtractToken(header string) string {
 	header = strings.TrimSpace(header)
 	for _, prefix := range []string{"token ", "Token ", "Bearer ", "bearer "} {

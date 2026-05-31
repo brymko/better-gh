@@ -1,11 +1,13 @@
 package classifier
 
-// This file documents and proves classification bypasses found during the
-// security audit. Each TestSec_* asserts the *current* (vulnerable) behavior so
-// the suite stays green while serving as executable proof. If a fix flips the
-// behavior, the test fails on purpose — update it to assert the secure result.
+// This file proves the classification bypasses found during the security audit are
+// closed. Each TestSec_* asserts the secure (fixed) behavior; if a regression flips
+// it, the test fails.
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // Regression for FINDING 1 (CRITICAL): GraphQL multi-root repository bypass — FIXED.
 //
@@ -74,6 +76,36 @@ func TestSec_MutationNodeIDExtraction(t *testing.T) {
 	}
 	if got["U_ignoreMe"] {
 		t.Errorf("user ID U_ignoreMe must NOT be extracted (would false-deny): %v", r.NodeIDs)
+	}
+}
+
+// FINDING 7 (HIGH, DoS): a GraphQL query with cyclic fragments, a long fragment
+// chain, or deeply nested selections previously stack-overflowed the recursive walk —
+// an unrecoverable process crash triggerable by any client. Classification must now
+// return without crashing and fail closed (no scope) for over-complex queries.
+func TestSec_GraphQLRecursionBoundedNoCrash(t *testing.T) {
+	cyclic := []byte(`{"query":"query { ...A } fragment A on Query { ...B } fragment B on Query { ...A }"}`)
+
+	var deep strings.Builder
+	deep.WriteString(`{"query":"query `)
+	for i := 0; i < 5000; i++ {
+		deep.WriteString("{ a ")
+	}
+	for i := 0; i < 5000; i++ {
+		deep.WriteString("}")
+	}
+	deep.WriteString(`"}`)
+
+	for _, body := range [][]byte{cyclic, []byte(deep.String())} {
+		// Must not crash. An over-complex read fails closed to an unscoped write, which
+		// the policy engine denies unconditionally.
+		r := Classify("POST", "/api/graphql", body)
+		if r.HasRepo() {
+			t.Fatalf("over-complex query must not yield an allowable repo scope, got %s", r.RepoFullName())
+		}
+		if r.Access != Write {
+			t.Fatalf("over-complex query should fail closed to Write (→ unscoped write denied), got %v", r.Access)
+		}
 	}
 }
 

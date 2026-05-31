@@ -160,9 +160,9 @@ func cmdServe(configPath string) error {
 	auditLogger := audit.NewLogger(cfg.AuditLog)
 
 	adminSecretPath := filepath.Join(config.DefaultDir(), "admin-secret")
-	adminSecret, err := auth.GenerateSecret(adminSecretPath)
+	adminSecret, err := auth.LoadOrCreateSecret(adminSecretPath)
 	if err != nil {
-		return fmt.Errorf("generating admin secret: %w", err)
+		return fmt.Errorf("preparing admin secret: %w", err)
 	}
 
 	socketPolicy, err := policy.LoadFromFile(cfg.PolicyFile)
@@ -215,11 +215,20 @@ func cmdServe(configPath string) error {
 		}
 
 		os.Remove(cfg.Socket)
+		// Create the socket with 0600 from the start (umask) so there is no window in
+		// which another local user could connect; then enforce it and fail hard if that
+		// does not hold. With 0600, only the owner can connect even on a shared dir.
+		oldUmask := syscall.Umask(0o177)
 		ln, err := net.Listen("unix", cfg.Socket)
+		syscall.Umask(oldUmask)
 		if err != nil {
 			return fmt.Errorf("listening on unix socket: %w", err)
 		}
-		os.Chmod(cfg.Socket, 0o600)
+		if err := os.Chmod(cfg.Socket, 0o600); err != nil {
+			ln.Close()
+			os.Remove(cfg.Socket)
+			return fmt.Errorf("securing socket permissions: %w", err)
+		}
 
 		fmt.Fprintf(os.Stderr, "bgh-proxy: listening on unix://%s\n", cfg.Socket)
 		fmt.Fprintf(os.Stderr, "bgh-proxy: setup gh (socket mode):\n\n  gh config set http_unix_socket %s\n\n", cfg.Socket)
@@ -631,15 +640,10 @@ func tokenRevoke(c *adminClient, idOrName string) error {
 }
 
 func tokenDelete(c *adminClient, idOrName string) error {
-	// The API currently only supports revoke via DELETE.
-	// For hard delete, we still go through the store directly.
-	storePath := filepath.Join(config.DefaultDir(), "tokens.json")
-	tokenStore, err := store.Open(storePath)
-	if err != nil {
-		return fmt.Errorf("opening token store: %w", err)
-	}
-	if !tokenStore.Delete(idOrName) {
-		return fmt.Errorf("token not found: %s", idOrName)
+	// Route through the running server so its in-memory store is updated; a direct
+	// file delete would be silently overwritten by the server's own writes.
+	if _, err := c.do("DELETE", "/api/tokens/"+idOrName+"?hard=true", nil); err != nil {
+		return err
 	}
 	fmt.Fprintf(os.Stderr, "token deleted\n")
 	return nil

@@ -71,7 +71,7 @@ func TestEnsureCertsValid(t *testing.T) {
 	}
 
 	_, err = serverCert.Verify(x509.VerifyOptions{
-		Roots: pool,
+		Roots:     pool,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	})
 	if err != nil {

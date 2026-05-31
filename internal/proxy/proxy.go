@@ -45,6 +45,23 @@ type Handler struct {
 
 const maxBodySize = 10 << 20 // 10 MB
 
+// hopByHopOrManaged headers are not copied from the client to the upstream request:
+// the client's Authorization is replaced with the real token, Host/Content-Length are
+// recomputed, X-GitHub-Api-Version is pinned, and the rest are hop-by-hop.
+var hopByHopOrManaged = map[string]bool{
+	"Authorization":        true,
+	"Host":                 true,
+	"Content-Length":       true,
+	"X-Github-Api-Version": true,
+	"Connection":           true,
+	"Proxy-Connection":     true,
+	"Keep-Alive":           true,
+	"Transfer-Encoding":    true,
+	"Te":                   true,
+	"Trailer":              true,
+	"Upgrade":              true,
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	path := r.URL.Path
@@ -96,22 +113,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	classified := classifier.Classify(r.Method, path, body)
 
-	// A mutation carries no repository() scope; it targets objects by node ID. Resolve
-	// every referenced node ID to its REAL repository (authoritatively, via GitHub),
-	// then scope the request to those repos. Any unresolved node leaves the request
-	// repo-less → denied as an unscoped write.
-	if h.NodeCache != nil && classified.Access == classifier.Write &&
-		!classified.HasRepo() && classified.Org == "" && len(classified.NodeIDs) > 0 &&
-		(norm == "/graphql" || norm == "/graphql/") {
-		if scopes, ok := h.resolveNodeScopes(r.Context(), classified.NodeIDs); ok {
-			classified.Owner = scopes[0].Owner
-			classified.Repo = scopes[0].Repo
-			classified.Additional = append(classified.Additional, scopes[1:]...)
-		}
-	}
-
-	repoName := classified.RepoFullName()
-
 	tokenName := ""
 	var pol *policy.Policy
 
@@ -127,7 +128,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Timestamp:        time.Now(),
 			Method:           r.Method,
 			Path:             path,
-			Repo:             repoName,
+			Repo:             classified.RepoFullName(),
 			Resource:         classified.Resource,
 			UnscopedCategory: classified.UnscopedCategory,
 			Access:           classified.Access.String(),
@@ -138,6 +139,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusForbidden, "bgh: denied — no token provided")
 		return
 	}
+
+	// A mutation carries no repository() scope; it targets objects by node ID. Resolve
+	// every referenced node ID to its REAL repository (authoritatively, via GitHub),
+	// then scope the request to those repos. Any unresolved node leaves the request
+	// repo-less → denied as an unscoped write. Gated on AllowsAnyWrite so a token that
+	// can never write cannot burn the upstream token's rate limit on doomed resolves.
+	if h.NodeCache != nil && classified.Access == classifier.Write &&
+		!classified.HasRepo() && classified.Org == "" && len(classified.NodeIDs) > 0 &&
+		(norm == "/graphql" || norm == "/graphql/") && pol.AllowsAnyWrite() {
+		if scopes, ok := h.resolveNodeScopes(r.Context(), classified.NodeIDs); ok {
+			classified.Owner = scopes[0].Owner
+			classified.Repo = scopes[0].Repo
+			classified.Additional = append(classified.Additional, scopes[1:]...)
+		}
+	}
+
+	repoName := classified.RepoFullName()
 
 	result := evaluateScopes(pol, &classified)
 
@@ -187,11 +205,19 @@ func evaluateScopes(pol *policy.Policy, c *classifier.Result) policy.Result {
 	return policy.Result{Allowed: true}
 }
 
+// maxResolveIDs caps how many node IDs one mutation may reference. GitHub's
+// nodes(ids:) accepts at most 100; beyond that the resolve would fail anyway, so we
+// reject up front rather than build an oversized upstream query.
+const maxResolveIDs = 100
+
 // resolveNodeScopes maps each node ID to the repository GitHub says it belongs to.
 // It returns one Scope per input ID (cache-first, then a single GitHub nodes(ids:)
 // call for the misses) and ok=false if ANY node cannot be resolved — so an
 // unresolvable or upstream-failed lookup fails closed.
 func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string) ([]classifier.Scope, bool) {
+	if len(ids) > maxResolveIDs {
+		return nil, false
+	}
 	resolved := make(map[string][2]string, len(ids))
 	var missing []string
 	for _, id := range ids {
@@ -326,11 +352,27 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 		return
 	}
 
+	// Forward the client's headers so media-type negotiation (raw/diff/patch/SARIF,
+	// tarball/zipball) and conditional requests (ETag/Last-Modified) keep working. The
+	// client's Authorization is dropped and replaced with the real token; hop-by-hop
+	// and length/host headers are not forwarded.
+	for k, vals := range r.Header {
+		if hopByHopOrManaged[http.CanonicalHeaderKey(k)] {
+			continue
+		}
+		for _, v := range vals {
+			req.Header.Add(k, v)
+		}
+	}
 	req.Header.Set("Authorization", "token "+h.GithubToken)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "bgh-proxy/0.1")
-	if len(body) > 0 {
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "application/vnd.github+json")
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "bgh-proxy/0.1")
+	}
+	if len(body) > 0 && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
 

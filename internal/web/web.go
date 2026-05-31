@@ -82,7 +82,7 @@ func (h *Handler) listTokens(w http.ResponseWriter, r *http.Request) {
 }
 
 type createReq struct {
-	Name   string         `json:"name"`
+	Name   string          `json:"name"`
 	Policy createReqPolicy `json:"policy"`
 }
 
@@ -213,6 +213,17 @@ func (h *Handler) getToken(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) revokeToken(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// ?hard=true removes the entry entirely; otherwise it is marked revoked. Both go
+	// through the running server's store so the change takes effect immediately and is
+	// not clobbered by the server's own writes.
+	if r.URL.Query().Get("hard") == "true" {
+		if !h.store.Delete(id) {
+			jsonResp(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
+		jsonResp(w, http.StatusOK, map[string]string{"status": "deleted"})
+		return
+	}
 	if !h.store.Revoke(id) {
 		jsonResp(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return

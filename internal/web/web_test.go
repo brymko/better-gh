@@ -280,6 +280,31 @@ func TestRevokeTokenNotFound(t *testing.T) {
 	}
 }
 
+// Regression for the token-delete revocation bypass: `?hard=true` removes the entry
+// through the running server's store (so the CLI no longer mutates the file out of
+// band, which the server would overwrite). Soft revoke marks it; hard delete removes it.
+func TestSec_HardDeleteThroughServerStore(t *testing.T) {
+	h, s := testHandler(t)
+
+	_, secret, err := s.Create("doomed", policy.Policy{Defaults: policy.Defaults{Mode: policy.ModeDeny}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := s.Lookup(secret).ID
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, adminReq("DELETE", "/api/tokens/"+id+"?hard=true", ""))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.Get(id) != nil {
+		t.Fatalf("token should be removed from the live store, still present")
+	}
+	if s.Lookup(secret) != nil {
+		t.Fatalf("deleted token secret should no longer authenticate")
+	}
+}
+
 func TestUnauthorizedAccess(t *testing.T) {
 	h, _ := testHandler(t)
 

@@ -54,7 +54,13 @@ func (s *Store) flush() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0o600)
+	// Write to a temp file then rename so a crash or a concurrent reader never sees a
+	// truncated/partial tokens.json (flush runs on every allowed request via TouchLastUsed).
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
 }
 
 func (s *Store) Create(name string, pol policy.Policy) (*ProxyToken, string, error) {

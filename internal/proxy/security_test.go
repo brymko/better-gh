@@ -10,11 +10,114 @@ package proxy
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"better-gh/internal/audit"
+	"better-gh/internal/nodecache"
 	"better-gh/internal/policy"
+	"better-gh/internal/store"
 )
+
+// recordingHandler wires a proxy.Handler to an upstream that records the headers it
+// receives, so tests can assert what was (and wasn't) forwarded.
+func recordingProxy(t *testing.T, pol policy.Policy) (*httptest.Server, string, *http.Header, *int32) {
+	t.Helper()
+	var got http.Header
+	var resolveCalls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "graphql") {
+			atomic.AddInt32(&resolveCalls, 1)
+		}
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("{}"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	s, err := store.Open(t.TempDir() + "/tokens.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secret, err := s.Create("rec", pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc := nodecache.New(time.Minute)
+	t.Cleanup(nc.Stop)
+	h := &Handler{
+		GithubToken: "real-secret-token",
+		Store:       s,
+		Audit:       audit.NewLogger(t.TempDir() + "/audit.jsonl"),
+		Client:      &http.Client{},
+		Mode:        GHEMode,
+		UpstreamURL: upstream.URL,
+		NodeCache:   nc,
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	return srv, secret, &got, &resolveCalls
+}
+
+// Fix for forward() clobbering client headers: the client's Accept (media-type
+// negotiation) and conditional-request headers are forwarded, while its Authorization
+// is dropped and replaced with the real token (never leaked, never passed through).
+func TestSec_ClientHeadersForwarded(t *testing.T) {
+	pol := policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo:     []policy.RepoRule{{Name: "o/r", Access: policy.AccessRead}},
+	}
+	srv, secret, got, _ := recordingProxy(t, pol)
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/v3/repos/o/r/pulls/1", nil)
+	req.Header.Set("Authorization", "token "+secret)
+	req.Header.Set("Accept", "application/vnd.github.v3.diff")
+	req.Header.Set("If-None-Match", `"etag123"`)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if a := got.Get("Accept"); a != "application/vnd.github.v3.diff" {
+		t.Errorf("client Accept not forwarded, upstream saw %q", a)
+	}
+	if got.Get("If-None-Match") != `"etag123"` {
+		t.Errorf("conditional-request header not forwarded")
+	}
+	if auth := got.Get("Authorization"); auth != "token real-secret-token" {
+		t.Errorf("upstream Authorization should be the real token, got %q", auth)
+	}
+	if strings.Contains(got.Get("Authorization"), secret) {
+		t.Errorf("client proxy token leaked upstream")
+	}
+}
+
+// Fix for resolver rate-limit burn: a token that can never write must not trigger the
+// upstream node-resolution call.
+func TestSec_NoResolveForNonWritingToken(t *testing.T) {
+	pol := policy.Policy{Defaults: policy.Defaults{Mode: policy.ModeDeny}} // all deny → no write possible
+	srv, secret, _, resolveCalls := recordingProxy(t, pol)
+
+	body := `{"query":"mutation($id: ID!){ closePullRequest(input:{pullRequestId:$id}){ clientMutationId } }","variables":{"id":"PR_kwDOsomething"}}`
+	req, _ := http.NewRequest("POST", srv.URL+"/api/graphql", strings.NewReader(body))
+	req.Header.Set("Authorization", "token "+secret)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("mutation under all-deny policy should be denied, got %d", resp.StatusCode)
+	}
+	if n := atomic.LoadInt32(resolveCalls); n != 0 {
+		t.Fatalf("non-writing token must not trigger upstream resolves, got %d", n)
+	}
+}
 
 // Regression for FINDING 5 (MEDIUM) e2e: with a read-write base grant plus per-resource
 // permissions, a write to an unmapped sibling endpoint (POST /dispatches, which can
