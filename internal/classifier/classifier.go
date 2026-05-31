@@ -41,6 +41,13 @@ type Result struct {
 	// scope, so the proxy resolves each node ID to its real repository before
 	// authorizing the write.
 	NodeIDs []string
+	// NodeIDResource maps each NodeID to the per-resource key of the root mutation field
+	// that referenced it (mergePullRequest → "pulls", createIssue → "issues", …). The
+	// proxy stamps it on that node's resolved repository scope so a multi-root mutation
+	// cannot smuggle a restricted-resource write under a different field's resource. A
+	// node referenced by a field that maps to no specific resource, and every read node,
+	// map to "" (the proxy falls back to the request's primary resource for reads only).
+	NodeIDResource map[string]string
 	// NavEscapes is set on a GraphQL read whose selection navigates from a scoped entry
 	// to other repositories (owner.repositories, forks, ...). The proxy's response
 	// filter handles it soundly when available, else denies.
@@ -165,6 +172,13 @@ func classifyGraphQL(body []byte) Result {
 
 	ops := selectedOperations(doc.Operations, req.OperationName)
 
+	// GitHub substitutes a variable's DEFAULT value when the request supplies none, so
+	// repository(owner:$o,name:$n) / pullRequestId:$id with defaults reach a repo the
+	// classifier must still scope. Overlay defaults onto the provided variables (provided
+	// values win) before any scope/node-ID extraction, or a default-supplied scope is
+	// invisible to policy.
+	vars := effectiveVariables(ops, req.Variables)
+
 	// Write if any selected operation is a mutation (fail closed).
 	access := Read
 	var mutationFieldName string
@@ -187,12 +201,13 @@ func classifyGraphQL(body []byte) Result {
 		if mutationFieldName != "" {
 			result.Resource = gqlMutationResource(mutationFieldName)
 		}
-		ids, ok := collectNodeIDArgs(ops, req.Variables)
+		ids, resByID, ok := collectNodeIDArgs(ops, doc.Fragments, vars)
 		if !ok {
 			// Too complex to walk safely → no scope → unscoped write → denied.
 			return Result{Access: Write}
 		}
 		result.NodeIDs = ids
+		result.NodeIDResource = resByID
 		// A mutation's RETURN selection is a normal read sub-graph and can navigate to
 		// other repositories (payload.pullRequest.repository.forks, ...). Scan it like a
 		// read so the proxy's response filter redacts denied navigated repos when
@@ -224,7 +239,7 @@ func classifyGraphQL(body []byte) Result {
 	tooComplex := false
 	escapes := false
 	for _, op := range ops {
-		collectGraphQLScopes(op.SelectionSet, doc.Fragments, req.Variables, add, 0, &tooComplex, &escapes)
+		collectGraphQLScopes(op.SelectionSet, doc.Fragments, vars, add, 0, &tooComplex, &escapes)
 	}
 	if tooComplex {
 		// A query too deep/cyclic to fully walk could hide a denied scope past the
@@ -236,7 +251,7 @@ func classifyGraphQL(body []byte) Result {
 	// carry no repository() scope, so the proxy resolves each to its real repository
 	// before allowing the read — otherwise a node-ID read would bypass a repo block
 	// under default=allow.
-	nodeIDs, idsOk := collectNodeIDArgs(ops, req.Variables)
+	nodeIDs, nodeRes, idsOk := collectNodeIDArgs(ops, doc.Fragments, vars)
 	if !idsOk {
 		return Result{Access: Write}
 	}
@@ -264,6 +279,7 @@ func classifyGraphQL(body []byte) Result {
 		}
 	}
 	result.NavEscapes = escapes
+	result.NodeIDResource = nodeRes
 	return result
 }
 
@@ -523,27 +539,42 @@ func isNodeIDArgKey(name string) bool {
 // safe — every collected ID is independently resolved and policy-checked; missing one
 // would be the dangerous case. ok is false if the input is too deep/cyclic to walk
 // safely; the caller fails closed.
-func collectNodeIDArgs(ops ast.OperationList, vars map[string]interface{}) (ids []string, ok bool) {
+func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionList, vars map[string]interface{}) (ids []string, resourceByID map[string]string, ok bool) {
 	seen := make(map[string]bool)
+	resourceByID = make(map[string]string)
 	var out []string
-	add := func(s string) {
-		if s != "" && looksLikeNodeID(s) && !seen[s] {
-			seen[s] = true
-			out = append(out, s)
+	add := func(id, resource string) {
+		if id == "" || !looksLikeNodeID(id) || seen[id] {
+			return
 		}
+		seen[id] = true
+		out = append(out, id)
+		resourceByID[id] = resource
 	}
 	tooComplex := false
 	for _, op := range ops {
-		walkSelectionArgs(op.SelectionSet, vars, add, 0, &tooComplex)
+		// Only mutations carry per-resource writes; for a mutation the operation's direct
+		// (and top-level-fragment) fields are root mutation fields whose name maps to a
+		// resource. Reads pass atRoot=false so every node maps to "".
+		walkSelectionArgs(op.SelectionSet, fragments, vars, add, op.Operation == ast.Mutation, "", 0, &tooComplex)
 	}
-	walkVarsForIDs("", vars, add, 0, &tooComplex)
+	// Variables not bound to any walked argument: collected defensively with no resource.
+	walkVarsForIDs("", vars, func(id string) { add(id, "") }, 0, &tooComplex)
 	if tooComplex {
-		return nil, false
+		return nil, nil, false
 	}
-	return out, true
+	return out, resourceByID, true
 }
 
-func walkSelectionArgs(sels ast.SelectionSet, vars map[string]interface{}, add func(string), depth int, tooComplex *bool) {
+// walkSelectionArgs descends the selection set collecting node-ID arguments, tagging each
+// with the resource of the enclosing ROOT mutation field. It MUST traverse inline fragments
+// and fragment spreads as well as plain fields: GitHub executes a mutation field reached
+// through a fragment, so a node ID hidden in one
+// (`mutation{ ...F } fragment F on Mutation{ closePullRequest(input:{pullRequestId:...}) }`)
+// would otherwise never be resolved or policy-checked. atRoot is true while iterating root
+// mutation fields (preserved across top-level fragments); a root field's name fixes the
+// resource for its whole subtree. The depth bound doubles as the cyclic-fragment guard.
+func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(id, resource string), atRoot bool, resource string, depth int, tooComplex *bool) {
 	if *tooComplex {
 		return
 	}
@@ -552,18 +583,54 @@ func walkSelectionArgs(sels ast.SelectionSet, vars map[string]interface{}, add f
 		return
 	}
 	for _, sel := range sels {
-		if f, ok := sel.(*ast.Field); ok {
-			for _, arg := range f.Arguments {
-				walkArgValue(arg.Name, arg.Value, vars, add, depth+1, tooComplex)
+		switch s := sel.(type) {
+		case *ast.Field:
+			res := resource
+			if atRoot {
+				res = gqlMutationResource(s.Name)
 			}
-			if len(f.SelectionSet) > 0 {
-				walkSelectionArgs(f.SelectionSet, vars, add, depth+1, tooComplex)
+			for _, arg := range s.Arguments {
+				walkArgValue(arg.Name, arg.Value, vars, add, res, depth+1, tooComplex)
+			}
+			if len(s.SelectionSet) > 0 {
+				walkSelectionArgs(s.SelectionSet, fragments, vars, add, false, res, depth+1, tooComplex)
+			}
+		case *ast.InlineFragment:
+			walkSelectionArgs(s.SelectionSet, fragments, vars, add, atRoot, resource, depth+1, tooComplex)
+		case *ast.FragmentSpread:
+			if frag := fragments.ForName(s.Name); frag != nil {
+				walkSelectionArgs(frag.SelectionSet, fragments, vars, add, atRoot, resource, depth+1, tooComplex)
 			}
 		}
 	}
 }
 
-func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add func(string), depth int, tooComplex *bool) {
+// effectiveVariables overlays each selected operation's variable DEFAULT values onto the
+// request-supplied variables (a provided value always wins). GitHub applies defaults when
+// a variable is omitted, so scope/node-ID extraction must see them too — otherwise a
+// default-supplied repository() owner/name or mutation node ID is invisible to policy.
+func effectiveVariables(ops ast.OperationList, provided map[string]interface{}) map[string]interface{} {
+	eff := make(map[string]interface{}, len(provided))
+	for k, v := range provided {
+		eff[k] = v
+	}
+	for _, op := range ops {
+		for _, vd := range op.VariableDefinitions {
+			if vd.DefaultValue == nil {
+				continue
+			}
+			if _, ok := eff[vd.Variable]; ok {
+				continue
+			}
+			if val, err := vd.DefaultValue.Value(nil); err == nil && val != nil {
+				eff[vd.Variable] = val
+			}
+		}
+	}
+	return eff
+}
+
+func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add func(id, resource string), resource string, depth int, tooComplex *bool) {
 	if *tooComplex {
 		return
 	}
@@ -577,21 +644,21 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 	switch v.Kind {
 	case ast.StringValue:
 		if isNodeIDArgKey(name) {
-			add(v.Raw)
+			add(v.Raw, resource)
 		}
 	case ast.Variable:
 		if isNodeIDArgKey(name) {
 			if s, ok := vars[v.Raw].(string); ok {
-				add(s)
+				add(s, resource)
 			}
 		}
 	case ast.ObjectValue:
 		for _, child := range v.Children {
-			walkArgValue(child.Name, child.Value, vars, add, depth+1, tooComplex)
+			walkArgValue(child.Name, child.Value, vars, add, resource, depth+1, tooComplex)
 		}
 	case ast.ListValue:
 		for _, child := range v.Children {
-			walkArgValue(name, child.Value, vars, add, depth+1, tooComplex)
+			walkArgValue(name, child.Value, vars, add, resource, depth+1, tooComplex)
 		}
 	}
 }

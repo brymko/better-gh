@@ -178,13 +178,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if !canResolve {
 			forceDenyReason = "node-scoped request not permitted by policy"
-		} else if scopes, ok := h.resolveNodeScopes(r.Context(), classified.NodeIDs); ok {
-			// Resolved node scopes inherit the request's resource (e.g. a mergePullRequest
-			// mutation maps to "pulls") so a per-resource permission still applies to the
-			// repository GitHub says the node belongs to. Without this the resolved scope's
-			// empty Resource would overwrite it and fall back to the rule's base grant.
-			for i := range scopes {
-				scopes[i].Resource = classified.Resource
+		} else if scopes, ok := h.resolveNodeScopes(r.Context(), classified.NodeIDs, classified.NodeIDResource); ok {
+			// Each resolved node carries the resource of the root mutation field that
+			// referenced it (mergePullRequest → "pulls", createIssue → "issues"), so a
+			// per-resource permission applies per the operation that actually touches the
+			// repo — a multi-root mutation can't smuggle a restricted-resource write under
+			// the first field's resource. Reads have no per-node resource; fall back to the
+			// request's primary resource so a per-resource read rule still applies.
+			if classified.Access == classifier.Read {
+				for i := range scopes {
+					if scopes[i].Resource == "" {
+						scopes[i].Resource = classified.Resource
+					}
+				}
 			}
 			// scopes can be empty when every referenced node is non-repo (e.g. a user
 			// assignee); then the request carries no node-derived repo constraint.
@@ -372,7 +378,7 @@ type nodeRes struct {
 // no repo scope, which the policy denies as an unscoped write. Only a node that resolves
 // to a repo-scoped TYPE without a repository (anomalous) fails the whole request closed.
 // An upstream error also fails closed. Returns (scopes, ok); scopes may be empty.
-func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string) ([]classifier.Scope, bool) {
+func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceByID map[string]string) ([]classifier.Scope, bool) {
 	if len(ids) > maxResolveIDs {
 		return nil, false
 	}
@@ -406,7 +412,7 @@ func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string) ([]classi
 	scopes := make([]classifier.Scope, 0, len(repoOf))
 	for _, id := range ids {
 		if or, ok := repoOf[id]; ok {
-			scopes = append(scopes, classifier.Scope{Owner: or[0], Repo: or[1]})
+			scopes = append(scopes, classifier.Scope{Owner: or[0], Repo: or[1], Resource: resourceByID[id]})
 		}
 	}
 	return scopes, true
