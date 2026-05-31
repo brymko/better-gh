@@ -40,6 +40,10 @@ type Result struct {
 	// scope, so the proxy resolves each node ID to its real repository before
 	// authorizing the write.
 	NodeIDs []string
+	// NavEscapes is set on a GraphQL read whose selection navigates from a scoped entry
+	// to other repositories (owner.repositories, forks, ...). The proxy's response
+	// filter handles it soundly when available, else denies.
+	NavEscapes bool
 }
 
 // Scope is one (repo | org | unscoped-category) target a request touches.
@@ -212,13 +216,6 @@ func classifyGraphQL(body []byte) Result {
 		// recursion bound. Fail closed by treating it like an unparseable query.
 		return Result{Access: Write}
 	}
-	if escapes {
-		// The query enters through a repository/node scope but then navigates to OTHER
-		// repositories via fields (owner.repositories, forks, headRepository, ...). The
-		// classifier can't bound that, and the proxy streams responses unfiltered, so a
-		// scoped entry point would otherwise leak arbitrary repos. Fail closed.
-		return Result{Access: Write}
-	}
 
 	// Reads can also address objects by opaque node ID (node(id:)/nodes(ids:)). Those
 	// carry no repository() scope, so the proxy resolves each to its real repository
@@ -229,24 +226,30 @@ func classifyGraphQL(body []byte) Result {
 		return Result{Access: Write}
 	}
 
+	// escapes marks cross-repo field navigation. The proxy's response filter handles it
+	// soundly when available; otherwise it falls back to denying the request.
+	var result Result
 	if len(scopes) == 0 {
 		if len(nodeIDs) > 0 {
-			return Result{Access: Read, NodeIDs: nodeIDs}
+			result = Result{Access: Read, NodeIDs: nodeIDs}
+		} else {
+			result = Result{Access: Read, UnscopedCategory: gqlUnscopedCategory(doc)}
 		}
-		return Result{Access: Read, UnscopedCategory: gqlUnscopedCategory(doc)}
+	} else {
+		primary := scopes[0]
+		result = Result{
+			Access:           Read,
+			Owner:            primary.Owner,
+			Repo:             primary.Repo,
+			Org:              primary.Org,
+			Resource:         primary.Resource,
+			UnscopedCategory: primary.UnscopedCategory,
+			NodeIDs:          nodeIDs,
+			Additional:       scopes[1:],
+		}
 	}
-
-	primary := scopes[0]
-	return Result{
-		Access:           Read,
-		Owner:            primary.Owner,
-		Repo:             primary.Repo,
-		Org:              primary.Org,
-		Resource:         primary.Resource,
-		UnscopedCategory: primary.UnscopedCategory,
-		NodeIDs:          nodeIDs,
-		Additional:       scopes[1:],
-	}
+	result.NavEscapes = escapes
+	return result
 }
 
 // selectedOperations returns the operations a request actually executes. When an

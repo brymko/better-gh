@@ -161,23 +161,20 @@ func TestSec_GraphQLCrossRepoNavFailsClosed(t *testing.T) {
 	}
 	for _, q := range escaping {
 		r := Classify("POST", "/api/graphql", []byte(`{"query":`+jsonStr(q)+`}`))
-		if r.HasRepo() || len(r.Additional) > 0 {
-			t.Errorf("cross-repo nav must NOT yield an allowable repo scope; query=%s scope=%s+%v", q, r.RepoFullName(), r.Additional)
-		}
-		if r.Access != Write {
-			t.Errorf("cross-repo nav should fail closed (Write→unscoped deny); got %v for %s", r.Access, q)
+		if !r.NavEscapes {
+			t.Errorf("cross-repo nav must set NavEscapes (proxy redacts via filter, else denies); query=%s", q)
 		}
 	}
 
 	// Org/owner enumeration of its OWN repos is legitimate (granted via org access) and
-	// must stay a normal org-scoped read, not fail closed.
+	// must NOT be flagged as escaping.
 	for _, q := range []string{
 		`query{organization(login:"o"){repositories(first:5){nodes{name}}}}`,
 		`query{repositoryOwner(login:"o"){repositories(first:5){nodes{name}}}}`,
 	} {
 		r := Classify("POST", "/api/graphql", []byte(`{"query":`+jsonStr(q)+`}`))
-		if r.Org != "o" || r.Access != Read {
-			t.Errorf("org enumeration should be an org-scoped read; query=%s org=%q access=%v", q, r.Org, r.Access)
+		if r.Org != "o" || r.Access != Read || r.NavEscapes {
+			t.Errorf("org enumeration should be a plain org-scoped read; query=%s org=%q access=%v escapes=%v", q, r.Org, r.Access, r.NavEscapes)
 		}
 	}
 
@@ -189,8 +186,8 @@ func TestSec_GraphQLCrossRepoNavFailsClosed(t *testing.T) {
 	}
 	for _, q := range legit {
 		r := Classify("POST", "/api/graphql", []byte(`{"query":`+jsonStr(q)+`}`))
-		if r.RepoFullName() != "o/r" || r.Access != Read {
-			t.Errorf("legit in-repo query mis-handled: query=%s repo=%q access=%v", q, r.RepoFullName(), r.Access)
+		if r.RepoFullName() != "o/r" || r.Access != Read || r.NavEscapes {
+			t.Errorf("legit in-repo query mis-handled: query=%s repo=%q access=%v escapes=%v", q, r.RepoFullName(), r.Access, r.NavEscapes)
 		}
 	}
 }

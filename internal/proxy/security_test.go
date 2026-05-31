@@ -9,6 +9,7 @@ package proxy
 // the proxy forwards requests it should have blocked.
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,10 +18,70 @@ import (
 	"time"
 
 	"better-gh/internal/audit"
+	"better-gh/internal/gqlfilter"
 	"better-gh/internal/nodecache"
 	"better-gh/internal/policy"
 	"better-gh/internal/store"
 )
+
+// FINDING 9 (CRITICAL) — schema-aware response filter: a GraphQL read that navigates
+// from an allowed repo to a denied repo is forwarded, but the proxy redacts every
+// repo-scoped object whose repository the policy denies. Here the upstream returns a
+// response containing both repos (with the injected markers); the denied repo's content
+// must be stripped, the allowed repo's kept, and the markers removed.
+func TestSec_GraphQLFilterRedactsDeniedRepoFromResponse(t *testing.T) {
+	sch, err := gqlfilter.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":{"repository":{"bghRepoTagZ9":"allowed-org/rw-repo","name":"rw-repo","owner":{"repositories":{"nodes":[`+
+			`{"bghRepoTagZ9":"allowed-org/rw-repo","name":"rw-repo"},`+
+			`{"bghRepoTagZ9":"blocked-org/secret","name":"secret","issues":{"nodes":[`+
+			`{"bghRepoTagZ9":{"nameWithOwner":"blocked-org/secret"},"body":"TOPSECRET_LEAK"}]}}]}}}}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo:     []policy.RepoRule{{Name: "allowed-org/rw-repo", Access: policy.AccessRead}},
+	}
+	h := &Handler{
+		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol,
+		UpstreamURL: upstream.URL, GQLFilter: sch,
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	body := `{"query":"query{repository(owner:\"allowed-org\",name:\"rw-repo\"){name owner{repositories(first:50){nodes{name issues(first:5){nodes{body}}}}}}}"}`
+	resp, err := http.Post(srv.URL+"/graphql", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	s := string(out)
+	if strings.Contains(s, "TOPSECRET_LEAK") || strings.Contains(s, "secret") {
+		t.Fatalf("denied repo not redacted: %s", s)
+	}
+	if !strings.Contains(s, "rw-repo") {
+		t.Fatalf("allowed repo data was lost: %s", s)
+	}
+	if strings.Contains(s, "bghRepoTagZ9") {
+		t.Fatalf("injected marker leaked to client: %s", s)
+	}
+}
+
+func mustStore(t *testing.T) *store.Store {
+	t.Helper()
+	s, err := store.Open(t.TempDir() + "/tokens.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
 
 // recordingHandler wires a proxy.Handler to an upstream that records the headers it
 // receives, so tests can assert what was (and wasn't) forwarded.

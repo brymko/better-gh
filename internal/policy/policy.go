@@ -256,6 +256,43 @@ func (p *Policy) AllowsAnyRead() bool {
 	return false
 }
 
+// CanReadAnything reports whether the policy permits reading any part of a repo/org.
+// The GraphQL response filter uses it at repo granularity: an object whose repository
+// is entirely unreadable is redacted, while one that is readable in any way is kept.
+func (p *Policy) CanReadAnything(repo, org string) bool {
+	if repo != "" {
+		for _, r := range p.Repo {
+			if strings.EqualFold(r.Name, repo) {
+				if r.Access != AccessNone {
+					return true
+				}
+				for _, a := range r.Permissions {
+					if a != AccessNone {
+						return true
+					}
+				}
+				return false
+			}
+		}
+	}
+	if org != "" {
+		for _, o := range p.Org {
+			if strings.EqualFold(o.Name, org) {
+				if o.Access != AccessNone {
+					return true
+				}
+				for _, a := range o.Permissions {
+					if a != AccessNone {
+						return true
+					}
+				}
+				return false
+			}
+		}
+	}
+	return p.Defaults.Mode == ModeAllow
+}
+
 func permits(rule Access, requested classifier.AccessLevel) bool {
 	switch rule {
 	case AccessNone:

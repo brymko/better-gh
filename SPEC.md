@@ -38,6 +38,7 @@ The real GitHub token never reaches the client.
 | `internal/audit` | Async JSONL audit logger |
 | `internal/config`, `internal/tlsgen`, `internal/web` | Config loading, self-signed TLS, admin UI/API |
 | `internal/oauth` | GitHub OAuth device flow for `bgh-proxy login` |
+| `internal/gqlfilter` | Schema-aware GraphQL response filter (redacts denied-repo data) |
 | `cmd/bgh-proxy` | CLI: `init`, `login`, `serve`, `token …` |
 
 ## Request pipeline
@@ -116,9 +117,9 @@ The adversary is a holder of a proxy token (GHE) or any local process running as
 
 Enforced: deny-by-default; per-repo/org/resource read/write; multi-scope GraphQL (every touched repo checked); authoritative mutation scoping (no mis-attribution); case-insensitive name matching; path-traversal rejection; fail-closed on parse/resolve/complexity failures; no token leakage to clients; constant-time secret comparison; least-privilege file modes.
 
-GraphQL reads that enter via an allowed `repository()`/`node()` and then navigate to other repos via fields (`owner.repositories`, `forks`, `headRepository`, …) are detected by `scanCrossRepoNav` and fail closed.
+GraphQL **read isolation** is enforced by schema-aware **response filtering** (`internal/gqlfilter`), not by the classifier's scope check alone. The classifier still gates the entry point and unscoped categories, but the filter is what makes cross-repo navigation safe: the proxy types the read against GitHub's embedded schema, injects a hidden `repository { nameWithOwner }` tag into every repo-scoped selection, forwards the rewritten query, and redacts from the JSON response every object whose repository the policy denies (`Policy.CanReadAnything`). Because every repo-scoped datum self-identifies its real repository, this is sound against multi-root, `owner.repositories`, `forks`, `node(id:)`, search results, and `viewer.repositories` alike. A query that can't be typed against the embedded schema falls back to the classifier's `scanCrossRepoNav` denylist (`NavEscapes`) + denial.
 
-Explicitly **not** boundaries (see README → Security model): the upstream token sees everything, so GraphQL isolation is a denylist, not a proof (org enumeration, `search` results, and cross-references can still reach token-visible data — a fine-grained upstream PAT is the only hard boundary); the `search` and `user` unscoped categories run against the powerful token; the proxy filters whole requests, not response fields; socket mode authenticates the user, not the process; mutation extraction is bounded by a node-ID prefix allowlist (unknown types fail closed).
+Explicitly **not** boundaries (see README → Security model): the response filter is only as current as its embedded schema (newer fields → fail closed); redaction is repo-granular (per-resource limits aren't applied to navigated objects); a fine-grained upstream PAT remains the defense-in-depth floor; socket mode authenticates the user, not the process; mutation extraction is bounded by a node-ID prefix allowlist (unknown types fail closed).
 
 ## Technology
 

@@ -13,6 +13,7 @@ import (
 	"better-gh/internal/audit"
 	"better-gh/internal/auth"
 	"better-gh/internal/classifier"
+	"better-gh/internal/gqlfilter"
 	"better-gh/internal/nodecache"
 	"better-gh/internal/policy"
 	"better-gh/internal/store"
@@ -40,7 +41,8 @@ type Handler struct {
 	Mode         ListenerMode
 	SocketPolicy *policy.Policy // used for socket mode when no proxy token matches
 	NodeCache    *nodecache.Cache
-	UpstreamURL  string // default "" → "https://api.github.com"
+	GQLFilter    *gqlfilter.Schema // schema-aware GraphQL response filter (read isolation)
+	UpstreamURL  string            // default "" → "https://api.github.com"
 }
 
 const maxBodySize = 10 << 20 // 10 MB
@@ -173,6 +175,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	result := evaluateScopes(pol, &classified)
 
+	// Sound GraphQL read isolation: rewrite the query to tag every repo-scoped object
+	// with its repository, then redact (from the response) any object whose repository
+	// the policy denies. This is the authoritative defense against cross-repo navigation
+	// the classifier can't see. When it IS in effect, the classifier's nav-escape flag
+	// is ignored (the filter handles it); when it is NOT (schema drift / disabled), the
+	// flag falls back to denying the whole request.
+	var respFilter func([]byte) []byte
+	if h.GQLFilter != nil && classified.Access == classifier.Read &&
+		(norm == "/graphql" || norm == "/graphql/") {
+		if aug, ok := h.augmentGraphQL(body); ok {
+			body = aug
+			p := pol
+			respFilter = func(resp []byte) []byte { return filterGraphQLResponse(h.GQLFilter, p, resp) }
+		}
+	}
+	if result.Allowed && classified.NavEscapes && respFilter == nil {
+		result = policy.Result{Reason: "cross-repo navigation without a response filter"}
+	}
+
 	if forceDenyReason != "" || !result.Allowed {
 		reason := forceDenyReason
 		if reason == "" {
@@ -200,7 +221,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		go h.Store.TouchLastUsed(proxyToken.ID)
 	}
 
-	h.forward(w, r, start, norm, body, proxyToken, &classified)
+	h.forward(w, r, start, norm, body, proxyToken, &classified, respFilter)
+}
+
+func (h *Handler) augmentGraphQL(body []byte) ([]byte, bool) {
+	var req map[string]json.RawMessage
+	if json.Unmarshal(body, &req) != nil {
+		return nil, false
+	}
+	var query string
+	if json.Unmarshal(req["query"], &query) != nil || query == "" {
+		return nil, false
+	}
+	aug, err := h.GQLFilter.Augment(query)
+	if err != nil {
+		// Untypable against our schema snapshot (or invalid) — forward verbatim; the
+		// classifier's cross-repo-nav denylist still applies as a fallback.
+		slog.Debug("graphql augment skipped", "err", err)
+		return nil, false
+	}
+	qb, _ := json.Marshal(aug)
+	req["query"] = qb
+	out, err := json.Marshal(req)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte) []byte {
+	var parsed map[string]any
+	if json.Unmarshal(resp, &parsed) != nil {
+		return resp // non-JSON (e.g. an error page) — pass through unchanged
+	}
+	filtered := gqlfilter.Filter(parsed, func(owner, repo string) bool {
+		return pol.CanReadAnything(owner+"/"+repo, owner)
+	})
+	out, err := json.Marshal(filtered)
+	if err != nil {
+		return resp
+	}
+	return out
 }
 
 // evaluateScopes allows a request only if EVERY scope it touches is allowed. A
@@ -345,7 +406,7 @@ func (h *Handler) upstreamBase() string {
 	return "https://api.github.com"
 }
 
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, tok *store.ProxyToken, classified *classifier.Result) {
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, tok *store.ProxyToken, classified *classifier.Result, respFilter func([]byte) []byte) {
 	base := h.upstreamBase()
 	upstream := base + normPath
 	if normPath == "/graphql" || normPath == "/graphql/" {
@@ -459,6 +520,28 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 		Mode:             h.Mode.String(),
 		TokenName:        tokenName,
 	})
+
+	// When a response filter is set (GraphQL reads), buffer the body, redact denied
+	// repos, and send the filtered bytes; the Content-Length will be recomputed.
+	if respFilter != nil {
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+		if rerr != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		filtered := respFilter(raw)
+		for key, vals := range resp.Header {
+			if key == "Transfer-Encoding" || key == "Content-Encoding" || key == "Content-Length" {
+				continue
+			}
+			for _, v := range vals {
+				w.Header().Add(key, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		w.Write(filtered)
+		return
+	}
 
 	for key, vals := range resp.Header {
 		if key == "Transfer-Encoding" || key == "Content-Encoding" {

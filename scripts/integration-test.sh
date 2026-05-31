@@ -83,6 +83,12 @@ den(){ local desc="$1"; shift; local body code
 code(){ local desc="$1" want="$2"; shift 2; local c; c=$(req -o /dev/null -w '%{http_code}' "$@")
   [ "$c" = "$want" ] && { echo "  PASS  $desc ($c)"; P=$((P+1)); } || { echo "  FAIL  $desc (got $c want $want)"; F=$((F+1)); }; }
 gql(){ den "$1" -X POST http://localhost/graphql -d @"$BODYDIR/$2.json"; }
+# noleak: the response must not contain the denied repo's secret (it may be 200 with the
+# denied data redacted by the response filter, or 403 — either way, no leak).
+noleak(){ local desc="$1"; shift; local body; body=$(req "$@")
+  if printf '%s' "$body" | grep -q "$MARK"; then echo "  FAIL  $desc (SECRET LEAKED)"; F=$((F+1))
+  else echo "  PASS  $desc (no leak)"; P=$((P+1)); fi; }
+gqlnoleak(){ noleak "$1" -X POST http://localhost/graphql -d @"$BODYDIR/$2.json"; }
 
 echo "== the denied private repo must be unreachable via every vector =="
 den  "REST repo"            "http://localhost/repos/$OWNER/$DENY"
@@ -94,8 +100,8 @@ gql  "GraphQL multi-root"     multiroot
 gql  "GraphQL node(id) read"  nodeid
 gql  "GraphQL search repo:"   search
 gql  "GraphQL node-id mutation" mutation
-gql  "GraphQL nav owner.repositories" nav_repos
-gql  "GraphQL nav owner.repository(denied)" nav_byname
+gqlnoleak "GraphQL nav owner.repositories (redacted)" nav_repos
+gqlnoleak "GraphQL nav owner.repository(denied) (redacted)" nav_byname
 echo "== the allowed repo must still work =="
 code "REST allowed issue"  200 "http://localhost/repos/$OWNER/$ALLOW/issues/1"
 code "GraphQL allowed"     200 -X POST http://localhost/graphql -d @"$BODYDIR/allowed.json"

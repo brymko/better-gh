@@ -20,6 +20,7 @@ import (
 	"better-gh/internal/audit"
 	"better-gh/internal/auth"
 	"better-gh/internal/config"
+	"better-gh/internal/gqlfilter"
 	"better-gh/internal/nodecache"
 	"better-gh/internal/oauth"
 	"better-gh/internal/policy"
@@ -271,6 +272,12 @@ func cmdServe(configPath string) error {
 	}
 	nodeCache := nodecache.New(30 * time.Minute)
 
+	gqlSchema, err := gqlfilter.Load()
+	if err != nil {
+		slog.Warn("graphql response filter disabled (schema failed to load)", "err", err)
+		gqlSchema = nil
+	}
+
 	errCh := make(chan error, 3)
 
 	webHandler := web.NewHandler(tokenStore, adminSecret)
@@ -305,6 +312,7 @@ func cmdServe(configPath string) error {
 			Mode:         proxy.SocketMode,
 			SocketPolicy: socketPolicy,
 			NodeCache:    nodeCache,
+			GQLFilter:    gqlSchema,
 		}
 
 		os.Remove(cfg.Socket)
@@ -344,6 +352,7 @@ func cmdServe(configPath string) error {
 			Client:      httpClient,
 			Mode:        proxy.GHEMode,
 			NodeCache:   nodeCache,
+			GQLFilter:   gqlSchema,
 		}
 
 		certs, err := tlsgen.EnsureCerts(cfg.TLSDir)
