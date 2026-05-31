@@ -3,6 +3,7 @@ package policy
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"better-gh/internal/classifier"
 
@@ -106,7 +107,9 @@ func LoadFromFile(path string) (*Policy, error) {
 func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resource, unscopedCategory string) Result {
 	if repo != "" {
 		for _, r := range p.Repo {
-			if r.Name == repo {
+			// GitHub resolves owner/repo names case-insensitively; match the same
+			// way so a re-cased path cannot dodge an exact-match rule.
+			if strings.EqualFold(r.Name, repo) {
 				if resource != "" && r.Permissions != nil {
 					if permAccess, ok := r.Permissions[resource]; ok {
 						if permits(permAccess, access) {
@@ -114,6 +117,11 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 						}
 						return Result{
 							Reason: fmt.Sprintf("repo '%s' resource '%s' policy is %s, requested %s", repo, resource, accessStr(permAccess), access),
+						}
+					}
+					if resource == classifier.ResourceUnknown && access == classifier.Write {
+						return Result{
+							Reason: fmt.Sprintf("repo '%s' write to unrecognized resource denied (per-resource policy in effect)", repo),
 						}
 					}
 				}
@@ -129,7 +137,7 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 
 	if org != "" {
 		for _, o := range p.Org {
-			if o.Name == org {
+			if strings.EqualFold(o.Name, org) {
 				if resource != "" && o.Permissions != nil {
 					if permAccess, ok := o.Permissions[resource]; ok {
 						if permits(permAccess, access) {
@@ -137,6 +145,11 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 						}
 						return Result{
 							Reason: fmt.Sprintf("org '%s' resource '%s' policy is %s, requested %s", org, resource, accessStr(permAccess), access),
+						}
+					}
+					if resource == classifier.ResourceUnknown && access == classifier.Write {
+						return Result{
+							Reason: fmt.Sprintf("org '%s' write to unrecognized resource denied (per-resource policy in effect)", org),
 						}
 					}
 				}
@@ -159,6 +172,10 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 				Reason: fmt.Sprintf("unscoped category '%s' policy is %s, requested %s", unscopedCategory, accessStr(catAccess), access),
 			}
 		}
+	}
+
+	if access == classifier.Write && repo == "" && org == "" {
+		return Result{Reason: "unscoped write denied"}
 	}
 
 	switch p.Defaults.Mode {

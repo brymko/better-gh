@@ -119,7 +119,7 @@ mode = "deny"
 # pulls = "read-write"
 # actions = "none"
 `
-		if err := os.WriteFile(policyPath, []byte(example), 0o644); err != nil {
+		if err := os.WriteFile(policyPath, []byte(example), 0o600); err != nil {
 			return err
 		}
 		fmt.Fprintf(os.Stderr, "bgh-proxy: example policy written to %s\n", policyPath)
@@ -135,7 +135,7 @@ mode = "both"          # "socket", "ghe", or "both"
 audit_log = "~/.config/bgh/audit.jsonl"
 policy_file = "~/.config/bgh/policy.toml"
 `
-		if err := os.WriteFile(configPath, []byte(example), 0o644); err != nil {
+		if err := os.WriteFile(configPath, []byte(example), 0o600); err != nil {
 			return err
 		}
 		fmt.Fprintf(os.Stderr, "bgh-proxy: example config written to %s\n", configPath)
@@ -170,7 +170,12 @@ func cmdServe(configPath string) error {
 		return fmt.Errorf("loading policy: %w", err)
 	}
 
-	httpClient := &http.Client{}
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: 30 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+		},
+	}
 	nodeCache := nodecache.New(30 * time.Minute)
 
 	errCh := make(chan error, 3)
@@ -184,9 +189,17 @@ func cmdServe(configPath string) error {
 			return fmt.Errorf("listening on admin %s: %w", cfg.AdminBind, err)
 		}
 		fmt.Fprintf(os.Stderr, "bgh-proxy: admin UI: http://%s/\n", cfg.AdminBind)
-		fmt.Fprintf(os.Stderr, "bgh-proxy: admin secret: %s\n", adminSecret)
+		fmt.Fprintf(os.Stderr, "bgh-proxy: admin secret written to %s\n", adminSecretPath)
+		if !isLoopback(cfg.AdminBind) {
+			slog.Warn("admin API bound to non-loopback address — credentials transmitted in cleartext", "bind", cfg.AdminBind)
+		}
 		go func() {
-			errCh <- (&http.Server{Handler: adminMux}).Serve(ln)
+			errCh <- (&http.Server{
+				Handler:      adminMux,
+				ReadTimeout:  10 * time.Second,
+				WriteTimeout: 30 * time.Second,
+				IdleTimeout:  60 * time.Second,
+			}).Serve(ln)
 		}()
 	}
 
@@ -195,7 +208,6 @@ func cmdServe(configPath string) error {
 			GithubToken:  cfg.GithubToken,
 			Store:        tokenStore,
 			Audit:        auditLogger,
-			AdminSecret:  adminSecret,
 			Client:       httpClient,
 			Mode:         proxy.SocketMode,
 			SocketPolicy: socketPolicy,
@@ -213,8 +225,12 @@ func cmdServe(configPath string) error {
 		fmt.Fprintf(os.Stderr, "bgh-proxy: setup gh (socket mode):\n\n  gh config set http_unix_socket %s\n\n", cfg.Socket)
 
 		go func() {
-			srv := &http.Server{Handler: socketHandler}
-			errCh <- srv.Serve(ln)
+			errCh <- (&http.Server{
+				Handler:      socketHandler,
+				ReadTimeout:  30 * time.Second,
+				WriteTimeout: 120 * time.Second,
+				IdleTimeout:  120 * time.Second,
+			}).Serve(ln)
 		}()
 	}
 
@@ -223,7 +239,6 @@ func cmdServe(configPath string) error {
 			GithubToken: cfg.GithubToken,
 			Store:       tokenStore,
 			Audit:       auditLogger,
-			AdminSecret: adminSecret,
 			Client:      httpClient,
 			Mode:        proxy.GHEMode,
 			NodeCache:   nodeCache,
@@ -241,6 +256,7 @@ func cmdServe(configPath string) error {
 
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{tlsCert},
+			MinVersion:   tls.VersionTLS12,
 		}
 
 		ln, err := tls.Listen("tcp", cfg.Bind, tlsConfig)
@@ -255,7 +271,12 @@ func cmdServe(configPath string) error {
 			portFromAddr(cfg.Bind))
 
 		go func() {
-			errCh <- (&http.Server{Handler: gheHandler}).Serve(ln)
+			errCh <- (&http.Server{
+				Handler:      gheHandler,
+				ReadTimeout:  30 * time.Second,
+				WriteTimeout: 120 * time.Second,
+				IdleTimeout:  120 * time.Second,
+			}).Serve(ln)
 		}()
 	}
 
@@ -664,4 +685,16 @@ func portFromAddr(addr string) string {
 		return addr
 	}
 	return port
+}
+
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	if ip != nil {
+		return ip.IsLoopback()
+	}
+	return host == "localhost"
 }

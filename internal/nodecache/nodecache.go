@@ -1,15 +1,20 @@
+// Package nodecache stores authoritative GraphQL node-ID → repository mappings.
+//
+// Mappings are produced only by resolving a node ID against GitHub (see the proxy's
+// resolver) — never by sniffing read responses. This is the trust boundary for
+// node-ID-scoped mutations: a write is authorized against the repository GitHub says
+// the node belongs to, not one guessed from an earlier read.
 package nodecache
 
 import (
-	"encoding/json"
 	"sync"
 	"time"
 )
 
 type entry struct {
-	Owner     string
-	Repo      string
-	ExpiresAt time.Time
+	owner     string
+	repo      string
+	expiresAt time.Time
 }
 
 type Cache struct {
@@ -33,52 +38,29 @@ func (c *Cache) Stop() {
 	close(c.stopCh)
 }
 
-func (c *Cache) Ingest(owner, repo string, responseBody []byte) {
-	var parsed any
-	if err := json.Unmarshal(responseBody, &parsed); err != nil {
-		return
-	}
-
-	expires := time.Now().Add(c.ttl)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	walkIngest(parsed, func(id string) {
-		c.entries[id] = entry{Owner: owner, Repo: repo, ExpiresAt: expires}
-	})
-}
-
-func (c *Cache) Lookup(requestBody []byte) (owner, repo string, ok bool) {
-	var parsed any
-	if err := json.Unmarshal(requestBody, &parsed); err != nil {
+// Get returns a previously verified node-ID → repo mapping, if present and unexpired.
+func (c *Cache) Get(id string) (owner, repo string, ok bool) {
+	if id == "" {
 		return "", "", false
 	}
-
-	obj, isObj := parsed.(map[string]any)
-	if !isObj {
-		return "", "", false
-	}
-
-	vars, hasVars := obj["variables"]
-	if !hasVars {
-		return "", "", false
-	}
-
-	now := time.Now()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	e, exists := c.entries[id]
+	if !exists || !e.expiresAt.After(time.Now()) {
+		return "", "", false
+	}
+	return e.owner, e.repo, true
+}
 
-	var found string
-	walkValues(vars, func(s string) bool {
-		if e, exists := c.entries[s]; exists && e.ExpiresAt.After(now) {
-			owner = e.Owner
-			repo = e.Repo
-			found = s
-			return true
-		}
-		return false
-	})
-
-	return owner, repo, found != ""
+// Put records an authoritative node-ID → repo mapping. Callers MUST only pass
+// mappings obtained from GitHub, never ones inferred from request/response sniffing.
+func (c *Cache) Put(id, owner, repo string) {
+	if id == "" || owner == "" || repo == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[id] = entry{owner: owner, repo: repo, expiresAt: time.Now().Add(c.ttl)}
 }
 
 func (c *Cache) evictLoop() {
@@ -91,49 +73,11 @@ func (c *Cache) evictLoop() {
 		case now := <-ticker.C:
 			c.mu.Lock()
 			for k, e := range c.entries {
-				if e.ExpiresAt.Before(now) {
+				if e.expiresAt.Before(now) {
 					delete(c.entries, k)
 				}
 			}
 			c.mu.Unlock()
 		}
 	}
-}
-
-func walkIngest(v any, emit func(string)) {
-	switch val := v.(type) {
-	case map[string]any:
-		for k, child := range val {
-			if (k == "id" || k == "node_id") {
-				if s, ok := child.(string); ok && s != "" {
-					emit(s)
-				}
-			}
-			walkIngest(child, emit)
-		}
-	case []any:
-		for _, child := range val {
-			walkIngest(child, emit)
-		}
-	}
-}
-
-func walkValues(v any, match func(string) bool) bool {
-	switch val := v.(type) {
-	case string:
-		return match(val)
-	case map[string]any:
-		for _, child := range val {
-			if walkValues(child, match) {
-				return true
-			}
-		}
-	case []any:
-		for _, child := range val {
-			if walkValues(child, match) {
-				return true
-			}
-		}
-	}
-	return false
 }

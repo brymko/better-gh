@@ -3,6 +3,7 @@ package policy
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"better-gh/internal/classifier"
@@ -67,7 +68,23 @@ func TestAllowDefaultPermitsUnknown(t *testing.T) {
 	p := &Policy{Defaults: Defaults{Mode: ModeAllow}}
 	r := p.Evaluate("any/repo", "", classifier.Write, "", "")
 	if !r.Allowed {
-		t.Fatal("should be allowed")
+		t.Fatal("should be allowed (repo is non-empty, not unscoped)")
+	}
+}
+
+func TestAllowDefaultDeniesUnscopedWrite(t *testing.T) {
+	p := &Policy{Defaults: Defaults{Mode: ModeAllow}}
+	r := p.Evaluate("", "", classifier.Write, "", "")
+	if r.Allowed {
+		t.Fatal("unscoped write should be denied even with mode=allow")
+	}
+}
+
+func TestAllowDefaultPermitsUnscopedRead(t *testing.T) {
+	p := &Policy{Defaults: Defaults{Mode: ModeAllow}}
+	r := p.Evaluate("", "", classifier.Read, "", "")
+	if !r.Allowed {
+		t.Fatal("unscoped read with mode=allow should be allowed")
 	}
 }
 
@@ -302,6 +319,250 @@ func TestOrgPermissionsNoneBlocks(t *testing.T) {
 	r = p.Evaluate("org/repo", "org", classifier.Read, "pulls", "")
 	if !r.Allowed {
 		t.Fatalf("org pulls should fall back to org access=read-write: %s", r.Reason)
+	}
+}
+
+func TestNilPermissionsMapBehavesLikeEmpty(t *testing.T) {
+	p := &Policy{
+		Defaults: Defaults{Mode: ModeDeny},
+		Repo: []RepoRule{
+			{Name: "org/repo", Access: AccessReadWrite, Permissions: nil},
+		},
+	}
+	r := p.Evaluate("org/repo", "org", classifier.Write, "pulls", "")
+	if !r.Allowed {
+		t.Fatalf("nil permissions should fall through to access=read-write: %s", r.Reason)
+	}
+}
+
+func TestEmptyPermissionsMapBehavesLikeNil(t *testing.T) {
+	p := &Policy{
+		Defaults: Defaults{Mode: ModeDeny},
+		Repo: []RepoRule{
+			{Name: "org/repo", Access: AccessReadWrite, Permissions: map[string]Access{}},
+		},
+	}
+	r := p.Evaluate("org/repo", "org", classifier.Write, "pulls", "")
+	if !r.Allowed {
+		t.Fatalf("empty permissions should fall through to access=read-write: %s", r.Reason)
+	}
+}
+
+func TestReasonStringContainsResourceName(t *testing.T) {
+	p := &Policy{
+		Defaults: Defaults{Mode: ModeDeny},
+		Repo: []RepoRule{
+			{
+				Name:   "org/repo",
+				Access: AccessRead,
+				Permissions: map[string]Access{
+					"actions": AccessNone,
+				},
+			},
+		},
+	}
+	r := p.Evaluate("org/repo", "org", classifier.Read, "actions", "")
+	if r.Allowed {
+		t.Fatal("should be denied")
+	}
+	if !strings.Contains(r.Reason, "actions") {
+		t.Fatalf("reason should mention resource name, got: %s", r.Reason)
+	}
+	if !strings.Contains(r.Reason, "none") {
+		t.Fatalf("reason should mention access level, got: %s", r.Reason)
+	}
+}
+
+func TestReasonStringForOrg(t *testing.T) {
+	p := &Policy{
+		Defaults: Defaults{Mode: ModeDeny},
+		Org: []OrgRule{
+			{
+				Name:   "org",
+				Access: AccessRead,
+				Permissions: map[string]Access{
+					"hooks": AccessNone,
+				},
+			},
+		},
+	}
+	r := p.Evaluate("org/repo", "org", classifier.Read, "hooks", "")
+	if r.Allowed {
+		t.Fatal("should be denied")
+	}
+	if !strings.Contains(r.Reason, "hooks") {
+		t.Fatalf("reason should mention resource, got: %s", r.Reason)
+	}
+}
+
+func TestReasonStringForUnscopedCategory(t *testing.T) {
+	p := &Policy{
+		Defaults: Defaults{
+			Mode: ModeDeny,
+			Unscoped: map[string]Access{
+				"gists": AccessRead,
+			},
+		},
+	}
+	r := p.Evaluate("", "", classifier.Write, "", "gists")
+	if r.Allowed {
+		t.Fatal("should be denied")
+	}
+	if !strings.Contains(r.Reason, "gists") {
+		t.Fatalf("reason should mention category, got: %s", r.Reason)
+	}
+}
+
+func TestMultipleRepoRulesSecondMatches(t *testing.T) {
+	p := &Policy{
+		Defaults: Defaults{Mode: ModeDeny},
+		Repo: []RepoRule{
+			{Name: "org/other", Access: AccessNone},
+			{Name: "org/target", Access: AccessReadWrite},
+		},
+	}
+	r := p.Evaluate("org/target", "org", classifier.Write, "", "")
+	if !r.Allowed {
+		t.Fatalf("second repo rule should match: %s", r.Reason)
+	}
+}
+
+func TestUnscopedWithRepoScopedRequest(t *testing.T) {
+	p := &Policy{
+		Defaults: Defaults{
+			Mode: ModeDeny,
+			Unscoped: map[string]Access{
+				"user": AccessReadWrite,
+			},
+		},
+	}
+	r := p.Evaluate("org/repo", "org", classifier.Read, "", "")
+	if r.Allowed {
+		t.Fatal("unscoped rules should not apply to repo-scoped requests")
+	}
+}
+
+func TestNilUnscopedMapWithCategory(t *testing.T) {
+	p := &Policy{
+		Defaults: Defaults{Mode: ModeDeny, Unscoped: nil},
+	}
+	r := p.Evaluate("", "", classifier.Read, "", "user")
+	if r.Allowed {
+		t.Fatal("nil unscoped map should fall through to default deny")
+	}
+}
+
+func TestAccessMarshalText(t *testing.T) {
+	tests := []struct {
+		access Access
+		want   string
+	}{
+		{AccessNone, "none"},
+		{AccessRead, "read"},
+		{AccessReadWrite, "read-write"},
+	}
+	for _, tt := range tests {
+		got, err := tt.access.MarshalText()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tt.want {
+			t.Errorf("MarshalText(%d) = %q, want %q", tt.access, got, tt.want)
+		}
+	}
+}
+
+func TestDefaultModeMarshalText(t *testing.T) {
+	deny, _ := ModeDeny.MarshalText()
+	if string(deny) != "deny" {
+		t.Errorf("ModeDeny.MarshalText() = %q, want deny", deny)
+	}
+	allow, _ := ModeAllow.MarshalText()
+	if string(allow) != "allow" {
+		t.Errorf("ModeAllow.MarshalText() = %q, want allow", allow)
+	}
+}
+
+func TestAccessUnmarshalTextAliases(t *testing.T) {
+	tests := []struct {
+		text string
+		want Access
+	}{
+		{"none", AccessNone},
+		{"read", AccessRead},
+		{"read-write", AccessReadWrite},
+		{"readwrite", AccessReadWrite},
+		{"write", AccessReadWrite},
+	}
+	for _, tt := range tests {
+		var a Access
+		if err := a.UnmarshalText([]byte(tt.text)); err != nil {
+			t.Fatalf("UnmarshalText(%q): %v", tt.text, err)
+		}
+		if a != tt.want {
+			t.Errorf("UnmarshalText(%q) = %d, want %d", tt.text, a, tt.want)
+		}
+	}
+}
+
+func TestAccessUnmarshalTextInvalid(t *testing.T) {
+	var a Access
+	if err := a.UnmarshalText([]byte("invalid")); err == nil {
+		t.Fatal("expected error for invalid access")
+	}
+}
+
+func TestDefaultModeUnmarshalTextInvalid(t *testing.T) {
+	var m DefaultMode
+	if err := m.UnmarshalText([]byte("invalid")); err == nil {
+		t.Fatal("expected error for invalid mode")
+	}
+}
+
+func TestLoadFromFileNotFound(t *testing.T) {
+	_, err := LoadFromFile("/nonexistent/path/policy.toml")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestLoadFromFileInvalidTOML(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.toml")
+	os.WriteFile(path, []byte("{{{{invalid toml"), 0o644)
+	_, err := LoadFromFile(path)
+	if err == nil {
+		t.Fatal("expected error for invalid TOML")
+	}
+}
+
+// --- Security audit tests ---
+
+func TestSec_DefaultAllowPermitsUnscopedWrite(t *testing.T) {
+	p := &Policy{
+		Defaults: Defaults{Mode: ModeAllow},
+		Repo: []RepoRule{
+			{Name: "org/secret", Access: AccessNone},
+		},
+	}
+	r := p.Evaluate("", "", classifier.Write, "pulls", "")
+	if r.Allowed {
+		t.Fatal("unscoped write should be denied regardless of default mode")
+	}
+}
+
+func TestSec_WriteWithResourceButNoScopeFallsToDefault(t *testing.T) {
+	// Even with a resource identified (e.g. "pulls"), if repo/org are empty,
+	// the evaluation falls straight to defaults.mode.
+	p := &Policy{
+		Defaults: Defaults{Mode: ModeDeny},
+		Repo: []RepoRule{
+			{Name: "org/repo", Access: AccessReadWrite},
+		},
+	}
+	r := p.Evaluate("", "", classifier.Write, "pulls", "")
+	if r.Allowed {
+		t.Fatal("unscoped write should be denied with default=deny")
 	}
 }
 

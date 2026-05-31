@@ -30,6 +30,37 @@ type Result struct {
 	Access           AccessLevel
 	Resource         string
 	UnscopedCategory string
+	// Additional holds every other scope a single request also touches. A GraphQL
+	// document may select several repositories/orgs/search targets at once and
+	// GitHub executes all of them, so policy must allow EVERY scope, not just the
+	// primary (Owner/Repo/Org) one. Empty for REST and single-scope requests.
+	Additional []Scope
+	// NodeIDs are repo-scoped GraphQL node IDs referenced by a mutation (from inline
+	// arguments and variables, under id-typed keys). Mutations carry no repository()
+	// scope, so the proxy resolves each node ID to its real repository before
+	// authorizing the write.
+	NodeIDs []string
+}
+
+// Scope is one (repo | org | unscoped-category) target a request touches.
+type Scope struct {
+	Owner            string
+	Repo             string
+	Org              string
+	Resource         string
+	UnscopedCategory string
+}
+
+// AllScopes returns the primary scope followed by any Additional scopes. The proxy
+// must allow all of them.
+func (r *Result) AllScopes() []Scope {
+	scopes := make([]Scope, 0, 1+len(r.Additional))
+	scopes = append(scopes, Scope{
+		Owner: r.Owner, Repo: r.Repo, Org: r.Org,
+		Resource: r.Resource, UnscopedCategory: r.UnscopedCategory,
+	})
+	scopes = append(scopes, r.Additional...)
+	return scopes
 }
 
 func (r *Result) HasRepo() bool {
@@ -110,55 +141,96 @@ func Classify(method, path string, body []byte) Result {
 
 func classifyGraphQL(body []byte) Result {
 	if len(body) == 0 {
-		return Result{Access: Read}
+		return Result{Access: Write}
 	}
 
 	var req struct {
-		Query     string                 `json:"query"`
-		Variables map[string]interface{} `json:"variables"`
+		Query         string                 `json:"query"`
+		Variables     map[string]interface{} `json:"variables"`
+		OperationName string                 `json:"operationName"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
-		return Result{Access: Read}
+		return Result{Access: Write}
 	}
 
 	doc, gqlErr := parser.ParseQuery(&ast.Source{Input: req.Query})
 	if gqlErr != nil {
-		return Result{Access: Read}
+		return Result{Access: Write}
 	}
 
+	ops := selectedOperations(doc.Operations, req.OperationName)
+
+	// Write if any selected operation is a mutation (fail closed).
 	access := Read
 	var mutationFieldName string
-	for _, op := range doc.Operations {
+	for _, op := range ops {
 		if op.Operation == ast.Mutation {
 			access = Write
-			for _, sel := range op.SelectionSet {
-				if f, ok := sel.(*ast.Field); ok && !isScopeField(f.Name) {
-					mutationFieldName = f.Name
-					break
+			if mutationFieldName == "" {
+				for _, sel := range op.SelectionSet {
+					if f, ok := sel.(*ast.Field); ok && !isScopeField(f.Name) {
+						mutationFieldName = f.Name
+						break
+					}
 				}
 			}
-			break
 		}
 	}
 
-	result := Result{Access: access}
-	var repoField *ast.Field
-	for _, op := range doc.Operations {
-		extractGraphQLScope(op.SelectionSet, doc.Fragments, req.Variables, &result, &repoField)
-		if result.HasRepo() || result.Org != "" {
-			break
+	if access == Write {
+		result := Result{Access: Write}
+		if mutationFieldName != "" {
+			result.Resource = gqlMutationResource(mutationFieldName)
+		}
+		result.NodeIDs = collectMutationNodeIDs(ops, req.Variables)
+		return result
+	}
+
+	// Read: collect EVERY scope the selected operations touch — GitHub executes all
+	// root fields, so every repository/org/search/unscoped target must pass policy.
+	var scopes []Scope
+	seen := make(map[Scope]bool)
+	add := func(s Scope) {
+		if s == (Scope{}) || seen[s] {
+			return
+		}
+		seen[s] = true
+		scopes = append(scopes, s)
+	}
+	for _, op := range ops {
+		collectGraphQLScopes(op.SelectionSet, doc.Fragments, req.Variables, add)
+	}
+
+	if len(scopes) == 0 {
+		return Result{Access: Read, UnscopedCategory: gqlUnscopedCategory(doc)}
+	}
+
+	primary := scopes[0]
+	return Result{
+		Access:           Read,
+		Owner:            primary.Owner,
+		Repo:             primary.Repo,
+		Org:              primary.Org,
+		Resource:         primary.Resource,
+		UnscopedCategory: primary.UnscopedCategory,
+		Additional:       scopes[1:],
+	}
+}
+
+// selectedOperations returns the operations a request actually executes. When an
+// operationName is given, GitHub runs only that operation; otherwise (single op, or
+// the spec-invalid multi-op-without-name case) we classify every operation, which
+// can only add scopes and therefore only add denials.
+func selectedOperations(ops ast.OperationList, name string) ast.OperationList {
+	if name == "" {
+		return ops
+	}
+	for _, op := range ops {
+		if op.Name == name {
+			return ast.OperationList{op}
 		}
 	}
-
-	if access == Write && mutationFieldName != "" {
-		result.Resource = gqlMutationResource(mutationFieldName)
-	} else if result.HasRepo() && repoField != nil {
-		result.Resource = gqlRepoResource(repoField)
-	} else if !result.HasRepo() && result.Org == "" {
-		result.UnscopedCategory = gqlUnscopedCategory(doc)
-	}
-
-	return result
+	return ops
 }
 
 func isScopeField(name string) bool {
@@ -213,7 +285,12 @@ func gqlUnscopedCategory(doc *ast.QueryDocument) string {
 	return ""
 }
 
-func extractGraphQLScope(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, result *Result, repoField **ast.Field) {
+// collectGraphQLScopes walks the selection set and emits a Scope for every
+// repository/organization/search/unscoped target it finds — not just the first.
+// A resolved repository/search field is not descended into: its own resource is
+// captured by gqlRepoResource, and cross-referenced foreign objects beneath it
+// must not be mistaken for additional top-level targets.
+func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(Scope)) {
 	for _, sel := range selections {
 		switch s := sel.(type) {
 		case *ast.Field:
@@ -222,43 +299,41 @@ func extractGraphQLScope(selections ast.SelectionSet, fragments ast.FragmentDefi
 				owner := resolveStringArg(s.Arguments, "owner", vars)
 				name := resolveStringArg(s.Arguments, "name", vars)
 				if owner != "" && name != "" {
-					result.Owner = owner
-					result.Repo = name
-					*repoField = s
-					return
+					add(Scope{Owner: owner, Repo: name, Resource: gqlRepoResource(s)})
+					continue
 				}
 			case "organization", "repositoryOwner":
 				login := resolveStringArg(s.Arguments, "login", vars)
 				if login != "" {
-					result.Org = login
-					return
+					add(Scope{Org: login})
+					continue
 				}
 			case "search":
 				query := resolveStringArg(s.Arguments, "query", vars)
-				if owner, repo, ok := parseSearchRepoQualifier(query); ok {
-					result.Owner = owner
-					result.Repo = repo
-					return
+				repos := parseSearchRepoQualifiers(query)
+				if len(repos) > 0 {
+					for _, rp := range repos {
+						add(Scope{Owner: rp.owner, Repo: rp.repo})
+					}
+				} else {
+					add(Scope{UnscopedCategory: "search"})
 				}
+				continue
+			case "viewer":
+				add(Scope{UnscopedCategory: "user"})
+				continue
+			case "rateLimit":
+				add(Scope{UnscopedCategory: "meta"})
+				continue
 			}
 			if len(s.SelectionSet) > 0 {
-				extractGraphQLScope(s.SelectionSet, fragments, vars, result, repoField)
-				if result.HasRepo() || result.Org != "" {
-					return
-				}
+				collectGraphQLScopes(s.SelectionSet, fragments, vars, add)
 			}
 		case *ast.InlineFragment:
-			extractGraphQLScope(s.SelectionSet, fragments, vars, result, repoField)
-			if result.HasRepo() || result.Org != "" {
-				return
-			}
+			collectGraphQLScopes(s.SelectionSet, fragments, vars, add)
 		case *ast.FragmentSpread:
-			frag := fragments.ForName(s.Name)
-			if frag != nil {
-				extractGraphQLScope(frag.SelectionSet, fragments, vars, result, repoField)
-				if result.HasRepo() || result.Org != "" {
-					return
-				}
+			if frag := fragments.ForName(s.Name); frag != nil {
+				collectGraphQLScopes(frag.SelectionSet, fragments, vars, add)
 			}
 		}
 	}
@@ -279,16 +354,136 @@ func resolveStringArg(args ast.ArgumentList, name string, vars map[string]interf
 	return ""
 }
 
-func parseSearchRepoQualifier(query string) (owner, repo string, ok bool) {
+// repoScopedIDPrefixes are GitHub's typed node-ID prefixes for objects that belong to
+// a repository (pull requests, issues, reviews, comments, releases, the repo itself,
+// labels, milestones, discussions). User/org/project/gist IDs are intentionally
+// excluded so that mutations legitimately referencing them are not false-denied.
+//
+// Trade-off: this allowlist governs which node-ID mutations can be scoped. A
+// repo-scoped node whose prefix is missing here would not be extracted — safe in
+// isolation (no ID → unscoped write → denied) but a residual risk if it rode
+// alongside an allowed ID. The authoritative resolver (proxy) means every extracted
+// ID is checked against its REAL repository; the only remaining gap is prefix
+// coverage, so keep this list broad for repo-scoped types.
+var repoScopedIDPrefixes = []string{
+	"PR_", "PRR_", "PRRC_", "PRRT_", // pull requests, reviews, review comments/threads
+	"I_", "IC_", // issues, issue comments
+	"CC_",        // commit comments
+	"RE_",        // releases
+	"R_",         // repositories
+	"LA_", "MI_", // labels, milestones
+	"D_", "DC_", // discussions, discussion comments
+}
+
+func isRepoScopedNodeID(s string) bool {
+	for _, p := range repoScopedIDPrefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func isIDKeyName(name string) bool {
+	n := strings.ToLower(name)
+	return strings.HasSuffix(n, "id") || strings.HasSuffix(n, "ids")
+}
+
+// collectMutationNodeIDs returns the repo-scoped node IDs a mutation references,
+// from inline arguments (under id-typed argument/object-field names) and from
+// variables (under id-typed keys). Over-collection is safe — every collected ID is
+// independently resolved and policy-checked; missing one would be the dangerous case.
+func collectMutationNodeIDs(ops ast.OperationList, vars map[string]interface{}) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(s string) {
+		if s != "" && isRepoScopedNodeID(s) && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, op := range ops {
+		if op.Operation != ast.Mutation {
+			continue
+		}
+		walkSelectionArgs(op.SelectionSet, vars, add)
+	}
+	walkVarsForIDs("", vars, add)
+	return out
+}
+
+func walkSelectionArgs(sels ast.SelectionSet, vars map[string]interface{}, add func(string)) {
+	for _, sel := range sels {
+		if f, ok := sel.(*ast.Field); ok {
+			for _, arg := range f.Arguments {
+				walkArgValue(arg.Name, arg.Value, vars, add)
+			}
+			if len(f.SelectionSet) > 0 {
+				walkSelectionArgs(f.SelectionSet, vars, add)
+			}
+		}
+	}
+}
+
+func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add func(string)) {
+	if v == nil {
+		return
+	}
+	switch v.Kind {
+	case ast.StringValue:
+		if isIDKeyName(name) {
+			add(v.Raw)
+		}
+	case ast.Variable:
+		if isIDKeyName(name) {
+			if s, ok := vars[v.Raw].(string); ok {
+				add(s)
+			}
+		}
+	case ast.ObjectValue:
+		for _, child := range v.Children {
+			walkArgValue(child.Name, child.Value, vars, add)
+		}
+	case ast.ListValue:
+		for _, child := range v.Children {
+			walkArgValue(name, child.Value, vars, add)
+		}
+	}
+}
+
+func walkVarsForIDs(key string, v interface{}, add func(string)) {
+	switch val := v.(type) {
+	case string:
+		if isIDKeyName(key) {
+			add(val)
+		}
+	case map[string]interface{}:
+		for k, child := range val {
+			walkVarsForIDs(k, child, add)
+		}
+	case []interface{}:
+		for _, child := range val {
+			walkVarsForIDs(key, child, add)
+		}
+	}
+}
+
+type ownerRepo struct{ owner, repo string }
+
+// parseSearchRepoQualifiers returns EVERY repo: qualifier in a search query. GitHub
+// search treats multiple repo: qualifiers as a union, so each is a scope that must
+// pass policy — returning only the first would let a denied repo ride along.
+func parseSearchRepoQualifiers(query string) []ownerRepo {
+	var out []ownerRepo
 	for _, part := range strings.Fields(query) {
 		if strings.HasPrefix(part, "repo:") {
 			spec := part[len("repo:"):]
 			if slash := strings.IndexByte(spec, '/'); slash > 0 && slash < len(spec)-1 {
-				return spec[:slash], spec[slash+1:], true
+				out = append(out, ownerRepo{owner: spec[:slash], repo: spec[slash+1:]})
 			}
 		}
 	}
-	return "", "", false
+	return out
 }
 
 var restResourceMap = map[string]string{
@@ -323,6 +518,13 @@ var restMetadataSegments = map[string]bool{
 	"license": true, "community": true, "traffic": true,
 }
 
+// ResourceUnknown marks a repo sub-resource the classifier does not recognize. It is
+// distinct from "" (no resource determinable, e.g. ambiguous GraphQL): the policy
+// engine refuses to let an unknown WRITE inherit a rule's base grant when per-resource
+// permissions are in effect, so a per-resource 'none' cannot be dodged via an unmapped
+// sibling endpoint (e.g. POST /repos/o/r/dispatches escaping actions=none).
+const ResourceUnknown = "unknown"
+
 func restResource(segments []string) string {
 	if len(segments) <= 3 {
 		return "metadata"
@@ -334,7 +536,7 @@ func restResource(segments []string) string {
 	if restMetadataSegments[seg] {
 		return "metadata"
 	}
-	return ""
+	return ResourceUnknown
 }
 
 var restUnscopedMap = map[string]string{
@@ -431,14 +633,26 @@ func splitPath(path string) []string {
 	return segments
 }
 
+// HasDotSegment reports whether the path contains a "." or ".." segment. Such a
+// path is classified from the segments before the "..", but the proxy forwards the
+// ".." verbatim to GitHub — if GitHub's edge collapses it, the request reaches a
+// different resource than the one policy checked. (Percent-encoded slashes decode
+// into the path before this runs, so this also catches %2F-smuggled traversal.)
+// Legitimate GitHub REST paths never contain dot segments, so the proxy rejects them.
+func HasDotSegment(path string) bool {
+	for _, seg := range strings.Split(path, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 // IsGHEAuthEndpoint returns true for paths that gh uses during auth
 // and that should bypass policy (they don't access repo data).
 func IsGHEAuthEndpoint(method, path string) bool {
 	norm := NormalizePath(path)
 	if norm == "/" || norm == "" {
-		return method == http.MethodGet
-	}
-	if norm == "/user" || norm == "/user/" {
 		return method == http.MethodGet
 	}
 	return false

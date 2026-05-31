@@ -154,8 +154,8 @@ func TestGraphQLRepositoryOwner(t *testing.T) {
 func TestGraphQLMutationWithRepo(t *testing.T) {
 	body := []byte(`{"query":"mutation($owner: String!, $name: String!, $input: CreateIssueInput!) { repository(owner: $owner, name: $name) { id } }","variables":{"owner":"octocat","name":"hello-world"}}`)
 	r := Classify(http.MethodPost, "/graphql", body)
-	if r.Owner != "octocat" || r.Repo != "hello-world" {
-		t.Fatalf("expected octocat/hello-world, got %s/%s", r.Owner, r.Repo)
+	if r.Owner != "" || r.Repo != "" {
+		t.Fatalf("mutations should not extract scope from repository(), got %s/%s", r.Owner, r.Repo)
 	}
 	if r.Access != Write {
 		t.Fatal("expected Write")
@@ -216,15 +216,15 @@ func TestGraphQLUnrelatedVariables(t *testing.T) {
 
 func TestGraphQLNoBody(t *testing.T) {
 	r := Classify(http.MethodPost, "/graphql", nil)
-	if r.Access != Read {
-		t.Fatal("expected Read for no body")
+	if r.Access != Write {
+		t.Fatal("expected Write for no body (fail-closed)")
 	}
 }
 
 func TestGraphQLInvalidJSON(t *testing.T) {
 	r := Classify(http.MethodPost, "/graphql", []byte("not json"))
-	if r.Access != Read {
-		t.Fatal("expected Read for invalid JSON")
+	if r.Access != Write {
+		t.Fatal("expected Write for invalid JSON (fail-closed)")
 	}
 }
 
@@ -309,7 +309,7 @@ func TestRESTResourceExtraction(t *testing.T) {
 		{"/repos/o/r/community", "metadata"},
 		{"/repos/o/r/traffic", "metadata"},
 		{"/repos/o/r", "metadata"},
-		{"/repos/o/r/something-unknown", ""},
+		{"/repos/o/r/something-unknown", "unknown"},
 	}
 	for _, tt := range tests {
 		r := Classify(http.MethodGet, tt.path, nil)
@@ -584,12 +584,265 @@ func TestGraphQLRepoResourceWithUnknownField(t *testing.T) {
 	}
 }
 
+func TestGraphQLRepoResourceTypename(t *testing.T) {
+	body := []byte(`{"query":"{ repository(owner: \"o\", name: \"r\") { __typename } }"}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.Owner != "o" || r.Repo != "r" {
+		t.Fatalf("expected o/r, got %s/%s", r.Owner, r.Repo)
+	}
+	if r.Resource != "metadata" {
+		t.Errorf("__typename only: Resource = %q, want %q", r.Resource, "metadata")
+	}
+}
+
+func TestGraphQLRepoResourceSameResourceDedup(t *testing.T) {
+	body := []byte(`{"query":"{ repository(owner: \"o\", name: \"r\") { pullRequest(number:1) { title } pullRequests(first:10) { nodes { title } } } }"}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.Owner != "o" || r.Repo != "r" {
+		t.Fatalf("expected o/r, got %s/%s", r.Owner, r.Repo)
+	}
+	if r.Resource != "pulls" {
+		t.Errorf("pullRequest+pullRequests: Resource = %q, want %q", r.Resource, "pulls")
+	}
+}
+
+func TestGraphQLRepoResourceOnlyUnknownFields(t *testing.T) {
+	body := []byte(`{"query":"{ repository(owner: \"o\", name: \"r\") { customField anotherCustom } }"}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.Owner != "o" || r.Repo != "r" {
+		t.Fatalf("expected o/r, got %s/%s", r.Owner, r.Repo)
+	}
+	if r.Resource != "metadata" {
+		t.Errorf("unknown fields only: Resource = %q, want %q", r.Resource, "metadata")
+	}
+}
+
+func TestRESTResourceDeepPath(t *testing.T) {
+	r := Classify(http.MethodGet, "/repos/o/r/pulls/42/reviews", nil)
+	if r.Resource != "pulls" {
+		t.Errorf("deep path pulls: Resource = %q, want %q", r.Resource, "pulls")
+	}
+}
+
+func TestRESTResourceDeepPathActions(t *testing.T) {
+	r := Classify(http.MethodGet, "/repos/o/r/actions/workflows/1/runs", nil)
+	if r.Resource != "actions" {
+		t.Errorf("deep path actions: Resource = %q, want %q", r.Resource, "actions")
+	}
+}
+
+func TestGraphQLMutationOnlyScopeFields(t *testing.T) {
+	body := []byte(`{"query":"mutation($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }","variables":{"owner":"o","name":"r"}}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.Owner != "" || r.Repo != "" {
+		t.Fatalf("mutations should not extract scope, got %s/%s", r.Owner, r.Repo)
+	}
+	if r.Access != Write {
+		t.Fatal("expected Write for mutation")
+	}
+	if r.Resource != "" {
+		t.Errorf("mutation with only scope fields: Resource = %q, want empty", r.Resource)
+	}
+}
+
+func TestGraphQLRepoResourceInlineFragment(t *testing.T) {
+	body := []byte(`{"query":"{ repository(owner: \"o\", name: \"r\") { ... on Repository { pullRequests(first:1) { nodes { title } } } } }"}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.Owner != "o" || r.Repo != "r" {
+		t.Fatalf("expected o/r, got %s/%s", r.Owner, r.Repo)
+	}
+	if r.Resource != "metadata" {
+		t.Errorf("inline fragment: Resource = %q, want %q", r.Resource, "metadata")
+	}
+}
+
+func TestRESTOrgHasNoResourceOrCategory(t *testing.T) {
+	r := Classify(http.MethodGet, "/orgs/my-org/repos", nil)
+	if r.Resource != "" {
+		t.Errorf("org REST: Resource = %q, want empty", r.Resource)
+	}
+	if r.UnscopedCategory != "" {
+		t.Errorf("org REST: UnscopedCategory = %q, want empty", r.UnscopedCategory)
+	}
+}
+
+func TestRESTUsersHasNoResourceOrCategory(t *testing.T) {
+	r := Classify(http.MethodGet, "/users/octocat/repos", nil)
+	if r.Resource != "" {
+		t.Errorf("users REST: Resource = %q, want empty", r.Resource)
+	}
+	if r.UnscopedCategory != "" {
+		t.Errorf("users REST: UnscopedCategory = %q, want empty", r.UnscopedCategory)
+	}
+}
+
+func TestGraphQLValidJSONInvalidGQL(t *testing.T) {
+	body := []byte(`{"query":"query { ??? broken }"}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.Access != Write {
+		t.Fatal("invalid GQL should default to Write (fail-closed)")
+	}
+	if r.HasRepo() || r.Org != "" {
+		t.Fatal("invalid GQL should have no scope")
+	}
+}
+
+func TestGraphQLSearchRepoQualifierNoSlash(t *testing.T) {
+	body := []byte(`{"query":"query($q: String!) { search(query: $q, type: ISSUE, first: 10) { nodes { ... on Issue { title } } } }","variables":{"q":"repo:single is:open"}}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.HasRepo() {
+		t.Fatal("repo:single (no slash) should not resolve to owner/repo")
+	}
+}
+
+func TestGraphQLSearchRepoQualifierTrailingSlash(t *testing.T) {
+	body := []byte(`{"query":"query($q: String!) { search(query: $q, type: ISSUE, first: 10) { nodes { ... on Issue { title } } } }","variables":{"q":"repo:owner/ is:open"}}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.HasRepo() {
+		t.Fatal("repo:owner/ (trailing slash) should not resolve to owner/repo")
+	}
+}
+
+func TestGraphQLSearchRepoQualifierLeadingSlash(t *testing.T) {
+	body := []byte(`{"query":"query($q: String!) { search(query: $q, type: ISSUE, first: 10) { nodes { ... on Issue { title } } } }","variables":{"q":"repo:/repo is:open"}}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.HasRepo() {
+		t.Fatal("repo:/repo (leading slash) should not resolve to owner/repo")
+	}
+}
+
+func TestAccessLevelString(t *testing.T) {
+	if Read.String() != "read" {
+		t.Errorf("Read.String() = %q, want %q", Read.String(), "read")
+	}
+	if Write.String() != "write" {
+		t.Errorf("Write.String() = %q, want %q", Write.String(), "write")
+	}
+}
+
+func TestNormalizePathTrailingSlashGraphQL(t *testing.T) {
+	got := NormalizePath("/api/graphql/")
+	if got != "/graphql" {
+		t.Errorf("NormalizePath(/api/graphql/) = %q, want %q", got, "/graphql")
+	}
+}
+
+func TestIsGHEAuthEndpointUserTrailingSlash(t *testing.T) {
+	if IsGHEAuthEndpoint(http.MethodGet, "/api/v3/user/") {
+		t.Fatal("GET /api/v3/user/ should not be auth endpoint")
+	}
+}
+
+func TestGraphQLFragmentSpreadWithRepoScope(t *testing.T) {
+	body := []byte(`{"query":"query($owner: String!, $name: String!) { ...RepoFields } fragment RepoFields on Query { repository(owner: $owner, name: $name) { pullRequests(first:10) { nodes { title } } } }","variables":{"owner":"octocat","name":"hello"}}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.Owner != "octocat" || r.Repo != "hello" {
+		t.Fatalf("fragment spread: expected octocat/hello, got %s/%s", r.Owner, r.Repo)
+	}
+}
+
+func TestGraphQLInlineFragmentTopLevelScope(t *testing.T) {
+	body := []byte(`{"query":"query($owner: String!, $name: String!) { ... on Query { repository(owner: $owner, name: $name) { id } } }","variables":{"owner":"o","name":"r"}}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.Owner != "o" || r.Repo != "r" {
+		t.Fatalf("top-level inline fragment: expected o/r, got %s/%s", r.Owner, r.Repo)
+	}
+}
+
+func TestGraphQLFragmentSpreadUndefined(t *testing.T) {
+	body := []byte(`{"query":"query { ...UndefinedFragment }"}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if r.HasRepo() || r.Org != "" {
+		t.Fatal("undefined fragment should not resolve scope")
+	}
+}
+
+// --- Security audit tests ---
+
+func TestSec_MalformedGraphQLDefaultsToWrite(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{"empty body", nil},
+		{"invalid json", []byte("not json")},
+		{"valid json invalid gql", []byte(`{"query":"mutation { ??? broken }"}`)},
+		{"utf8 bom prefix", append([]byte{0xEF, 0xBB, 0xBF}, []byte(`{"query":"mutation { deleteRepository(input:{}) { id } }"}`)...)},
+	}
+	for _, tt := range tests {
+		r := Classify(http.MethodPost, "/graphql", tt.body)
+		if r.Access != Write {
+			t.Errorf("%s: expected Write (fail-closed), got Read", tt.name)
+		}
+		if r.HasRepo() || r.Org != "" {
+			t.Errorf("%s: malformed body should have no scope", tt.name)
+		}
+		if r.Resource != "" || r.UnscopedCategory != "" {
+			t.Errorf("%s: malformed body should have no resource/category", tt.name)
+		}
+	}
+}
+
+func TestSec_MutationWithRepoFieldScopesToFirstMatch(t *testing.T) {
+	body := []byte(`{
+		"query": "mutation($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } mergePullRequest(input: {pullRequestId: \"PR_fromDeniedRepo\"}) { pullRequest { url } } }",
+		"variables": {"owner": "allowed-org", "name": "allowed-repo"}
+	}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+
+	if r.Owner != "" || r.Repo != "" {
+		t.Fatalf("mutations should not extract scope from repository(), got %s/%s", r.Owner, r.Repo)
+	}
+	if r.Access != Write {
+		t.Fatal("expected Write")
+	}
+	if r.Resource != "pulls" {
+		t.Fatalf("expected resource=pulls, got %q", r.Resource)
+	}
+}
+
+func TestSec_UnscopedMutationHasNoRepoOrOrg(t *testing.T) {
+	// Finding 3: a node-ID mutation with no repository() field and no
+	// cache hit results in empty owner/repo/org. With default=allow,
+	// this bypasses all repo-specific deny rules.
+	body := []byte(`{
+		"query": "mutation($id: ID!) { mergePullRequest(input: {pullRequestId: $id}) { pullRequest { url } } }",
+		"variables": {"id": "PR_kwDOSomeNodeId"}
+	}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+
+	if r.Owner != "" || r.Repo != "" || r.Org != "" {
+		t.Fatal("node-ID mutation should have no scope without cache")
+	}
+	if r.Access != Write {
+		t.Fatal("expected Write")
+	}
+	if r.Resource != "pulls" {
+		t.Fatalf("expected resource=pulls, got %q", r.Resource)
+	}
+}
+
+func TestSec_MutationScopeDoesNotPreventDifferentTarget(t *testing.T) {
+	body := []byte(`{
+		"query": "mutation { repository(owner: \"good-org\", name: \"good-repo\") { id } createIssue(input: {repositoryId: \"R_kgDODifferentRepo\"}) { issue { id } } }",
+		"variables": {}
+	}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+
+	if r.Owner != "" || r.Repo != "" {
+		t.Fatalf("mutations should not extract scope, got %s/%s", r.Owner, r.Repo)
+	}
+	if r.Resource != "issues" {
+		t.Fatalf("mutation resource should be issues, got %q", r.Resource)
+	}
+}
+
 func TestIsGHEAuthEndpoint(t *testing.T) {
 	if !IsGHEAuthEndpoint(http.MethodGet, "/api/v3/") {
 		t.Fatal("GET /api/v3/ should be auth endpoint")
 	}
-	if !IsGHEAuthEndpoint(http.MethodGet, "/api/v3/user") {
-		t.Fatal("GET /api/v3/user should be auth endpoint")
+	if IsGHEAuthEndpoint(http.MethodGet, "/api/v3/user") {
+		t.Fatal("GET /api/v3/user should not be auth endpoint")
 	}
 	if IsGHEAuthEndpoint(http.MethodPost, "/api/v3/") {
 		t.Fatal("POST /api/v3/ should not be auth endpoint")

@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"better-gh/internal/audit"
@@ -31,16 +33,17 @@ func (m ListenerMode) String() string {
 }
 
 type Handler struct {
-	GithubToken   string
-	Store         *store.Store
-	Audit         *audit.Logger
-	AdminSecret   string
-	Client        *http.Client
-	Mode          ListenerMode
-	SocketPolicy  *policy.Policy // used for socket mode when no proxy token matches
-	NodeCache     *nodecache.Cache
-	UpstreamURL   string // default "" → "https://api.github.com"
+	GithubToken  string
+	Store        *store.Store
+	Audit        *audit.Logger
+	Client       *http.Client
+	Mode         ListenerMode
+	SocketPolicy *policy.Policy // used for socket mode when no proxy token matches
+	NodeCache    *nodecache.Cache
+	UpstreamURL  string // default "" → "https://api.github.com"
 }
+
+const maxBodySize = 10 << 20 // 10 MB
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
@@ -71,11 +74,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("{}"))
 			return
 		}
-		h.forward(w, r, start, norm, nil, proxyToken, nil)
+	}
+
+	norm := classifier.NormalizePath(path)
+	if h.Mode == GHEMode && (norm == "/user" || norm == "/user/") {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"login":"bgh-proxy","id":0}`))
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	if classifier.HasDotSegment(path) {
+		jsonError(w, http.StatusBadRequest, "bgh: invalid path")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize))
 	if err != nil {
 		jsonError(w, http.StatusBadRequest, "bgh: failed to read request body")
 		return
@@ -83,19 +96,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	classified := classifier.Classify(r.Method, path, body)
 
-	if h.NodeCache != nil && !classified.HasRepo() && classified.Org == "" &&
-		classified.Access == classifier.Write {
-		norm := classifier.NormalizePath(path)
-		if norm == "/graphql" || norm == "/graphql/" {
-			if owner, repo, ok := h.NodeCache.Lookup(body); ok {
-				classified.Owner = owner
-				classified.Repo = repo
-			}
+	// A mutation carries no repository() scope; it targets objects by node ID. Resolve
+	// every referenced node ID to its REAL repository (authoritatively, via GitHub),
+	// then scope the request to those repos. Any unresolved node leaves the request
+	// repo-less → denied as an unscoped write.
+	if h.NodeCache != nil && classified.Access == classifier.Write &&
+		!classified.HasRepo() && classified.Org == "" && len(classified.NodeIDs) > 0 &&
+		(norm == "/graphql" || norm == "/graphql/") {
+		if scopes, ok := h.resolveNodeScopes(r.Context(), classified.NodeIDs); ok {
+			classified.Owner = scopes[0].Owner
+			classified.Repo = scopes[0].Repo
+			classified.Additional = append(classified.Additional, scopes[1:]...)
 		}
 	}
 
 	repoName := classified.RepoFullName()
-	org := classified.EffectiveOrg()
 
 	tokenName := ""
 	var pol *policy.Policy
@@ -124,7 +139,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := pol.Evaluate(repoName, org, classified.Access, classified.Resource, classified.UnscopedCategory)
+	result := evaluateScopes(pol, &classified)
 
 	if !result.Allowed {
 		durationMs := time.Since(start).Milliseconds()
@@ -141,7 +156,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Mode:             h.Mode.String(),
 			TokenName:        tokenName,
 		})
-		jsonError(w, http.StatusForbidden, fmt.Sprintf("bgh: denied — %s", result.Reason))
+		jsonError(w, http.StatusForbidden, "bgh: denied")
 		return
 	}
 
@@ -149,8 +164,134 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		go h.Store.TouchLastUsed(proxyToken.ID)
 	}
 
-	norm := classifier.NormalizePath(path)
 	h.forward(w, r, start, norm, body, proxyToken, &classified)
+}
+
+// evaluateScopes allows a request only if EVERY scope it touches is allowed. A
+// single GraphQL document may reference several repositories/orgs at once; checking
+// only the primary scope would let a denied repo ride along (see classifier.Result).
+func evaluateScopes(pol *policy.Policy, c *classifier.Result) policy.Result {
+	for _, s := range c.AllScopes() {
+		repo := ""
+		if s.Owner != "" && s.Repo != "" {
+			repo = s.Owner + "/" + s.Repo
+		}
+		org := s.Org
+		if org == "" {
+			org = s.Owner
+		}
+		if res := pol.Evaluate(repo, org, c.Access, s.Resource, s.UnscopedCategory); !res.Allowed {
+			return res
+		}
+	}
+	return policy.Result{Allowed: true}
+}
+
+// resolveNodeScopes maps each node ID to the repository GitHub says it belongs to.
+// It returns one Scope per input ID (cache-first, then a single GitHub nodes(ids:)
+// call for the misses) and ok=false if ANY node cannot be resolved — so an
+// unresolvable or upstream-failed lookup fails closed.
+func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string) ([]classifier.Scope, bool) {
+	resolved := make(map[string][2]string, len(ids))
+	var missing []string
+	for _, id := range ids {
+		if owner, repo, ok := h.NodeCache.Get(id); ok {
+			resolved[id] = [2]string{owner, repo}
+		} else {
+			missing = append(missing, id)
+		}
+	}
+
+	if len(missing) > 0 {
+		fetched, err := h.resolveFromGitHub(ctx, missing)
+		if err != nil {
+			slog.Error("node resolution failed", "err", err)
+			return nil, false
+		}
+		for id, or := range fetched {
+			h.NodeCache.Put(id, or[0], or[1])
+			resolved[id] = or
+		}
+	}
+
+	scopes := make([]classifier.Scope, 0, len(ids))
+	for _, id := range ids {
+		or, ok := resolved[id]
+		if !ok {
+			return nil, false // some node did not resolve → deny
+		}
+		scopes = append(scopes, classifier.Scope{Owner: or[0], Repo: or[1]})
+	}
+	return scopes, true
+}
+
+const resolveQuery = `query($ids:[ID!]!){nodes(ids:$ids){__typename ` +
+	`... on RepositoryNode{repository{nameWithOwner}} ` +
+	`... on Repository{nameWithOwner} ` +
+	`... on Ref{repository{nameWithOwner}} ` +
+	`... on Release{repository{nameWithOwner}}}}`
+
+func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[string][2]string, error) {
+	reqBody, _ := json.Marshal(map[string]any{
+		"query":     resolveQuery,
+		"variables": map[string]any{"ids": ids},
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.upstreamBase()+"/graphql", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "token "+h.GithubToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "bgh-proxy/0.1")
+
+	resp, err := h.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed struct {
+		Data struct {
+			Nodes []*struct {
+				NameWithOwner string `json:"nameWithOwner"`
+				Repository    *struct {
+					NameWithOwner string `json:"nameWithOwner"`
+				} `json:"repository"`
+			} `json:"nodes"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string][2]string)
+	// GitHub returns nodes in the same order as the input ids; null entries (no access
+	// or wrong type) decode to a nil element and are left unresolved.
+	for i, n := range parsed.Data.Nodes {
+		if i >= len(ids) || n == nil {
+			continue
+		}
+		nwo := n.NameWithOwner
+		if n.Repository != nil && n.Repository.NameWithOwner != "" {
+			nwo = n.Repository.NameWithOwner
+		}
+		if owner, repo, ok := splitNameWithOwner(nwo); ok {
+			out[ids[i]] = [2]string{owner, repo}
+		}
+	}
+	return out, nil
+}
+
+func splitNameWithOwner(nwo string) (owner, repo string, ok bool) {
+	if i := strings.IndexByte(nwo, '/'); i > 0 && i < len(nwo)-1 {
+		return nwo[:i], nwo[i+1:], true
+	}
+	return "", "", false
 }
 
 func (h *Handler) upstreamBase() string {
@@ -225,7 +366,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 			TokenName:        tokenName,
 		})
 		slog.Error("upstream request failed", "err", err)
-		jsonError(w, http.StatusBadGateway, fmt.Sprintf("bgh: upstream error — %v", err))
+		jsonError(w, http.StatusBadGateway, "bgh: upstream error")
 		return
 	}
 	defer resp.Body.Close()
@@ -268,22 +409,8 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 		}
 	}
 
-	isGraphQL := normPath == "/graphql" || normPath == "/graphql/"
-	shouldIngest := h.NodeCache != nil && isGraphQL && classified != nil && classified.HasRepo()
-
-	if shouldIngest {
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			return
-		}
-		h.NodeCache.Ingest(classified.Owner, classified.Repo, respBody)
-		w.WriteHeader(resp.StatusCode)
-		w.Write(respBody)
-	} else {
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func jsonError(w http.ResponseWriter, status int, msg string) {

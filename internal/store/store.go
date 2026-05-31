@@ -2,6 +2,8 @@ package store
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,13 +16,13 @@ import (
 )
 
 type ProxyToken struct {
-	ID        string         `json:"id"`
-	Name      string         `json:"name"`
-	Secret    string         `json:"secret"`
-	Policy    policy.Policy  `json:"policy"`
-	CreatedAt time.Time      `json:"created_at"`
-	LastUsed  time.Time      `json:"last_used,omitempty"`
-	Revoked   bool           `json:"revoked"`
+	ID         string        `json:"id"`
+	Name       string        `json:"name"`
+	SecretHash string        `json:"secret_hash"`
+	Policy     policy.Policy `json:"policy"`
+	CreatedAt  time.Time     `json:"created_at"`
+	LastUsed   time.Time     `json:"last_used,omitempty"`
+	Revoked    bool          `json:"revoked"`
 }
 
 type Store struct {
@@ -68,15 +70,16 @@ func (s *Store) Create(name string, pol policy.Policy) (*ProxyToken, string, err
 		return nil, "", err
 	}
 
-	tok := ProxyToken{
-		ID:        hex.EncodeToString(idBytes),
-		Name:      name,
-		Secret:    hex.EncodeToString(secretBytes),
-		Policy:    pol,
-		CreatedAt: time.Now().UTC(),
-	}
+	secret := hex.EncodeToString(secretBytes)
+	hash := sha256.Sum256([]byte(secret))
 
-	secret := tok.Secret
+	tok := ProxyToken{
+		ID:         hex.EncodeToString(idBytes),
+		Name:       name,
+		SecretHash: hex.EncodeToString(hash[:]),
+		Policy:     pol,
+		CreatedAt:  time.Now().UTC(),
+	}
 	s.tokens = append(s.tokens, tok)
 	if err := s.flush(); err != nil {
 		s.tokens = s.tokens[:len(s.tokens)-1]
@@ -86,10 +89,13 @@ func (s *Store) Create(name string, pol policy.Policy) (*ProxyToken, string, err
 }
 
 func (s *Store) Lookup(secret string) *ProxyToken {
+	hash := sha256.Sum256([]byte(secret))
+	hexHash := hex.EncodeToString(hash[:])
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for i := range s.tokens {
-		if s.tokens[i].Secret == secret && !s.tokens[i].Revoked {
+		if subtle.ConstantTimeCompare([]byte(s.tokens[i].SecretHash), []byte(hexHash)) == 1 && !s.tokens[i].Revoked {
 			return &s.tokens[i]
 		}
 	}

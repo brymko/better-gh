@@ -55,6 +55,28 @@ func mockGitHub() *httptest.Server {
 	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		bodyStr := string(body)
+		if strings.Contains(bodyStr, "nodes(ids") {
+			var req struct {
+				Variables struct {
+					IDs []string `json:"ids"`
+				} `json:"variables"`
+			}
+			json.Unmarshal(body, &req)
+			nodes := make([]any, 0, len(req.Variables.IDs))
+			for _, id := range req.Variables.IDs {
+				nwo := mockResolveID(id)
+				if nwo == "" {
+					nodes = append(nodes, nil)
+					continue
+				}
+				nodes = append(nodes, map[string]any{
+					"__typename": "PullRequest",
+					"repository": map[string]any{"nameWithOwner": nwo},
+				})
+			}
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"nodes": nodes}})
+			return
+		}
 		if strings.Contains(bodyStr, "viewer") {
 			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"viewer": map[string]string{"login": "testuser"}}})
 		} else if strings.Contains(bodyStr, "repository") {
@@ -81,6 +103,19 @@ func mockGitHub() *httptest.Server {
 		}
 	})
 	return httptest.NewServer(mux)
+}
+
+// mockResolveID models GitHub's authoritative node-ID → repository resolution for
+// tests. Only explicitly known IDs resolve; everything else is unresolved (null).
+func mockResolveID(id string) string {
+	switch {
+	case id == "PR_kwDOTestNode123", strings.Contains(id, "AllowedRw"):
+		return "allowed-org/rw-repo"
+	case strings.Contains(id, "BlockedSecret"):
+		return "blocked-org/secret"
+	default:
+		return ""
+	}
 }
 
 func testStore(t *testing.T, tmpDir string) (*store.Store, string) {
@@ -139,7 +174,6 @@ func setup(t *testing.T) *testEnv {
 		GithubToken: "fake-gh-token",
 		Store:       tokenStore,
 		Audit:       auditLogger,
-		AdminSecret: "admin-secret",
 		Client:      client,
 		Mode:        GHEMode,
 		UpstreamURL: mock.URL,
@@ -159,7 +193,6 @@ func setup(t *testing.T) *testEnv {
 		GithubToken:  "fake-gh-token",
 		Store:        tokenStore,
 		Audit:        auditLogger,
-		AdminSecret:  "admin-secret",
 		Client:       client,
 		Mode:         SocketMode,
 		SocketPolicy: socketPol,
@@ -508,7 +541,6 @@ func setupWithPerms(t *testing.T) *testEnv {
 		GithubToken: "fake-gh-token",
 		Store:       tokenStore,
 		Audit:       auditLogger,
-		AdminSecret: "admin-secret",
 		Client:      client,
 		Mode:        GHEMode,
 		UpstreamURL: mock.URL,
@@ -531,7 +563,6 @@ func setupWithPerms(t *testing.T) *testEnv {
 		GithubToken:  "fake-gh-token",
 		Store:        tokenStore,
 		Audit:        auditLogger,
-		AdminSecret:  "admin-secret",
 		Client:       client,
 		Mode:         SocketMode,
 		SocketPolicy: socketPol,
@@ -683,7 +714,7 @@ func TestAuditEntryContainsResourceAndCategory(t *testing.T) {
 	client := socketClient(env.socketPath)
 
 	client.Get("http://localhost/repos/allowed-org/rw-repo/pulls")
-	client.Get("http://localhost/user")
+	client.Get("http://localhost/search/repositories?q=test")
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -704,7 +735,7 @@ func TestAuditEntryContainsResourceAndCategory(t *testing.T) {
 		if r, ok := entry["resource"].(string); ok && r == "pulls" {
 			foundResource = true
 		}
-		if c, ok := entry["unscoped_category"].(string); ok && c == "user" {
+		if c, ok := entry["unscoped_category"].(string); ok && c == "search" {
 			foundCategory = true
 		}
 	}
@@ -712,7 +743,7 @@ func TestAuditEntryContainsResourceAndCategory(t *testing.T) {
 		t.Error("audit log missing resource=pulls entry")
 	}
 	if !foundCategory {
-		t.Error("audit log missing unscoped_category=user entry")
+		t.Error("audit log missing unscoped_category=search entry")
 	}
 }
 
@@ -816,6 +847,435 @@ func TestGHE_GraphQLResourcePermissions(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode == http.StatusForbidden {
 		t.Fatal("GraphQL pullRequests query on repo with pulls=read-write should be allowed")
+	}
+}
+
+func TestSocket_PermissionsInSocketPolicy(t *testing.T) {
+	mock := mockGitHub()
+	tmpDir := t.TempDir()
+	auditPath := filepath.Join(tmpDir, "audit.jsonl")
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("bgh-sockperm-%d.sock", os.Getpid()))
+
+	storePath := filepath.Join(tmpDir, "tokens.json")
+	tokenStore, err := store.Open(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	auditLogger := audit.NewLogger(auditPath)
+	client := &http.Client{Transport: &http.Transport{}}
+	nodeCache := nodecache.New(30 * time.Minute)
+
+	socketPol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo: []policy.RepoRule{{
+			Name:   "org/repo",
+			Access: policy.AccessRead,
+			Permissions: map[string]policy.Access{
+				"pulls":   policy.AccessReadWrite,
+				"actions": policy.AccessNone,
+			},
+		}},
+	}
+
+	socketHandler := &Handler{
+		GithubToken:  "fake-gh-token",
+		Store:        tokenStore,
+		Audit:        auditLogger,
+		Client:       client,
+		Mode:         SocketMode,
+		SocketPolicy: socketPol,
+		UpstreamURL:  mock.URL,
+		NodeCache:    nodeCache,
+	}
+
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: socketHandler}
+	go srv.Serve(ln)
+	t.Cleanup(func() {
+		srv.Close()
+		mock.Close()
+		nodeCache.Stop()
+		os.Remove(socketPath)
+	})
+
+	sc := socketClient(socketPath)
+
+	resp, err := sc.Post("http://localhost/repos/org/repo/pulls", "application/json", strings.NewReader(`{"title":"test"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("socket policy pulls=read-write should allow POST")
+	}
+
+	resp2, err := sc.Get("http://localhost/repos/org/repo/actions/runs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Fatalf("socket policy actions=none should deny GET, got %d", resp2.StatusCode)
+	}
+
+	resp3, err := sc.Get("http://localhost/repos/org/repo/issues")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode == http.StatusForbidden {
+		t.Fatal("socket policy issues should fall back to access=read and allow GET")
+	}
+}
+
+func TestAuditEntryDeniedByResourcePermission(t *testing.T) {
+	env := setupWithPerms(t)
+	client := gheClient(env.secret)
+
+	client.Get(env.gheServer.URL + "/api/v3/repos/allowed-org/rw-repo/actions/runs")
+
+	time.Sleep(100 * time.Millisecond)
+
+	auditPath := filepath.Join(env.tmpDir, "audit.jsonl")
+	data, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("reading audit log: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	found := false
+	for _, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if r, ok := entry["resource"].(string); ok && r == "actions" {
+			if pr, ok := entry["policy_result"].(string); ok && strings.Contains(pr, "denied") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("audit log should contain denied entry for resource=actions")
+	}
+}
+
+func TestGHE_QueryStringPreserved(t *testing.T) {
+	env := setup(t)
+	client := gheClient(env.secret)
+
+	resp, err := client.Get(env.gheServer.URL + "/api/v3/repos/allowed-org/rw-repo/pulls?state=closed&per_page=5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("query string request should be allowed")
+	}
+}
+
+func TestSocket_NoSocketPolicyDenies(t *testing.T) {
+	mock := mockGitHub()
+	tmpDir := t.TempDir()
+	auditPath := filepath.Join(tmpDir, "audit.jsonl")
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("bgh-nopol-%d.sock", os.Getpid()))
+
+	storePath := filepath.Join(tmpDir, "tokens.json")
+	tokenStore, err := store.Open(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	auditLogger := audit.NewLogger(auditPath)
+	client := &http.Client{Transport: &http.Transport{}}
+	nodeCache := nodecache.New(30 * time.Minute)
+
+	socketHandler := &Handler{
+		GithubToken:  "fake-gh-token",
+		Store:        tokenStore,
+		Audit:        auditLogger,
+		Client:       client,
+		Mode:         SocketMode,
+		SocketPolicy: nil,
+		UpstreamURL:  mock.URL,
+		NodeCache:    nodeCache,
+	}
+
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: socketHandler}
+	go srv.Serve(ln)
+	t.Cleanup(func() {
+		srv.Close()
+		mock.Close()
+		nodeCache.Stop()
+		os.Remove(socketPath)
+	})
+
+	sc := socketClient(socketPath)
+	resp, err := sc.Get("http://localhost/repos/any/repo/pulls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("nil socket policy should deny, got %d", resp.StatusCode)
+	}
+}
+
+func TestGHE_GraphQLMutationWithResourcePermission(t *testing.T) {
+	env := setupWithPerms(t)
+	client := gheClient(env.secret)
+
+	body := `{"query":"mutation($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } createIssue(input: {}) { issue { id } } }","variables":{"owner":"allowed-org","name":"rw-repo"}}`
+	resp, err := client.Post(
+		env.gheServer.URL+"/api/graphql",
+		"application/json",
+		strings.NewReader(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("createIssue mutation: repo access=read with no issues perm should deny write, got %d", resp.StatusCode)
+	}
+}
+
+func TestGHE_UpstreamFailureReturns502(t *testing.T) {
+	tmpDir := t.TempDir()
+	auditPath := filepath.Join(tmpDir, "audit.jsonl")
+
+	storePath := filepath.Join(tmpDir, "tokens.json")
+	tokenStore, err := store.Open(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pol := policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo:     []policy.RepoRule{{Name: "org/repo", Access: policy.AccessRead}},
+	}
+	_, secret, _ := tokenStore.Create("tok", pol)
+
+	auditLogger := audit.NewLogger(auditPath)
+	nodeCache := nodecache.New(30 * time.Minute)
+
+	handler := &Handler{
+		GithubToken: "fake-token",
+		Store:       tokenStore,
+		Audit:       auditLogger,
+		Client:      &http.Client{Transport: &http.Transport{}},
+		Mode:        GHEMode,
+		UpstreamURL: "http://127.0.0.1:1",
+		NodeCache:   nodeCache,
+	}
+
+	srv := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		srv.Close()
+		nodeCache.Stop()
+	})
+
+	client := gheClient(secret)
+	resp, err := client.Get(srv.URL + "/api/v3/repos/org/repo/pulls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 for unreachable upstream, got %d", resp.StatusCode)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	data, _ := os.ReadFile(auditPath)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	found := false
+	for _, line := range lines {
+		var entry map[string]any
+		json.Unmarshal([]byte(line), &entry)
+		if entry["policy_result"] == "allowed" && entry["resource"] == "pulls" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("upstream failure should still produce an audit entry with resource=pulls")
+	}
+}
+
+func TestListenerModeString(t *testing.T) {
+	if SocketMode.String() != "socket" {
+		t.Errorf("SocketMode.String() = %q", SocketMode.String())
+	}
+	if GHEMode.String() != "ghe" {
+		t.Errorf("GHEMode.String() = %q", GHEMode.String())
+	}
+}
+
+// --- Security audit tests ---
+
+func TestSec_UnscopedMutationWithDefaultAllow(t *testing.T) {
+	mock := mockGitHub()
+	tmpDir := t.TempDir()
+	auditPath := filepath.Join(tmpDir, "audit.jsonl")
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("bgh-sec-unscoped-%d.sock", os.Getpid()))
+
+	storePath := filepath.Join(tmpDir, "tokens.json")
+	tokenStore, _ := store.Open(storePath)
+	auditLogger := audit.NewLogger(auditPath)
+	nodeCache := nodecache.New(30 * time.Minute)
+
+	socketPol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeAllow},
+		Repo: []policy.RepoRule{
+			{Name: "secret-org/secret-repo", Access: policy.AccessNone},
+		},
+	}
+
+	socketHandler := &Handler{
+		GithubToken:  "fake-gh-token",
+		Store:        tokenStore,
+		Audit:        auditLogger,
+		Client:       &http.Client{Transport: &http.Transport{}},
+		Mode:         SocketMode,
+		SocketPolicy: socketPol,
+		UpstreamURL:  mock.URL,
+		NodeCache:    nodeCache,
+	}
+
+	ln, _ := net.Listen("unix", socketPath)
+	srv := &http.Server{Handler: socketHandler}
+	go srv.Serve(ln)
+	t.Cleanup(func() {
+		srv.Close()
+		mock.Close()
+		nodeCache.Stop()
+		os.Remove(socketPath)
+	})
+
+	sc := socketClient(socketPath)
+
+	body := `{"query":"mutation($id: ID!) { mergePullRequest(input: {pullRequestId: $id}) { pullRequest { url } } }","variables":{"id":"PR_kwDOFromDeniedRepo"}}`
+	resp, err := sc.Post("http://localhost/graphql", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("unscoped mutation should be denied, got %d", resp.StatusCode)
+	}
+}
+
+// Regression for FINDING 2 (CRITICAL): a node-ID mutation is authorized against the
+// repository GitHub says the node belongs to — not one inferred from a read. Here the
+// node resolves authoritatively to blocked-org/secret, so the mutation is denied even
+// though the client has write on allowed-org/rw-repo.
+func TestSec_MutationResolvesToRealRepoAndDenies(t *testing.T) {
+	env := setup(t)
+	client := gheClient(env.secret)
+
+	body := `{"query":"mutation($id: ID!){ closePullRequest(input:{pullRequestId:$id}){ clientMutationId } }","variables":{"id":"PR_BlockedSecretNode"}}`
+	resp, err := client.Post(env.gheServer.URL+"/api/graphql", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("mutation on a node owned by blocked-org/secret must be denied, got %d", resp.StatusCode)
+	}
+}
+
+// Control: a node that authoritatively resolves to the client's writable repo is allowed.
+func TestSec_MutationResolvesToAllowedRepo(t *testing.T) {
+	env := setup(t)
+	client := gheClient(env.secret)
+
+	body := `{"query":"mutation($id: ID!){ closePullRequest(input:{pullRequestId:$id}){ clientMutationId } }","variables":{"id":"PR_AllowedRwNode"}}`
+	resp, err := client.Post(env.gheServer.URL+"/api/graphql", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatalf("mutation on a node owned by allowed-org/rw-repo should be allowed, got 403")
+	}
+}
+
+func TestSec_GHEAuthEndpointLeaksUserInfo(t *testing.T) {
+	env := setup(t)
+
+	restrictedPol := policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+	}
+	_, secret, _ := env.store.Create("no-access-token", restrictedPol)
+	client := gheClient(secret)
+
+	resp, err := client.Get(env.gheServer.URL + "/api/v3/user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 (synthetic response), got %d", resp.StatusCode)
+	}
+	var user map[string]any
+	json.Unmarshal(body, &user)
+	if user["login"] != "bgh-proxy" {
+		t.Fatalf("expected synthetic login=bgh-proxy, got %v", user["login"])
+	}
+}
+
+func TestSec_MutationWithDummyRepoScope(t *testing.T) {
+	env := setupWithPerms(t)
+	client := gheClient(env.secret)
+
+	body := `{
+		"query": "mutation($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } mergePullRequest(input: {pullRequestId: \"PR_fromDeniedRepo\"}) { pullRequest { url } } }",
+		"variables": {"owner": "allowed-org", "name": "rw-repo"}
+	}`
+	resp, err := client.Post(
+		env.gheServer.URL+"/api/graphql",
+		"application/json",
+		strings.NewReader(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("mutation with dummy repo scope should be denied (unscoped write), got %d", resp.StatusCode)
+	}
+}
+
+func TestSec_ErrorMessageLeaksPolicy(t *testing.T) {
+	env := setup(t)
+	client := gheClient(env.secret)
+
+	resp, err := client.Get(env.gheServer.URL + "/api/v3/repos/blocked-org/secret/pulls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+	bodyStr := string(body)
+	if strings.Contains(bodyStr, "blocked-org/secret") ||
+		strings.Contains(bodyStr, "none") ||
+		strings.Contains(bodyStr, "policy") {
+		t.Fatalf("error message leaks policy details: %s", strings.TrimSpace(bodyStr))
 	}
 }
 

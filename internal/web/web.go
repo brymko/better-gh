@@ -1,10 +1,13 @@
 package web
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -46,10 +49,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) requireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := auth.ExtractToken(r.Header.Get("Authorization"))
-		if token == "" {
-			token = r.URL.Query().Get("token")
-		}
-		if token != h.adminSecret {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(h.adminSecret)) != 1 {
 			jsonResp(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
@@ -101,7 +101,7 @@ type createReqRule struct {
 
 func (h *Handler) createToken(w http.ResponseWriter, r *http.Request) {
 	var req createReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		jsonResp(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
@@ -171,7 +171,8 @@ func (h *Handler) createToken(w http.ResponseWriter, r *http.Request) {
 
 	tok, secret, err := h.store.Create(req.Name, pol)
 	if err != nil {
-		jsonResp(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		slog.Error("failed to create token", "err", err)
+		jsonResp(w, http.StatusInternalServerError, map[string]string{"error": "failed to create token"})
 		return
 	}
 
@@ -189,7 +190,25 @@ func (h *Handler) getToken(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
-	jsonResp(w, http.StatusOK, tok)
+	type tokenDetail struct {
+		ID        string        `json:"id"`
+		Name      string        `json:"name"`
+		Policy    policy.Policy `json:"policy"`
+		CreatedAt string        `json:"created_at"`
+		LastUsed  string        `json:"last_used,omitempty"`
+		Revoked   bool          `json:"revoked"`
+	}
+	out := tokenDetail{
+		ID:        tok.ID,
+		Name:      tok.Name,
+		Policy:    tok.Policy,
+		CreatedAt: tok.CreatedAt.Format("2006-01-02T15:04:05Z"),
+		Revoked:   tok.Revoked,
+	}
+	if !tok.LastUsed.IsZero() {
+		out.LastUsed = tok.LastUsed.Format("2006-01-02T15:04:05Z")
+	}
+	jsonResp(w, http.StatusOK, out)
 }
 
 func (h *Handler) revokeToken(w http.ResponseWriter, r *http.Request) {

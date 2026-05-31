@@ -1,6 +1,8 @@
 package store
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -111,6 +113,186 @@ func TestDelete(t *testing.T) {
 	}
 	if len(s.List()) != 0 {
 		t.Fatal("expected empty list after delete")
+	}
+}
+
+func TestDeleteNonexistent(t *testing.T) {
+	s := openTestStore(t)
+	if s.Delete("nonexistent") {
+		t.Fatal("Delete should return false for nonexistent token")
+	}
+}
+
+func TestRevokeNonexistent(t *testing.T) {
+	s := openTestStore(t)
+	if s.Revoke("nonexistent") {
+		t.Fatal("Revoke should return false for nonexistent token")
+	}
+}
+
+func TestGetNonexistent(t *testing.T) {
+	s := openTestStore(t)
+	if s.Get("nonexistent") != nil {
+		t.Fatal("Get should return nil for nonexistent token")
+	}
+}
+
+func TestLookupMultipleTokens(t *testing.T) {
+	s := openTestStore(t)
+	_, s1, _ := s.Create("tok-1", testPolicy())
+	_, s2, _ := s.Create("tok-2", testPolicy())
+
+	tok1 := s.Lookup(s1)
+	tok2 := s.Lookup(s2)
+	if tok1 == nil || tok1.Name != "tok-1" {
+		t.Fatal("lookup for tok-1 failed")
+	}
+	if tok2 == nil || tok2.Name != "tok-2" {
+		t.Fatal("lookup for tok-2 failed")
+	}
+}
+
+func TestTouchLastUsed(t *testing.T) {
+	s := openTestStore(t)
+	tok, _, _ := s.Create("tok", testPolicy())
+
+	if !tok.LastUsed.IsZero() {
+		t.Fatal("LastUsed should initially be zero")
+	}
+
+	s.TouchLastUsed(tok.ID)
+
+	updated := s.Get(tok.ID)
+	if updated.LastUsed.IsZero() {
+		t.Fatal("LastUsed should be updated after TouchLastUsed")
+	}
+}
+
+func TestTouchLastUsedNonexistent(t *testing.T) {
+	s := openTestStore(t)
+	s.TouchLastUsed("nonexistent-id")
+}
+
+func TestOpenCorruptJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tokens.json")
+	os.WriteFile(path, []byte("not json"), 0o644)
+
+	_, err := Open(path)
+	if err == nil {
+		t.Fatal("expected error for corrupt JSON")
+	}
+}
+
+func TestPolicyPreservedInToken(t *testing.T) {
+	s := openTestStore(t)
+	pol := policy.Policy{
+		Defaults: policy.Defaults{
+			Mode: policy.ModeDeny,
+			Unscoped: map[string]policy.Access{
+				"user": policy.AccessRead,
+			},
+		},
+		Repo: []policy.RepoRule{{
+			Name:   "org/repo",
+			Access: policy.AccessRead,
+			Permissions: map[string]policy.Access{
+				"pulls": policy.AccessReadWrite,
+			},
+		}},
+	}
+	tok, _, _ := s.Create("full-policy", pol)
+
+	retrieved := s.Get(tok.ID)
+	if retrieved.Policy.Defaults.Unscoped["user"] != policy.AccessRead {
+		t.Fatal("unscoped user=read not preserved")
+	}
+	if retrieved.Policy.Repo[0].Permissions["pulls"] != policy.AccessReadWrite {
+		t.Fatal("repo permissions not preserved")
+	}
+}
+
+func TestPersistencePreservesPermissionsAndUnscoped(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tokens.json")
+
+	s1, _ := Open(path)
+	pol := policy.Policy{
+		Defaults: policy.Defaults{
+			Mode: policy.ModeDeny,
+			Unscoped: map[string]policy.Access{
+				"user":   policy.AccessRead,
+				"search": policy.AccessRead,
+			},
+		},
+		Org: []policy.OrgRule{{
+			Name:   "org",
+			Access: policy.AccessRead,
+			Permissions: map[string]policy.Access{
+				"pulls": policy.AccessReadWrite,
+			},
+		}},
+		Repo: []policy.RepoRule{{
+			Name:   "org/repo",
+			Access: policy.AccessRead,
+			Permissions: map[string]policy.Access{
+				"actions": policy.AccessNone,
+				"issues":  policy.AccessReadWrite,
+			},
+		}},
+	}
+	s1.Create("round-trip", pol)
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tok := s2.Get("round-trip")
+	if tok == nil {
+		t.Fatal("token not found after reopen")
+	}
+
+	if tok.Policy.Defaults.Unscoped["user"] != policy.AccessRead {
+		t.Fatal("unscoped user=read lost on round-trip")
+	}
+	if tok.Policy.Defaults.Unscoped["search"] != policy.AccessRead {
+		t.Fatal("unscoped search=read lost on round-trip")
+	}
+	if tok.Policy.Org[0].Permissions["pulls"] != policy.AccessReadWrite {
+		t.Fatal("org pulls=read-write lost on round-trip")
+	}
+	if tok.Policy.Repo[0].Permissions["actions"] != policy.AccessNone {
+		t.Fatal("repo actions=none lost on round-trip")
+	}
+	if tok.Policy.Repo[0].Permissions["issues"] != policy.AccessReadWrite {
+		t.Fatal("repo issues=read-write lost on round-trip")
+	}
+}
+
+func TestSec_LookupReturnsPointerIntoSlice(t *testing.T) {
+	// Finding 9: Lookup returns a pointer into the tokens slice.
+	// Concurrent Create can reallocate the slice, dangling the pointer.
+	s := openTestStore(t)
+	_, secret, _ := s.Create("tok-1", testPolicy())
+
+	tok := s.Lookup(secret)
+	if tok == nil {
+		t.Fatal("expected token")
+	}
+
+	// tok is a pointer into s.tokens. If we create enough tokens
+	// to force a reallocation, tok could dangle.
+	name := tok.Name // capture before potential realloc
+	for i := 0; i < 100; i++ {
+		s.Create(fmt.Sprintf("tok-fill-%d", i), testPolicy())
+	}
+
+	// In Go, this won't crash (old backing array is kept alive by GC)
+	// but the pointer may now refer to stale data if the slice was
+	// reallocated and the old slot was reused. Verify it still works:
+	if tok.Name != name {
+		t.Logf("VULNERABLE: Lookup pointer returned stale data after slice realloc (Finding 9)")
 	}
 }
 
