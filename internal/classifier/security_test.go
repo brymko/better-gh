@@ -156,6 +156,8 @@ func TestSec_GraphQLCrossRepoNavFailsClosed(t *testing.T) {
 		`query{repository(owner:"o",name:"r"){forks(first:5){nodes{nameWithOwner}}}}`,
 		`query{repository(owner:"o",name:"r"){parent{nameWithOwner}}}`,
 		`query{node(id:"R_kgDOx"){... on Repository{owner{repositories(first:5){nodes{name}}}}}}`,
+		`query{search(query:"repo:o/r",type:ISSUE,first:5){nodes{... on Issue{repository{owner{repositories(first:5){nodes{name}}}}}}}}`,
+		`query{repositoryOwner(login:"o"){... on User{repositories(first:5){nodes{forks(first:1){nodes{name}}}}}}}`,
 	}
 	for _, q := range escaping {
 		r := Classify("POST", "/api/graphql", []byte(`{"query":`+jsonStr(q)+`}`))
@@ -164,6 +166,18 @@ func TestSec_GraphQLCrossRepoNavFailsClosed(t *testing.T) {
 		}
 		if r.Access != Write {
 			t.Errorf("cross-repo nav should fail closed (Write→unscoped deny); got %v for %s", r.Access, q)
+		}
+	}
+
+	// Org/owner enumeration of its OWN repos is legitimate (granted via org access) and
+	// must stay a normal org-scoped read, not fail closed.
+	for _, q := range []string{
+		`query{organization(login:"o"){repositories(first:5){nodes{name}}}}`,
+		`query{repositoryOwner(login:"o"){repositories(first:5){nodes{name}}}}`,
+	} {
+		r := Classify("POST", "/api/graphql", []byte(`{"query":`+jsonStr(q)+`}`))
+		if r.Org != "o" || r.Access != Read {
+			t.Errorf("org enumeration should be an org-scoped read; query=%s org=%q access=%v", q, r.Org, r.Access)
 		}
 	}
 
