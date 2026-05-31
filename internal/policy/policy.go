@@ -221,6 +221,41 @@ func (p *Policy) AllowsAnyWrite() bool {
 	return false
 }
 
+// AllowsAnyRead reports whether the policy could permit reading anything. Like
+// AllowsAnyWrite, the proxy uses it to skip node resolution for tokens that can never
+// read at all (avoiding upstream calls that could only be denied).
+func (p *Policy) AllowsAnyRead() bool {
+	if p.Defaults.Mode == ModeAllow {
+		return true
+	}
+	for _, a := range p.Defaults.Unscoped {
+		if a != AccessNone {
+			return true
+		}
+	}
+	for _, o := range p.Org {
+		if o.Access != AccessNone {
+			return true
+		}
+		for _, a := range o.Permissions {
+			if a != AccessNone {
+				return true
+			}
+		}
+	}
+	for _, r := range p.Repo {
+		if r.Access != AccessNone {
+			return true
+		}
+		for _, a := range r.Permissions {
+			if a != AccessNone {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func permits(rule Access, requested classifier.AccessLevel) bool {
 	switch rule {
 	case AccessNone:

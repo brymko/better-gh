@@ -182,7 +182,7 @@ func classifyGraphQL(body []byte) Result {
 		if mutationFieldName != "" {
 			result.Resource = gqlMutationResource(mutationFieldName)
 		}
-		ids, ok := collectMutationNodeIDs(ops, req.Variables)
+		ids, ok := collectNodeIDArgs(ops, req.Variables)
 		if !ok {
 			// Too complex to walk safely → no scope → unscoped write → denied.
 			return Result{Access: Write}
@@ -212,7 +212,19 @@ func classifyGraphQL(body []byte) Result {
 		return Result{Access: Write}
 	}
 
+	// Reads can also address objects by opaque node ID (node(id:)/nodes(ids:)). Those
+	// carry no repository() scope, so the proxy resolves each to its real repository
+	// before allowing the read — otherwise a node-ID read would bypass a repo block
+	// under default=allow.
+	nodeIDs, idsOk := collectNodeIDArgs(ops, req.Variables)
+	if !idsOk {
+		return Result{Access: Write}
+	}
+
 	if len(scopes) == 0 {
+		if len(nodeIDs) > 0 {
+			return Result{Access: Read, NodeIDs: nodeIDs}
+		}
 		return Result{Access: Read, UnscopedCategory: gqlUnscopedCategory(doc)}
 	}
 
@@ -224,6 +236,7 @@ func classifyGraphQL(body []byte) Result {
 		Org:              primary.Org,
 		Resource:         primary.Resource,
 		UnscopedCategory: primary.UnscopedCategory,
+		NodeIDs:          nodeIDs,
 		Additional:       scopes[1:],
 	}
 }
@@ -414,12 +427,13 @@ func isIDKeyName(name string) bool {
 	return strings.HasSuffix(n, "id") || strings.HasSuffix(n, "ids")
 }
 
-// collectMutationNodeIDs returns the repo-scoped node IDs a mutation references,
+// collectNodeIDArgs returns the repo-scoped node IDs a request references through
+// arguments — mutation inputs (e.g. pullRequestId) and node(id:)/nodes(ids:) reads —
 // from inline arguments (under id-typed argument/object-field names) and from
 // variables (under id-typed keys). Over-collection is safe — every collected ID is
 // independently resolved and policy-checked; missing one would be the dangerous case.
 // ok is false if the input is too deep/cyclic to walk safely; the caller fails closed.
-func collectMutationNodeIDs(ops ast.OperationList, vars map[string]interface{}) (ids []string, ok bool) {
+func collectNodeIDArgs(ops ast.OperationList, vars map[string]interface{}) (ids []string, ok bool) {
 	seen := make(map[string]bool)
 	var out []string
 	add := func(s string) {
@@ -430,9 +444,6 @@ func collectMutationNodeIDs(ops ast.OperationList, vars map[string]interface{}) 
 	}
 	tooComplex := false
 	for _, op := range ops {
-		if op.Operation != ast.Mutation {
-			continue
-		}
 		walkSelectionArgs(op.SelectionSet, vars, add, 0, &tooComplex)
 	}
 	walkVarsForIDs("", vars, add, 0, &tooComplex)

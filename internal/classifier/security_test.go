@@ -109,6 +109,38 @@ func TestSec_GraphQLRecursionBoundedNoCrash(t *testing.T) {
 	}
 }
 
+// FINDING 8 (Medium): a GraphQL read can address objects by opaque node ID
+// (node(id:)/nodes(ids:)) with no repository() scope. Previously these extracted no
+// scope and fell through to the default — bypassing a repo block under default=allow.
+// The classifier now extracts those node IDs (like mutations) so the proxy resolves
+// and policy-checks each.
+func TestSec_NodeIDReadExtracted(t *testing.T) {
+	single := []byte(`{"query":"query { node(id: \"R_kgDORepoNode\") { ... on Repository { name } } }"}`)
+	r := Classify("POST", "/api/graphql", single)
+	if r.Access != Read {
+		t.Fatalf("expected Read, got %v", r.Access)
+	}
+	if len(r.NodeIDs) != 1 || r.NodeIDs[0] != "R_kgDORepoNode" {
+		t.Fatalf("expected node(id) read to extract R_kgDORepoNode, got %v", r.NodeIDs)
+	}
+	if r.HasRepo() {
+		t.Fatalf("node(id) read should carry no repository() scope, got %s", r.RepoFullName())
+	}
+
+	multi := []byte(`{"query":"query($ids:[ID!]!){ nodes(ids: $ids) { __typename } }","variables":{"ids":["PR_one","I_two","U_user"]}}`)
+	r2 := Classify("POST", "/api/graphql", multi)
+	got := map[string]bool{}
+	for _, id := range r2.NodeIDs {
+		got[id] = true
+	}
+	if !got["PR_one"] || !got["I_two"] {
+		t.Fatalf("expected repo-scoped ids from nodes(ids:), got %v", r2.NodeIDs)
+	}
+	if got["U_user"] {
+		t.Fatalf("user node id must not be extracted, got %v", r2.NodeIDs)
+	}
+}
+
 func scopesContainRepo(r Result, owner, repo string) bool {
 	for _, s := range r.AllScopes() {
 		if s.Owner == owner && s.Repo == repo {

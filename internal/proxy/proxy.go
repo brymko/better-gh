@@ -140,18 +140,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A mutation carries no repository() scope; it targets objects by node ID. Resolve
-	// every referenced node ID to its REAL repository (authoritatively, via GitHub),
-	// then scope the request to those repos. Any unresolved node leaves the request
-	// repo-less → denied as an unscoped write. Gated on AllowsAnyWrite so a token that
-	// can never write cannot burn the upstream token's rate limit on doomed resolves.
-	if h.NodeCache != nil && classified.Access == classifier.Write &&
-		!classified.HasRepo() && classified.Org == "" && len(classified.NodeIDs) > 0 &&
-		(norm == "/graphql" || norm == "/graphql/") && pol.AllowsAnyWrite() {
-		if scopes, ok := h.resolveNodeScopes(r.Context(), classified.NodeIDs); ok {
-			classified.Owner = scopes[0].Owner
-			classified.Repo = scopes[0].Repo
-			classified.Additional = append(classified.Additional, scopes[1:]...)
+	// A request can address objects by opaque node ID with no repository() scope —
+	// mutation inputs, and node(id:)/nodes(ids:) reads. Resolve every referenced node
+	// ID to its REAL repository (authoritatively, via GitHub) and add those as scopes,
+	// so a node-ID request cannot reach a repo the token can't access. Unresolvable
+	// nodes fail closed. Gated on AllowsAny{Write,Read} so a token that can never act
+	// at this access level cannot burn the upstream rate limit on doomed resolves.
+	forceDenyReason := ""
+	if h.NodeCache != nil && len(classified.NodeIDs) > 0 &&
+		(norm == "/graphql" || norm == "/graphql/") {
+		canResolve := pol.AllowsAnyWrite()
+		if classified.Access == classifier.Read {
+			canResolve = pol.AllowsAnyRead()
+		}
+		if !canResolve {
+			forceDenyReason = "node-scoped request not permitted by policy"
+		} else if scopes, ok := h.resolveNodeScopes(r.Context(), classified.NodeIDs); ok {
+			if !classified.HasRepo() && classified.Org == "" {
+				classified.Owner = scopes[0].Owner
+				classified.Repo = scopes[0].Repo
+				classified.Resource = scopes[0].Resource
+				classified.Additional = append(classified.Additional, scopes[1:]...)
+			} else {
+				classified.Additional = append(classified.Additional, scopes...)
+			}
+		} else {
+			forceDenyReason = "unresolved node id"
 		}
 	}
 
@@ -159,7 +173,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	result := evaluateScopes(pol, &classified)
 
-	if !result.Allowed {
+	if forceDenyReason != "" || !result.Allowed {
+		reason := forceDenyReason
+		if reason == "" {
+			reason = result.Reason
+		}
 		durationMs := time.Since(start).Milliseconds()
 		h.Audit.Log(audit.Entry{
 			Timestamp:        time.Now(),
@@ -169,7 +187,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Resource:         classified.Resource,
 			UnscopedCategory: classified.UnscopedCategory,
 			Access:           classified.Access.String(),
-			PolicyResult:     "denied: " + result.Reason,
+			PolicyResult:     "denied: " + reason,
 			DurationMs:       durationMs,
 			Mode:             h.Mode.String(),
 			TokenName:        tokenName,

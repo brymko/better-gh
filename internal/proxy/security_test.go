@@ -182,6 +182,59 @@ func TestSec_E2E_PathTraversalRejected(t *testing.T) {
 	}
 }
 
+// FINDING 8 (Medium) e2e: under default=allow, a node(id:) read of a blocked repo's
+// object must be denied. Before the fix it extracted no scope and fell through to the
+// permissive default, bypassing the [[repo]] none block.
+func TestSec_E2E_NodeIDReadBlockedRepoDeniedUnderAllow(t *testing.T) {
+	env := setup(t)
+	pol := policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeAllow},
+		Repo:     []policy.RepoRule{{Name: "blocked-org/secret", Access: policy.AccessNone}},
+	}
+	_, secret, err := env.store.Create("allow-default-token", pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := gheClient(secret)
+
+	body := `{"query":"query { node(id: \"PR_BlockedSecretNode\") { ... on PullRequest { title body } } }"}`
+	resp, err := client.Post(env.gheServer.URL+"/api/graphql", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("node(id) read of a blocked repo must be denied under default=allow, got %d", resp.StatusCode)
+	}
+}
+
+// A node(id:) read that resolves to a readable repo works (no over-denial), and an
+// unresolvable node fails closed.
+func TestSec_E2E_NodeIDReadResolution(t *testing.T) {
+	env := setup(t)
+	client := gheClient(env.secret) // default deny; org allowed-org=read
+
+	ok := `{"query":"query { node(id: \"PR_AllowedRwNode\") { ... on PullRequest { title } } }"}`
+	resp, err := client.Post(env.gheServer.URL+"/api/graphql", "application/json", strings.NewReader(ok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatalf("node(id) read of an allowed repo should succeed, got 403")
+	}
+
+	bad := `{"query":"query { node(id: \"PR_kwDONeverResolves\") { ... on PullRequest { title } } }"}`
+	resp2, err := client.Post(env.gheServer.URL+"/api/graphql", "application/json", strings.NewReader(bad))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Fatalf("unresolvable node(id) read should fail closed, got %d", resp2.StatusCode)
+	}
+}
+
 // Baseline control: a single-repo GraphQL read of the blocked repo is correctly
 // denied. This is the behavior the multi-root bypass below evades.
 func TestSec_E2E_GraphQLSingleBlockedRepoDenied(t *testing.T) {
