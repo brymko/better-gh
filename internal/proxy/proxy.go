@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -181,12 +182,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			for i := range scopes {
 				scopes[i].Resource = classified.Resource
 			}
-			if !classified.HasRepo() && classified.Org == "" {
-				classified.Owner = scopes[0].Owner
-				classified.Repo = scopes[0].Repo
-				classified.Additional = append(classified.Additional, scopes[1:]...)
-			} else {
-				classified.Additional = append(classified.Additional, scopes...)
+			// scopes can be empty when every referenced node is non-repo (e.g. a user
+			// assignee); then the request carries no node-derived repo constraint.
+			if len(scopes) > 0 {
+				if !classified.HasRepo() && classified.Org == "" {
+					classified.Owner = scopes[0].Owner
+					classified.Repo = scopes[0].Repo
+					classified.Additional = append(classified.Additional, scopes[1:]...)
+				} else {
+					classified.Additional = append(classified.Additional, scopes...)
+				}
 			}
 		} else {
 			forceDenyReason = "unresolved node id"
@@ -318,19 +323,35 @@ func evaluateScopes(pol *policy.Policy, c *classifier.Result) policy.Result {
 // reject up front rather than build an oversized upstream query.
 const maxResolveIDs = 100
 
-// resolveNodeScopes maps each node ID to the repository GitHub says it belongs to.
-// It returns one Scope per input ID (cache-first, then a single GitHub nodes(ids:)
-// call for the misses) and ok=false if ANY node cannot be resolved — so an
-// unresolvable or upstream-failed lookup fails closed.
+// node resolution outcomes for a single ID.
+const (
+	nodeSkip = iota // null (invalid/unknown/no-access to the upstream token) or a non-repo node → no constraint
+	nodeRepo        // belongs to a repository → must be policy-checked
+	nodeDeny        // resolved to a repo-scoped TYPE but GitHub returned no repository → fail closed
+)
+
+type nodeRes struct {
+	kind        int
+	owner, repo string
+}
+
+// resolveNodeScopes maps each referenced node ID to the repository GitHub says it belongs
+// to. Repo-scoped nodes become Scopes the policy must allow. A node that does not resolve
+// (invalid/unknown, or not visible to the upstream token) and a non-repo node (user, org)
+// add no constraint and are skipped — a node the upstream token cannot resolve it cannot
+// mutate either, so this cannot exceed policy; a *lone* such node leaves the request with
+// no repo scope, which the policy denies as an unscoped write. Only a node that resolves
+// to a repo-scoped TYPE without a repository (anomalous) fails the whole request closed.
+// An upstream error also fails closed. Returns (scopes, ok); scopes may be empty.
 func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string) ([]classifier.Scope, bool) {
 	if len(ids) > maxResolveIDs {
 		return nil, false
 	}
-	resolved := make(map[string][2]string, len(ids))
+	repoOf := make(map[string][2]string, len(ids))
 	var missing []string
 	for _, id := range ids {
 		if owner, repo, ok := h.NodeCache.Get(id); ok {
-			resolved[id] = [2]string{owner, repo}
+			repoOf[id] = [2]string{owner, repo} // cache only ever holds verified repo nodes
 		} else {
 			missing = append(missing, id)
 		}
@@ -342,32 +363,41 @@ func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string) ([]classi
 			slog.Error("node resolution failed", "err", err)
 			return nil, false
 		}
-		for id, or := range fetched {
-			h.NodeCache.Put(id, or[0], or[1])
-			resolved[id] = or
+		for _, id := range missing {
+			switch fetched[id].kind { // absent → zero value nodeSkip → ignored
+			case nodeRepo:
+				h.NodeCache.Put(id, fetched[id].owner, fetched[id].repo)
+				repoOf[id] = [2]string{fetched[id].owner, fetched[id].repo}
+			case nodeDeny:
+				return nil, false // repo-scoped type without a repository → fail closed
+			}
 		}
 	}
 
-	scopes := make([]classifier.Scope, 0, len(ids))
+	scopes := make([]classifier.Scope, 0, len(repoOf))
 	for _, id := range ids {
-		or, ok := resolved[id]
-		if !ok {
-			return nil, false // some node did not resolve → deny
+		if or, ok := repoOf[id]; ok {
+			scopes = append(scopes, classifier.Scope{Owner: or[0], Repo: or[1]})
 		}
-		scopes = append(scopes, classifier.Scope{Owner: or[0], Repo: or[1]})
 	}
 	return scopes, true
 }
 
+// resolveQuery is the static fallback used only when no schema is loaded (GQLFilter nil).
+// In normal operation h.GQLFilter.NodeResolveQuery() covers every repo-scoped Node type.
 const resolveQuery = `query($ids:[ID!]!){nodes(ids:$ids){__typename ` +
 	`... on RepositoryNode{repository{nameWithOwner}} ` +
 	`... on Repository{nameWithOwner} ` +
 	`... on Ref{repository{nameWithOwner}} ` +
 	`... on Release{repository{nameWithOwner}}}}`
 
-func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[string][2]string, error) {
+func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[string]nodeRes, error) {
+	query := resolveQuery
+	if h.GQLFilter != nil {
+		query = h.GQLFilter.NodeResolveQuery()
+	}
 	reqBody, _ := json.Marshal(map[string]any{
-		"query":     resolveQuery,
+		"query":     query,
 		"variables": map[string]any{"ids": ids},
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.upstreamBase()+"/graphql", bytes.NewReader(reqBody))
@@ -391,34 +421,70 @@ func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[stri
 
 	var parsed struct {
 		Data struct {
-			Nodes []*struct {
-				NameWithOwner string `json:"nameWithOwner"`
-				Repository    *struct {
-					NameWithOwner string `json:"nameWithOwner"`
-				} `json:"repository"`
-			} `json:"nodes"`
+			Nodes []json.RawMessage `json:"nodes"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return nil, err
 	}
+	if parsed.Data.Nodes == nil {
+		// No nodes array at all (e.g. a top-level error: rate limit, too complex). This is
+		// a resolution failure, not per-node nulls → fail closed.
+		return nil, fmt.Errorf("node resolution returned no nodes")
+	}
 
-	out := make(map[string][2]string)
-	// GitHub returns nodes in the same order as the input ids; null entries (no access
-	// or wrong type) decode to a nil element and are left unresolved.
-	for i, n := range parsed.Data.Nodes {
-		if i >= len(ids) || n == nil {
-			continue
+	// GitHub returns nodes in input order; a null entry (invalid/unknown/no-access) decodes
+	// to JSON null → skip (the upstream token can't resolve it, so it can't mutate it). A
+	// non-null node carries __typename plus, for repo-scoped types, a uniquely-aliased
+	// repository marker (the alias varies, so we scan every non-typename field for a
+	// nameWithOwner). A node with __typename but no repository is non-repo — UNLESS its
+	// type is repo-scoped per the schema (a repository we failed to read), which fails
+	// closed so it can never slip through as "non-repo".
+	out := make(map[string]nodeRes, len(ids))
+	for i, raw := range parsed.Data.Nodes {
+		if i >= len(ids) {
+			break
 		}
-		nwo := n.NameWithOwner
-		if n.Repository != nil && n.Repository.NameWithOwner != "" {
-			nwo = n.Repository.NameWithOwner
-		}
+		id := ids[i]
+		typename, nwo := parseResolvedNode(raw)
 		if owner, repo, ok := splitNameWithOwner(nwo); ok {
-			out[ids[i]] = [2]string{owner, repo}
+			out[id] = nodeRes{kind: nodeRepo, owner: owner, repo: repo}
+		} else if typename != "" && h.GQLFilter != nil && h.GQLFilter.IsRepoScopedType(typename) {
+			out[id] = nodeRes{kind: nodeDeny} // repo-scoped type but no repository → fail closed
+		} else {
+			out[id] = nodeRes{kind: nodeSkip} // null node or non-repo node → no constraint
 		}
 	}
 	return out, nil
+}
+
+// parseResolvedNode extracts (__typename, nameWithOwner) from one resolved nodes(ids:)
+// element. The repository marker is selected under a per-type alias, so it scans every
+// field except __typename for either a "owner/repo" string (Repository.nameWithOwner) or
+// an object {nameWithOwner:"owner/repo"} (other repo-scoped types). Returns "" typename
+// for a JSON null node.
+func parseResolvedNode(raw json.RawMessage) (typename, nwo string) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return "", "" // null or non-object → unresolved
+	}
+	_ = json.Unmarshal(fields["__typename"], &typename)
+	for k, v := range fields {
+		if k == "__typename" {
+			continue
+		}
+		var s string
+		if json.Unmarshal(v, &s) == nil && strings.Contains(s, "/") {
+			return typename, s
+		}
+		var obj struct {
+			NameWithOwner string `json:"nameWithOwner"`
+		}
+		if json.Unmarshal(v, &obj) == nil && obj.NameWithOwner != "" {
+			return typename, obj.NameWithOwner
+		}
+	}
+	return typename, ""
 }
 
 func splitNameWithOwner(nwo string) (owner, repo string, ok bool) {

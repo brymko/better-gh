@@ -20,7 +20,9 @@ fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAILED=1; }
 FAILED=0
 gql() { curl -sS -H "Authorization: token $TOKEN" -X POST https://api.github.com/graphql -d "$1"; }
 
-echo "== 1. node-resolution query is schema-valid on live GitHub =="
+echo "== 1. fallback node-resolution query is schema-valid on live GitHub =="
+echo "   (the proxy normally uses a larger query generated from the embedded schema; that"
+echo "    one is exercised end-to-end through the proxy in section 4)"
 REPO_ID=$(gql "{\"query\":\"{repository(owner:\\\"$OWNER\\\",name:\\\"$NAME\\\"){id}}\"}" \
             | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 if [[ -z "$REPO_ID" ]]; then
@@ -80,6 +82,19 @@ A=$(sock -o /dev/null -w '%{http_code}' "http://localhost/repos/$REPO/pulls?per_
 [[ "$A" != 403 ]] && pass "allowed repo read -> HTTP $A" || fail "allowed repo was denied ($A)"
 D=$(sock -o /dev/null -w '%{http_code}' "http://localhost/repos/github/docs/pulls?per_page=1")
 [[ "$D" == 403 ]] && pass "unlisted repo read -> HTTP 403 (denied)" || fail "unlisted repo not denied ($D)"
+
+echo "== 4. node(id:) resolution through the proxy (exercises the generated resolver query) =="
+if [[ -n "${REPO_ID:-}" ]]; then
+  NODEQ="{\"query\":\"query{node(id:\\\"$REPO_ID\\\"){__typename ... on Repository{nameWithOwner}}}\"}"
+  NRESP=$(sock -X POST "http://localhost/graphql" -d "$NODEQ")
+  if grep -q "\"nameWithOwner\":\"$OWNER/$NAME\"" <<<"$NRESP"; then
+    pass "node(id:) of the allowed repo resolved through the proxy -> $OWNER/$NAME"
+  else
+    fail "node(id:) resolution through the proxy did not return the allowed repo:"; head -c 200 <<<"$NRESP"; echo
+  fi
+else
+  echo "  (skipped: no repo node id from section 1)"
+fi
 
 echo
 [[ "$FAILED" == 0 ]] && echo "all checks passed" || { echo "some checks FAILED"; exit 1; }

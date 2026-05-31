@@ -54,12 +54,14 @@ func TestSec_GraphQLSearch_AllRepoQualifiers(t *testing.T) {
 	}
 }
 
-// FINDING 2 support: a mutation's repo-scoped node IDs are extracted from BOTH
-// inline arguments and variables (so neither location can smuggle a denied repo's
-// node past the resolver). Non-repo-scoped IDs (users) are excluded so legitimate
-// user-referencing mutations are not false-denied.
+// FINDING 2 support: a mutation's node IDs are extracted from BOTH inline arguments and
+// variables (so neither location can smuggle a denied repo's node past the resolver). The
+// classifier no longer filters by node type — it extracts every node-ID-shaped value; the
+// proxy resolver classifies each (repo-scoped → policy-checked, non-repo like a user →
+// ignored). This is what keeps repo-scoped types whose prefix used to be unlisted from
+// being bypassed. (Resolution-layer behavior is proven in internal/proxy/security_test.go.)
 func TestSec_MutationNodeIDExtraction(t *testing.T) {
-	body := []byte(`{"query":"mutation($pid: ID!){ closePullRequest(input:{pullRequestId:$pid}){clientMutationId} addAssigneesToAssignable(input:{assignableId:\"I_kwDOInlineIssue\", assigneeIds:[\"U_ignoreMe\"]}){clientMutationId} }","variables":{"pid":"PR_kwDOVarPR"}}`)
+	body := []byte(`{"query":"mutation($pid: ID!){ closePullRequest(input:{pullRequestId:$pid}){clientMutationId} addAssigneesToAssignable(input:{assignableId:\"I_kwDOInlineIssue\", assigneeIds:[\"U_kwDOignoreMe\"]}){clientMutationId} }","variables":{"pid":"PR_kwDOVarPR"}}`)
 
 	r := Classify("POST", "/api/graphql", body)
 	if r.Access != Write {
@@ -69,14 +71,12 @@ func TestSec_MutationNodeIDExtraction(t *testing.T) {
 	for _, id := range r.NodeIDs {
 		got[id] = true
 	}
-	if !got["PR_kwDOVarPR"] {
-		t.Errorf("variable node ID PR_kwDOVarPR not extracted: %v", r.NodeIDs)
-	}
-	if !got["I_kwDOInlineIssue"] {
-		t.Errorf("inline node ID I_kwDOInlineIssue not extracted: %v", r.NodeIDs)
-	}
-	if got["U_ignoreMe"] {
-		t.Errorf("user ID U_ignoreMe must NOT be extracted (would false-deny): %v", r.NodeIDs)
+	// All node-ID-shaped values are extracted (incl. the user ID, which the resolver then
+	// classifies as non-repo and ignores) — none may be silently dropped at this layer.
+	for _, want := range []string{"PR_kwDOVarPR", "I_kwDOInlineIssue", "U_kwDOignoreMe"} {
+		if !got[want] {
+			t.Errorf("node ID %s not extracted: %v", want, r.NodeIDs)
+		}
 	}
 }
 
@@ -134,11 +134,10 @@ func TestSec_NodeIDReadExtracted(t *testing.T) {
 	for _, id := range r2.NodeIDs {
 		got[id] = true
 	}
-	if !got["PR_one"] || !got["I_two"] {
-		t.Fatalf("expected repo-scoped ids from nodes(ids:), got %v", r2.NodeIDs)
-	}
-	if got["U_user"] {
-		t.Fatalf("user node id must not be extracted, got %v", r2.NodeIDs)
+	// Every node-ID-shaped value is extracted; the proxy resolver decides repo vs non-repo
+	// authoritatively (the user ID resolves to a non-repo node and is ignored there).
+	if !got["PR_one"] || !got["I_two"] || !got["U_user"] {
+		t.Fatalf("expected all node ids from nodes(ids:) to be extracted, got %v", r2.NodeIDs)
 	}
 }
 

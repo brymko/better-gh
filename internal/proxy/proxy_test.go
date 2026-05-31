@@ -64,6 +64,11 @@ func mockGitHub() *httptest.Server {
 			json.Unmarshal(body, &req)
 			nodes := make([]any, 0, len(req.Variables.IDs))
 			for _, id := range req.Variables.IDs {
+				if strings.HasPrefix(id, "U_") || strings.HasPrefix(id, "O_") {
+					// a real non-repo node: __typename present, no repository
+					nodes = append(nodes, map[string]any{"__typename": "User"})
+					continue
+				}
 				nwo := mockResolveID(id)
 				if nwo == "" {
 					nodes = append(nodes, nil)

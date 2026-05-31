@@ -86,11 +86,11 @@ Variables are resolved. `operationName` is honored — only the executed operati
 
 GraphQL requests can address objects by opaque node ID with no `repository()` scope — every mutation (`mergePullRequest(input:{pullRequestId:…})`) and `node(id:)`/`nodes(ids:)` reads. Guessing the repository from earlier reads is unsafe (a response for repo A can contain node IDs belonging to repo B via cross-references), so the proxy resolves authoritatively:
 
-1. The classifier extracts repo-scoped node IDs from inline arguments and variables (id-typed keys, filtered by a repo-scoped node-ID prefix allowlist so user/org IDs are excluded).
-2. `proxy.resolveNodeScopes` looks each up in the verified `nodecache`; on a miss it asks GitHub `query{ nodes(ids:){ … on RepositoryNode { repository { nameWithOwner } } … } }` and caches the verified mapping (30 min TTL).
-3. Each resolved repository becomes a scope; the policy must allow the request's access level (read or write) on all of them.
+1. The classifier extracts **every** node-ID-shaped value from inline arguments and variables (id-typed keys; both modern `prefix_base64` and legacy base64 forms). It does **not** filter by type — there is no repo-scoped prefix allowlist to fall behind, so a repo-scoped object of any type is caught.
+2. `proxy.resolveNodeScopes` looks each up in the verified `nodecache`; on a miss it asks GitHub a `nodes(ids:)` query **generated from the embedded schema** that requests `repository { nameWithOwner }` for every repo-scoped `Node` type (covering check runs, deployments, commits, … — not just the few that implement `RepositoryNode`), and caches the verified mapping (30 min TTL).
+3. Each node that resolves to a **repository** becomes a scope the policy must allow at the request's access level. A node that resolves to a **non-repo** object (user, org) adds no constraint. A node that does **not** resolve (unknown/invalid, or not visible to the upstream token) also adds no constraint — the upstream token cannot mutate what it cannot resolve, so this cannot exceed policy; and a request whose *only* nodes are non-repo/unresolved carries no repo scope, which the policy denies as an unscoped write.
 
-Any node that cannot be resolved (unknown ID, upstream error, unrecognized type, or more than 100 IDs) makes the request fail closed. Resolution is gated on `AllowsAnyWrite`/`AllowsAnyRead` so a token that can never act at that level does not trigger upstream calls. The `nodecache` only ever stores mappings the resolver verified — it is never populated by sniffing responses. (Resolving reads also closes a `mode = "allow"` gap: a `node(id:)` read of a blocked repo would otherwise fall through to the permissive default.)
+A node that resolves to a repo-scoped **type** but yields no repository (anomalous), an upstream error, or more than 100 IDs makes the request fail closed. Resolution is gated on `AllowsAnyWrite`/`AllowsAnyRead` so a token that can never act at that level does not trigger upstream calls. The `nodecache` only ever stores mappings the resolver verified — it is never populated by sniffing responses. (Resolving reads also closes a `mode = "allow"` gap: a `node(id:)` read of a blocked repo would otherwise fall through to the permissive default.)
 
 ## Policy engine
 
@@ -121,7 +121,7 @@ GraphQL **read isolation** is enforced by schema-aware **response filtering** (`
 
 For the filter to see plaintext, the proxy does **not** forward the client's `Accept-Encoding` upstream — Go's transport then negotiates compression itself and decompresses transparently, so every body can be typed and redacted (a gzipped body would otherwise be unparseable and forwarded unredacted). A GraphQL response the filter cannot parse is **denied**, not passed through (`filterGraphQLResponse` fails closed).
 
-Explicitly **not** boundaries (see README → Security model): the response filter is only as current as its embedded schema (newer fields → fail closed); redaction is repo-granular (per-resource limits aren't applied to navigated objects); a fine-grained upstream PAT remains the defense-in-depth floor; socket mode authenticates the user, not the process; mutation extraction is bounded by a node-ID prefix allowlist (unknown types fail closed).
+Explicitly **not** boundaries (see README → Security model): the response filter is only as current as its embedded schema (newer fields → fail closed); redaction is repo-granular (per-resource limits aren't applied to navigated objects); a fine-grained upstream PAT remains the defense-in-depth floor; socket mode authenticates the user, not the process; node IDs are resolved against the embedded schema, so coverage of newly-added repo-scoped types tracks schema freshness.
 
 ## Technology
 

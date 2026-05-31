@@ -645,6 +645,43 @@ func TestSec_E2E_MutationMixedInlineAndVariableNodes(t *testing.T) {
 	}
 }
 
+// Regression for the node-ID prefix-allowlist write-bypass: a mutation that targets a
+// DENIED repo through a node type whose prefix the old allowlist didn't list (here a
+// check-run, CR_) — ridden alongside an allowed node — must still be resolved and denied.
+// The classifier now extracts all node IDs and the proxy resolves each authoritatively.
+func TestSec_E2E_MutationUnlistedNodePrefixChecked(t *testing.T) {
+	env := setup(t)
+	client := gheClient(env.secret) // allowed-org/rw-repo=read-write; blocked-org/secret=none
+
+	body := `{"query":"mutation{ a: addComment(input:{subjectId:\"CR_BlockedSecretCheckRun\",body:\"x\"}){clientMutationId} b: closePullRequest(input:{pullRequestId:\"PR_AllowedRwNode\"}){clientMutationId} }"}`
+	resp, err := client.Post(env.gheServer.URL+"/api/graphql", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("mutation touching a denied repo via an unlisted-prefix node must be denied, got %d", resp.StatusCode)
+	}
+}
+
+// Control: a non-repo node (a user, e.g. an assignee) referenced alongside an allowed repo
+// node must be IGNORED, not fail-closed — otherwise legitimate user-referencing mutations
+// would be falsely denied.
+func TestSec_E2E_MutationNonRepoNodeIgnored(t *testing.T) {
+	env := setup(t)
+	client := gheClient(env.secret)
+
+	body := `{"query":"mutation{ addAssigneesToAssignable(input:{assignableId:\"I_AllowedRwNode\", assigneeIds:[\"U_someuser\"]}){clientMutationId} }"}`
+	resp, err := client.Post(env.gheServer.URL+"/api/graphql", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatalf("mutation on an allowed repo with a non-repo (user) node must be allowed, got 403")
+	}
+}
+
 // Control: a mutation on an unresolvable node (GitHub returns null) fails closed.
 func TestSec_E2E_MutationUnknownNodeDenied(t *testing.T) {
 	env := setup(t)

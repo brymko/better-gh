@@ -3,6 +3,7 @@ package classifier
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/vektah/gqlparser/v2/ast"
@@ -484,52 +485,49 @@ func resolveStringArg(args ast.ArgumentList, name string, vars map[string]interf
 	return ""
 }
 
-// repoScopedIDPrefixes are GitHub's typed node-ID prefixes for objects that belong to
-// a repository (pull requests, issues, reviews, comments, releases, the repo itself,
-// labels, milestones, discussions). User/org/project/gist IDs are intentionally
-// excluded so that mutations legitimately referencing them are not false-denied.
+// node ID shapes the classifier extracts. GitHub uses two forms: the modern
+// "prefix_base64url" (PR_kwDO..., CR_..., U_kgDO...) and legacy base64 of "NN:TypeNN"
+// (e.g. MDEwOlJlcG9zaXRvcnkx...). Both are matched so older objects aren't missed.
 //
-// Trade-off: this allowlist governs which node-ID mutations can be scoped. A
-// repo-scoped node whose prefix is missing here would not be extracted — safe in
-// isolation (no ID → unscoped write → denied) but a residual risk if it rode
-// alongside an allowed ID. The authoritative resolver (proxy) means every extracted
-// ID is checked against its REAL repository; the only remaining gap is prefix
-// coverage, so keep this list broad for repo-scoped types.
-var repoScopedIDPrefixes = []string{
-	"PR_", "PRR_", "PRRC_", "PRRT_", // pull requests, reviews, review comments/threads
-	"I_", "IC_", // issues, issue comments
-	"CC_",        // commit comments
-	"RE_",        // releases
-	"R_",         // repositories
-	"LA_", "MI_", // labels, milestones
-	"D_", "DC_", // discussions, discussion comments
+// The classifier extracts EVERY id-typed value matching either shape and does NOT decide
+// repo-vs-non-repo here — that requires authoritative resolution. The proxy resolves each
+// to its real repository, so repo-scoped types are checked regardless of prefix or ID era
+// (no allowlist to fall behind). Over-extraction is harmless: a value that does not
+// resolve to a node is ignored by the resolver. The key exclusions and the minimum length
+// only avoid wasted resolve calls on obvious non-IDs (commit OIDs, client strings).
+var (
+	newNodeIDPattern    = regexp.MustCompile(`^[A-Za-z0-9]+_[A-Za-z0-9_=/+-]+$`)
+	legacyNodeIDPattern = regexp.MustCompile(`^[A-Za-z0-9+/]{16,}={0,2}$`)
+)
+
+func looksLikeNodeID(s string) bool {
+	return newNodeIDPattern.MatchString(s) || legacyNodeIDPattern.MatchString(s)
 }
 
-func isRepoScopedNodeID(s string) bool {
-	for _, p := range repoScopedIDPrefixes {
-		if strings.HasPrefix(s, p) {
-			return true
-		}
-	}
-	return false
-}
-
-func isIDKeyName(name string) bool {
+// isNodeIDArgKey reports whether an argument/field name carries a node ID. It excludes
+// id-suffixed keys that hold non-node values: client strings (clientMutationId,
+// externalId) and git object SHAs (*Oid, e.g. headRefOid, expectedHeadOid).
+func isNodeIDArgKey(name string) bool {
 	n := strings.ToLower(name)
+	if n == "clientmutationid" || n == "externalid" || strings.HasSuffix(n, "oid") {
+		return false
+	}
 	return strings.HasSuffix(n, "id") || strings.HasSuffix(n, "ids")
 }
 
-// collectNodeIDArgs returns the repo-scoped node IDs a request references through
-// arguments — mutation inputs (e.g. pullRequestId) and node(id:)/nodes(ids:) reads —
-// from inline arguments (under id-typed argument/object-field names) and from
-// variables (under id-typed keys). Over-collection is safe — every collected ID is
-// independently resolved and policy-checked; missing one would be the dangerous case.
-// ok is false if the input is too deep/cyclic to walk safely; the caller fails closed.
+// collectNodeIDArgs returns the node IDs a request references through arguments —
+// mutation inputs (e.g. pullRequestId) and node(id:)/nodes(ids:) reads — from inline
+// arguments (under id-typed argument/object-field names) and from variables (under
+// id-typed keys). It collects every node-ID-shaped value regardless of type; the proxy
+// resolves each to its real repository and ignores non-repo nodes. Over-collection is
+// safe — every collected ID is independently resolved and policy-checked; missing one
+// would be the dangerous case. ok is false if the input is too deep/cyclic to walk
+// safely; the caller fails closed.
 func collectNodeIDArgs(ops ast.OperationList, vars map[string]interface{}) (ids []string, ok bool) {
 	seen := make(map[string]bool)
 	var out []string
 	add := func(s string) {
-		if s != "" && isRepoScopedNodeID(s) && !seen[s] {
+		if s != "" && looksLikeNodeID(s) && !seen[s] {
 			seen[s] = true
 			out = append(out, s)
 		}
@@ -578,11 +576,11 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 	}
 	switch v.Kind {
 	case ast.StringValue:
-		if isIDKeyName(name) {
+		if isNodeIDArgKey(name) {
 			add(v.Raw)
 		}
 	case ast.Variable:
-		if isIDKeyName(name) {
+		if isNodeIDArgKey(name) {
 			if s, ok := vars[v.Raw].(string); ok {
 				add(s)
 			}
@@ -608,7 +606,7 @@ func walkVarsForIDs(key string, v interface{}, add func(string), depth int, tooC
 	}
 	switch val := v.(type) {
 	case string:
-		if isIDKeyName(key) {
+		if isNodeIDArgKey(key) {
 			add(val)
 		}
 	case map[string]interface{}:
