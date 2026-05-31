@@ -42,9 +42,9 @@ echo "  denied issue #$NUM node=$NODE marker=$MARK"
 
 # GraphQL request bodies (generated in python to avoid shell-quoting issues).
 BODYDIR=$(mktemp -d)
-OWNER="$OWNER" DENY="$DENY" ALLOW="$ALLOW" NODE="$NODE" MARK="$MARK" BODYDIR="$BODYDIR" python3 - <<'PY'
+OWNER="$OWNER" DENY="$DENY" ALLOW="$ALLOW" NODE="$NODE" NUM="$NUM" MARK="$MARK" BODYDIR="$BODYDIR" python3 - <<'PY'
 import json,os
-o,deny,allow,node,mark,d=(os.environ[k] for k in("OWNER","DENY","ALLOW","NODE","MARK","BODYDIR"))
+o,deny,allow,node,num,mark,d=(os.environ[k] for k in("OWNER","DENY","ALLOW","NODE","NUM","MARK","BODYDIR"))
 def w(n,q): open(f"{d}/{n}.json","w").write(json.dumps({"query":q}))
 w("single",   f'query{{repository(owner:"{o}",name:"{deny}"){{issue(number:1){{title body}}}}}}')
 w("multiroot",f'query{{a:repository(owner:"{o}",name:"{allow}"){{name}} b:repository(owner:"{o}",name:"{deny}"){{issue(number:1){{title body}}}}}}')
@@ -53,6 +53,11 @@ w("search",   f'query{{search(query:"repo:{o}/{deny} {mark}",type:ISSUE,first:5)
 w("mutation", f'mutation{{addComment(input:{{subjectId:"{node}",body:"x"}}){{clientMutationId}}}}')
 w("nav_repos",f'query{{repository(owner:"{o}",name:"{allow}"){{owner{{repositories(first:100){{nodes{{name issues(first:10){{nodes{{body}}}}}}}}}}}}}}')
 w("nav_byname",f'query{{repository(owner:"{o}",name:"{allow}"){{owner{{repository(name:"{deny}"){{issues(first:5){{nodes{{body}}}}}}}}}}}}')
+# alias: navigates allowed -> owner.repository(denied) -> the secret issue, pre-declaring
+# the proxy's reserved marker alias on BOTH the denied repo and the issue to suppress the
+# injected repository tags and dodge redaction. (Verified to leak on the pre-fix build.)
+# Augment must reject the reserved alias and fail closed.
+w("alias",    f'query{{repository(owner:"{o}",name:"{allow}"){{owner{{repository(name:"{deny}"){{bghRepoTagZ9:name issue(number:{num}){{bghRepoTagZ9:title body}}}}}}}}}}')
 w("allowed",  f'query{{repository(owner:"{o}",name:"{allow}"){{issue(number:1){{title}}}}}}')
 PY
 
@@ -89,6 +94,18 @@ noleak(){ local desc="$1"; shift; local body; body=$(req "$@")
   if printf '%s' "$body" | grep -q "$MARK"; then echo "  FAIL  $desc (SECRET LEAKED)"; F=$((F+1))
   else echo "  PASS  $desc (no leak)"; P=$((P+1)); fi; }
 gqlnoleak(){ noleak "$1" -X POST http://localhost/graphql -d @"$BODYDIR/$2.json"; }
+# gznoleak: same, but advertises gzip. The proxy must NOT forward Accept-Encoding upstream
+# (a gzipped body would otherwise slip past the response filter unredacted); we decompress
+# the response before checking so a leak in compressed bytes is still caught. NOTE: GitHub
+# only gzips responses above a size threshold, so a small test dataset may come back
+# identity and this check then only exercises the Accept-Encoding-stripping path end to end;
+# the forced-compression case is covered deterministically by the gqlfilter/proxy unit tests.
+gznoleak(){ local desc="$1" name="$2"; local tmp; tmp=$(mktemp)
+  req -H "Accept-Encoding: gzip" -o "$tmp" -X POST http://localhost/graphql -d @"$BODYDIR/$name.json"
+  local body; body=$( (gunzip -c "$tmp" 2>/dev/null || cat "$tmp") )
+  rm -f "$tmp"
+  if printf '%s' "$body" | grep -q "$MARK"; then echo "  FAIL  $desc (SECRET LEAKED)"; F=$((F+1))
+  else echo "  PASS  $desc (no leak)"; P=$((P+1)); fi; }
 
 echo "== the denied private repo must be unreachable via every vector =="
 den  "REST repo"            "http://localhost/repos/$OWNER/$DENY"
@@ -102,6 +119,8 @@ gql  "GraphQL search repo:"   search
 gql  "GraphQL node-id mutation" mutation
 gqlnoleak "GraphQL nav owner.repositories (redacted)" nav_repos
 gqlnoleak "GraphQL nav owner.repository(denied) (redacted)" nav_byname
+gqlnoleak "GraphQL nav + reserved alias (must not bypass filter)" alias
+gznoleak  "GraphQL nav + Accept-Encoding gzip (filter must still apply)" nav_repos
 echo "== the allowed repo must still work =="
 code "REST allowed issue"  200 "http://localhost/repos/$OWNER/$ALLOW/issues/1"
 code "GraphQL allowed"     200 -X POST http://localhost/graphql -d @"$BODYDIR/allowed.json"
