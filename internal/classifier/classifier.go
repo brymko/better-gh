@@ -192,6 +192,20 @@ func classifyGraphQL(body []byte) Result {
 			return Result{Access: Write}
 		}
 		result.NodeIDs = ids
+		// A mutation's RETURN selection is a normal read sub-graph and can navigate to
+		// other repositories (payload.pullRequest.repository.forks, ...). Scan it like a
+		// read so the proxy's response filter redacts denied navigated repos when
+		// available, and the request fails closed when it is not (schema drift). Without
+		// this, a write grant on one repo could read any navigable repo via the payload.
+		escapes := false
+		navTooComplex := false
+		for _, op := range ops {
+			scanCrossRepoNav(op.SelectionSet, doc.Fragments, gqlCrossRepoNavFields, &escapes, 0, &navTooComplex)
+		}
+		if navTooComplex {
+			return Result{Access: Write}
+		}
+		result.NavEscapes = escapes
 		return result
 	}
 

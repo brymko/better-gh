@@ -50,10 +50,19 @@ const maxBodySize = 10 << 20 // 10 MB
 // hopByHopOrManaged headers are not copied from the client to the upstream request:
 // the client's Authorization is replaced with the real token, Host/Content-Length are
 // recomputed, X-GitHub-Api-Version is pinned, and the rest are hop-by-hop.
+//
+// Accept-Encoding is intentionally dropped: if it were forwarded, Go's transport would
+// hand back the still-compressed upstream body (it only auto-decompresses responses to
+// gzip requests IT added). The GraphQL response filter cannot parse a gzipped body, so it
+// would fail open and forward denied-repo data unredacted; plain responses would also be
+// corrupted (Content-Encoding is stripped on the way back). Dropping it lets the transport
+// negotiate + transparently decompress, so the filter always sees JSON and clients get an
+// identity-encoded body.
 var hopByHopOrManaged = map[string]bool{
 	"Authorization":        true,
 	"Host":                 true,
 	"Content-Length":       true,
+	"Accept-Encoding":      true,
 	"X-Github-Api-Version": true,
 	"Connection":           true,
 	"Proxy-Connection":     true,
@@ -158,10 +167,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !canResolve {
 			forceDenyReason = "node-scoped request not permitted by policy"
 		} else if scopes, ok := h.resolveNodeScopes(r.Context(), classified.NodeIDs); ok {
+			// Resolved node scopes inherit the request's resource (e.g. a mergePullRequest
+			// mutation maps to "pulls") so a per-resource permission still applies to the
+			// repository GitHub says the node belongs to. Without this the resolved scope's
+			// empty Resource would overwrite it and fall back to the rule's base grant.
+			for i := range scopes {
+				scopes[i].Resource = classified.Resource
+			}
 			if !classified.HasRepo() && classified.Org == "" {
 				classified.Owner = scopes[0].Owner
 				classified.Repo = scopes[0].Repo
-				classified.Resource = scopes[0].Resource
 				classified.Additional = append(classified.Additional, scopes[1:]...)
 			} else {
 				classified.Additional = append(classified.Additional, scopes...)
@@ -181,13 +196,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the classifier can't see. When it IS in effect, the classifier's nav-escape flag
 	// is ignored (the filter handles it); when it is NOT (schema drift / disabled), the
 	// flag falls back to denying the whole request.
-	var respFilter func([]byte) []byte
-	if h.GQLFilter != nil && classified.Access == classifier.Read &&
-		(norm == "/graphql" || norm == "/graphql/") {
+	var respFilter func([]byte) ([]byte, bool)
+	if h.GQLFilter != nil && (norm == "/graphql" || norm == "/graphql/") {
+		// Reads AND mutations: a mutation's payload is a read sub-graph that can navigate
+		// to other repos, so its response must be filtered too. Augmentation injects the
+		// repository markers; filterGraphQLResponse redacts denied repos and fails closed.
 		if aug, ok := h.augmentGraphQL(body); ok {
 			body = aug
 			p := pol
-			respFilter = func(resp []byte) []byte { return filterGraphQLResponse(h.GQLFilter, p, resp) }
+			respFilter = func(resp []byte) ([]byte, bool) { return filterGraphQLResponse(h.GQLFilter, p, resp) }
 		}
 	}
 	if result.Allowed && classified.NavEscapes && respFilter == nil {
@@ -249,19 +266,24 @@ func (h *Handler) augmentGraphQL(body []byte) ([]byte, bool) {
 	return out, true
 }
 
-func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte) []byte {
+// filterGraphQLResponse redacts denied-repo objects from a GraphQL JSON response. It
+// FAILS CLOSED: if the body cannot be parsed as JSON or re-marshaled — so redaction
+// cannot be applied — it returns ok=false and the caller must not forward the bytes.
+// (This is why the proxy drops Accept-Encoding upstream: a gzipped body would otherwise
+// be unparseable here and, before, was forwarded unredacted.)
+func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte) ([]byte, bool) {
 	var parsed map[string]any
 	if json.Unmarshal(resp, &parsed) != nil {
-		return resp // non-JSON (e.g. an error page) — pass through unchanged
+		return nil, false
 	}
 	filtered := gqlfilter.Filter(parsed, func(owner, repo string) bool {
 		return pol.CanReadAnything(owner+"/"+repo, owner)
 	})
 	out, err := json.Marshal(filtered)
 	if err != nil {
-		return resp
+		return nil, false
 	}
-	return out
+	return out, true
 }
 
 // evaluateScopes allows a request only if EVERY scope it touches is allowed. A
@@ -406,7 +428,7 @@ func (h *Handler) upstreamBase() string {
 	return "https://api.github.com"
 }
 
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, tok *store.ProxyToken, classified *classifier.Result, respFilter func([]byte) []byte) {
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, tok *store.ProxyToken, classified *classifier.Result, respFilter func([]byte) ([]byte, bool)) {
 	base := h.upstreamBase()
 	upstream := base + normPath
 	if normPath == "/graphql" || normPath == "/graphql/" {
@@ -529,7 +551,15 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-		filtered := respFilter(raw)
+		filtered, ok := respFilter(raw)
+		if !ok {
+			// The body could not be parsed/redacted; fail closed rather than forward
+			// bytes we could not filter. After Accept-Encoding is dropped upstream this
+			// is only reachable for a genuinely non-JSON /graphql body.
+			slog.Warn("graphql response not filterable; denying", "status", resp.StatusCode)
+			jsonError(w, http.StatusBadGateway, "bgh: response could not be filtered")
+			return
+		}
 		for key, vals := range resp.Header {
 			if key == "Transfer-Encoding" || key == "Content-Encoding" || key == "Content-Length" {
 				continue

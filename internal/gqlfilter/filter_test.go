@@ -30,6 +30,24 @@ func TestAugmentRejectsInvalid(t *testing.T) {
 	}
 }
 
+// A client that pre-declares the reserved marker alias inside a repo-scoped selection
+// would suppress our injected repository tag and defeat redaction; Augment must reject it
+// (fail closed) so the caller falls back to the cross-repo-nav denial.
+func TestAugmentRejectsReservedAlias(t *testing.T) {
+	s, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := `query { repository(owner:"o", name:"r") { forks(first:5){ nodes { name ` + markerAlias + `: name } } } }`
+	if _, err := s.Augment(q); err == nil {
+		t.Fatalf("expected Augment to reject a query that uses the reserved marker alias %q", markerAlias)
+	}
+	// A normal query (no reserved alias) must still augment fine.
+	if _, err := s.Augment(`query { repository(owner:"o", name:"r") { name } }`); err != nil {
+		t.Fatalf("normal query should augment: %v", err)
+	}
+}
+
 func TestFilterRedactsDeniedRepos(t *testing.T) {
 	// Simulated augmented response: an allowed repo whose owner.repositories includes a
 	// denied repo with an issue body.

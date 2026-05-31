@@ -24,6 +24,21 @@ func (s *Schema) Augment(query string) (string, error) {
 	if gerr != nil {
 		return "", fmt.Errorf("validating query: %s", gerr.Error())
 	}
+	// Fail closed if the client itself references the reserved marker alias: it could
+	// otherwise pre-declare bghRepoTagZ9 in a repo-scoped selection to suppress our
+	// injected repository tag and defeat redaction. The same walk bounds nesting depth so
+	// augment() below never recurses unboundedly. The caller treats this error like an
+	// untypable query, falling back to the classifier's cross-repo-nav denial.
+	for _, op := range doc.Operations {
+		if usesReservedAlias(op.SelectionSet, 0) {
+			return "", fmt.Errorf("query references reserved alias %q or is too deeply nested", markerAlias)
+		}
+	}
+	for _, frag := range doc.Fragments {
+		if usesReservedAlias(frag.SelectionSet, 0) {
+			return "", fmt.Errorf("query references reserved alias %q or is too deeply nested", markerAlias)
+		}
+	}
 	for _, op := range doc.Operations {
 		root := s.rootTypeName(op.Operation)
 		s.augment(&op.SelectionSet, root)
@@ -35,6 +50,40 @@ func (s *Schema) Augment(query string) (string, error) {
 	var buf bytes.Buffer
 	formatter.NewFormatter(&buf).FormatQueryDocument(doc)
 	return buf.String(), nil
+}
+
+// maxAugmentDepth bounds the marker/alias walk; a query deeper than this fails closed.
+// Real queries are far shallower, and GitHub itself rejects very deep documents.
+const maxAugmentDepth = 256
+
+// usesReservedAlias reports whether any field in the selection tree uses markerAlias as
+// its response key (alias, or name when unaliased), or whether the tree exceeds
+// maxAugmentDepth. Fragment bodies are checked via their own definitions by the caller,
+// so fragment spreads are not followed here.
+func usesReservedAlias(sels ast.SelectionSet, depth int) bool {
+	if depth > maxAugmentDepth {
+		return true
+	}
+	for _, sel := range sels {
+		switch f := sel.(type) {
+		case *ast.Field:
+			key := f.Alias
+			if key == "" {
+				key = f.Name
+			}
+			if key == markerAlias {
+				return true
+			}
+			if usesReservedAlias(f.SelectionSet, depth+1) {
+				return true
+			}
+		case *ast.InlineFragment:
+			if usesReservedAlias(f.SelectionSet, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Schema) rootTypeName(op ast.Operation) string {
@@ -71,7 +120,7 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string) {
 			s.augment(&f.SelectionSet, tc)
 		}
 	}
-	if s.isRepoScoped(typeName) && !hasAlias(*sels, markerAlias) {
+	if s.isRepoScoped(typeName) {
 		*sels = append(*sels, s.marker(typeName))
 	}
 }
@@ -87,21 +136,6 @@ func (s *Schema) marker(typeName string) *ast.Field {
 			&ast.Field{Alias: "nameWithOwner", Name: "nameWithOwner"},
 		},
 	}
-}
-
-func hasAlias(sels ast.SelectionSet, alias string) bool {
-	for _, sel := range sels {
-		if f, ok := sel.(*ast.Field); ok {
-			a := f.Alias
-			if a == "" {
-				a = f.Name
-			}
-			if a == alias {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // Filter walks a GraphQL JSON response and redacts (replaces with null) any repo-scoped

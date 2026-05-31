@@ -9,6 +9,8 @@ package proxy
 // the proxy forwards requests it should have blocked.
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -81,6 +83,252 @@ func mustStore(t *testing.T) *store.Store {
 		t.Fatal(err)
 	}
 	return s
+}
+
+func maybeGunzip(b []byte) []byte {
+	gr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		return b
+	}
+	dec, err := io.ReadAll(gr)
+	if err != nil {
+		return b
+	}
+	return dec
+}
+
+// Regression for FINDING A (CRITICAL): forwarding the client's Accept-Encoding let the
+// upstream gzip the response, which filterGraphQLResponse could not parse — so it failed
+// OPEN and forwarded denied-repo data unredacted. The proxy now drops Accept-Encoding
+// upstream (its transport decompresses transparently) so the filter always sees JSON.
+func TestSec_GraphQLFilterGzipResponseRedacted(t *testing.T) {
+	sch, err := gqlfilter.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := `{"data":{"repository":{"bghRepoTagZ9":"allowed-org/rw-repo","forks":{"nodes":[` +
+		`{"bghRepoTagZ9":"blocked-org/secret","name":"secret","description":"TOPSECRET_LEAK"}]}}}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			gz := gzip.NewWriter(w)
+			io.WriteString(gz, plain)
+			gz.Close()
+			return
+		}
+		io.WriteString(w, plain)
+	}))
+	t.Cleanup(upstream.Close)
+
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo:     []policy.RepoRule{{Name: "allowed-org/rw-repo", Access: policy.AccessRead}},
+	}
+	h := &Handler{
+		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol,
+		UpstreamURL: upstream.URL, GQLFilter: sch,
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	q := `{"query":"query{repository(owner:\"allowed-org\",name:\"rw-repo\"){forks(first:5){nodes{name description}}}}"}`
+	req, _ := http.NewRequest("POST", srv.URL+"/graphql", strings.NewReader(q))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := (&http.Client{Transport: &http.Transport{DisableCompression: true}}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// Gunzip if still compressed, so a fail-open leak is detected even in compressed bytes.
+	got := maybeGunzip(raw)
+	if strings.Contains(string(got), "TOPSECRET_LEAK") {
+		t.Fatalf("gzipped response bypassed the filter: %s", got)
+	}
+	if strings.Contains(string(got), "bghRepoTagZ9") {
+		t.Fatalf("marker leaked (filter did not run): %s", got)
+	}
+}
+
+// Regression for FINDING A (correctness): a plain REST response that the upstream gzips
+// must reach the client as decodable JSON, not raw gzip bytes with Content-Encoding stripped.
+func TestSec_RestGzipNotCorrupted(t *testing.T) {
+	payload := `{"hello":"world","n":1}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			gz := gzip.NewWriter(w)
+			io.WriteString(gz, payload)
+			gz.Close()
+			return
+		}
+		io.WriteString(w, payload)
+	}))
+	t.Cleanup(upstream.Close)
+	pol := &policy.Policy{Defaults: policy.Defaults{Mode: policy.ModeAllow}}
+	h := &Handler{
+		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol, UpstreamURL: upstream.URL,
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/repos/o/r/pulls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// The client must receive identity-encoded JSON (no manual gunzip needed).
+	if string(out) != payload {
+		t.Fatalf("REST response corrupted under gzip (Content-Encoding=%q): %q", resp.Header.Get("Content-Encoding"), out)
+	}
+}
+
+// Regression for FINDING B (CRITICAL): a read that pre-declares the reserved marker alias
+// inside a cross-repo navigation can no longer suppress redaction — Augment fails closed,
+// so the request falls back to the cross-repo-nav denial.
+func TestSec_GraphQLAliasCollisionDenied(t *testing.T) {
+	sch, err := gqlfilter.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var upstreamHit int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHit, 1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":{}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo:     []policy.RepoRule{{Name: "allowed-org/rw-repo", Access: policy.AccessRead}},
+	}
+	h := &Handler{
+		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol,
+		UpstreamURL: upstream.URL, GQLFilter: sch,
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	q := `{"query":"query{repository(owner:\"allowed-org\",name:\"rw-repo\"){forks(first:5){nodes{name bghRepoTagZ9: name}}}}"}`
+	resp, err := http.Post(srv.URL+"/graphql", "application/json", strings.NewReader(q))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("query using the reserved marker alias with cross-repo nav must be denied, got %d", resp.StatusCode)
+	}
+	if n := atomic.LoadInt32(&upstreamHit); n != 0 {
+		t.Fatalf("denied query must not reach the upstream, got %d hits", n)
+	}
+}
+
+// Regression for FINDING C (HIGH): a mutation's RETURN selection is now augmented and
+// response-filtered like a read, so navigating the payload to a denied repo is redacted.
+func TestSec_MutationReturnNavigationRedacted(t *testing.T) {
+	sch, err := gqlfilter.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(body), "nodes(ids") {
+			io.WriteString(w, `{"data":{"nodes":[{"__typename":"PullRequest","repository":{"nameWithOwner":"allowed-org/rw-repo"}}]}}`)
+			return
+		}
+		io.WriteString(w, `{"data":{"closePullRequest":{"pullRequest":{"bghRepoTagZ9":"allowed-org/rw-repo","repository":{"bghRepoTagZ9":"allowed-org/rw-repo","forks":{"nodes":[`+
+			`{"bghRepoTagZ9":"blocked-org/secret","name":"TOPSECRET_LEAK"}]}}}}}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo: []policy.RepoRule{
+			{Name: "allowed-org/rw-repo", Access: policy.AccessReadWrite},
+			{Name: "blocked-org/secret", Access: policy.AccessNone},
+		},
+	}
+	nc := nodecache.New(time.Minute)
+	t.Cleanup(nc.Stop)
+	h := &Handler{
+		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol,
+		UpstreamURL: upstream.URL, GQLFilter: sch, NodeCache: nc,
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	body := `{"query":"mutation($id:ID!){ closePullRequest(input:{pullRequestId:$id}){ pullRequest { repository { forks(first:1){ nodes { name } } } } } }","variables":{"id":"PR_AllowedRwNode"}}`
+	resp, err := http.Post(srv.URL+"/graphql", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatalf("mutation to a writable repo should be allowed then filtered, got 403: %s", out)
+	}
+	if strings.Contains(string(out), "TOPSECRET_LEAK") {
+		t.Fatalf("mutation payload leaked a denied repo: %s", out)
+	}
+	if strings.Contains(string(out), "bghRepoTagZ9") {
+		t.Fatalf("marker leaked (filter did not run on the mutation): %s", out)
+	}
+}
+
+// Regression for FINDING C (HIGH) fail-closed path: when no response filter is wired
+// (schema disabled/drift), a mutation whose payload navigates cross-repo must be denied
+// rather than forwarded unfiltered.
+func TestSec_E2E_MutationNavigationFailsClosedWithoutFilter(t *testing.T) {
+	env := setup(t) // harness Handler has GQLFilter == nil
+	client := gheClient(env.secret)
+	body := `{"query":"mutation($id:ID!){ closePullRequest(input:{pullRequestId:$id}){ pullRequest { repository { forks(first:1){ nodes { name } } } } } }","variables":{"id":"PR_AllowedRwNode"}}`
+	resp, err := client.Post(env.gheServer.URL+"/api/graphql", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("navigating mutation without a response filter must fail closed, got %d", resp.StatusCode)
+	}
+}
+
+// Regression for FINDING D (HIGH): a GraphQL mutation now keeps its resource (e.g.
+// mergePullRequest -> "pulls") through node resolution, so a per-resource pulls=none under
+// a read-write base is enforced instead of being dropped to the base grant.
+func TestSec_E2E_MutationRespectsPerResourcePermission(t *testing.T) {
+	env := setup(t)
+	pol := policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo: []policy.RepoRule{{
+			Name:        "allowed-org/rw-repo",
+			Access:      policy.AccessReadWrite,
+			Permissions: map[string]policy.Access{"pulls": policy.AccessNone},
+		}},
+	}
+	_, secret, err := env.store.Create("pulls-none", pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := gheClient(secret)
+
+	// pulls=none -> mergePullRequest denied.
+	body := `{"query":"mutation($id:ID!){ mergePullRequest(input:{pullRequestId:$id}){ clientMutationId } }","variables":{"id":"PR_AllowedRwNode"}}`
+	resp, err := client.Post(env.gheServer.URL+"/api/graphql", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("mergePullRequest under pulls=none must be denied, got %d", resp.StatusCode)
+	}
 }
 
 // recordingHandler wires a proxy.Handler to an upstream that records the headers it
