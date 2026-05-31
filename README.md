@@ -278,6 +278,8 @@ Variables are resolved (`repository(owner: $owner, name: $name)`). A single Grap
 
 A mutation whose node IDs cannot all be resolved (unknown ID, upstream error) is **denied** as an unscoped write. The resolution call is skipped entirely for tokens whose policy can never write. This means `gh pr merge 123` works because the PR's node ID resolves to its repository, and a mutation cannot be misdirected to a repo the token can't write — the repository is confirmed by GitHub, never guessed from an earlier read.
 
+The same resolution applies to **reads by node ID** — `node(id:)` / `nodes(ids:)` queries carry no `repository()` scope, so each referenced node is resolved to its repository and the read is checked against it (and denied if it can't be resolved). Without this, a `node(id:)` read could reach a repo a `[[repo]] none` rule was meant to block under `mode = "allow"`.
+
 #### Org-scoped requests
 
 These requests are matched against `[[org]]` rules only. No `[[repo]]` rule can match since there is no repo.
@@ -482,7 +484,7 @@ The proxy holds one **powerful upstream GitHub token** and hands out **narrow ac
 **What is enforced**
 - Per-repo / per-org / per-resource read vs write, deny-by-default.
 - GraphQL queries are scoped to **every** repository/org/search target they touch — a query touching a denied repo alongside an allowed one is denied. `operationName` is honored.
-- GraphQL mutations are scoped by **authoritative resolution**: each node ID is resolved to its real repository by GitHub before the write is authorized, so a mutation cannot be misdirected to a repo the token can't write.
+- GraphQL requests that address objects by node ID (mutations, and `node(id:)`/`nodes(ids:)` reads) are scoped by **authoritative resolution**: each node ID is resolved to its real repository by GitHub before the request is authorized, so it cannot be misdirected to a repo the token can't access.
 - Names match case-insensitively (GitHub routes them that way), so a re-cased path can't dodge a rule.
 - Requests with `.`/`..` path segments (including `%2F`-encoded) are rejected `400`.
 - Unparseable, over-deep, or cyclic GraphQL fails closed (denied), and never crashes the proxy.
@@ -508,6 +510,7 @@ The proxy holds one **powerful upstream GitHub token** and hands out **narrow ac
 - Mutation scoping relies on a repo-scoped node-ID **prefix allowlist**; a repo-scoped object type whose prefix isn't listed is denied (fail-closed) rather than mis-scoped.
 - A GraphQL query that reads `viewer`/`rateLimit` *alongside* a repository now also requires the `user`/`meta` unscoped category — grant them if your clients send such combined queries.
 - The proxy trusts GitHub's node→repository resolution; it does not independently re-verify GitHub's responses.
+- `mode = "allow"` permits anything the classifier cannot map to a deny rule. GraphQL node-ID reads/writes are resolved and checked, but a REST endpoint the classifier does not recognize as repo/org-scoped — e.g. repo-by-numeric-id `GET /repositories/{id}` — falls through to allow. **Use `mode = "deny"` for a safe baseline**; reserve `allow` for low-stakes setups where you accept that anything unmapped is permitted.
 
 ## Undoing
 

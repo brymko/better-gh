@@ -80,15 +80,15 @@ A GraphQL document can touch many repositories/orgs in one operation, and GitHub
 
 Variables are resolved. `operationName` is honored — only the executed operation is classified. The policy must allow **all** collected scopes. The AST walk is depth-bounded and fails closed on cyclic fragments / excessive nesting (an unbounded recursive walk would otherwise crash the process — `parser.ParseQuery` validates neither).
 
-### GraphQL mutations — authoritative node resolution
+### Node-ID requests — authoritative resolution
 
-Mutations carry no `repository()` scope; they address objects by opaque node ID. Guessing the repository from earlier reads is unsafe (a response for repo A can contain node IDs belonging to repo B via cross-references), so the proxy resolves authoritatively:
+GraphQL requests can address objects by opaque node ID with no `repository()` scope — every mutation (`mergePullRequest(input:{pullRequestId:…})`) and `node(id:)`/`nodes(ids:)` reads. Guessing the repository from earlier reads is unsafe (a response for repo A can contain node IDs belonging to repo B via cross-references), so the proxy resolves authoritatively:
 
-1. The classifier extracts repo-scoped node IDs from the mutation's inline arguments and variables (id-typed keys, filtered by a repo-scoped node-ID prefix allowlist so user/org IDs are excluded).
+1. The classifier extracts repo-scoped node IDs from inline arguments and variables (id-typed keys, filtered by a repo-scoped node-ID prefix allowlist so user/org IDs are excluded).
 2. `proxy.resolveNodeScopes` looks each up in the verified `nodecache`; on a miss it asks GitHub `query{ nodes(ids:){ … on RepositoryNode { repository { nameWithOwner } } … } }` and caches the verified mapping (30 min TTL).
-3. Each resolved repository becomes a scope; the policy must allow a write to all of them.
+3. Each resolved repository becomes a scope; the policy must allow the request's access level (read or write) on all of them.
 
-Any node that cannot be resolved (unknown ID, upstream error, unrecognized type, or more than 100 IDs) leaves the request without a complete scope set and it is denied as an unscoped write. The `nodecache` only ever stores mappings the resolver verified — it is never populated by sniffing responses.
+Any node that cannot be resolved (unknown ID, upstream error, unrecognized type, or more than 100 IDs) makes the request fail closed. Resolution is gated on `AllowsAnyWrite`/`AllowsAnyRead` so a token that can never act at that level does not trigger upstream calls. The `nodecache` only ever stores mappings the resolver verified — it is never populated by sniffing responses. (Resolving reads also closes a `mode = "allow"` gap: a `node(id:)` read of a blocked repo would otherwise fall through to the permissive default.)
 
 ## Policy engine
 
