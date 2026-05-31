@@ -153,8 +153,13 @@ func filterValue(v any, authorized func(owner, repo string) bool) any {
 	switch val := v.(type) {
 	case map[string]any:
 		if tag, ok := val[markerAlias]; ok {
-			if owner, repo, ok := repoFromMarker(tag); ok && !authorized(owner, repo) {
-				return nil // redact the whole repo-scoped object
+			// A marker is only injected onto repo-scoped objects, so its presence means
+			// this object belongs to a repository. Redact if that repository is denied OR
+			// if the marker is unparseable (anomalous null/malformed repository) — failing
+			// closed, since we cannot prove the object's repository is authorized.
+			owner, repo, parsed := repoFromMarker(tag)
+			if !parsed || !authorized(owner, repo) {
+				return nil
 			}
 			delete(val, markerAlias)
 		}

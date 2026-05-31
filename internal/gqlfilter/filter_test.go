@@ -85,6 +85,30 @@ func TestFilterRedactsDeniedRepos(t *testing.T) {
 	}
 }
 
+// Regression for FINDING H (LOW): a repo-scoped object whose marker is present but
+// unparseable (anomalous null/malformed repository) must be redacted (fail closed), since
+// the object cannot be proven to belong to an authorized repository.
+func TestFilterRedactsUnparseableMarker(t *testing.T) {
+	authorizeAll := func(owner, repo string) bool { return true }
+	for name, tag := range map[string]any{
+		"null marker":        nil,
+		"empty string":       "",
+		"no slash":           "noslash",
+		"null nameWithOwner": map[string]any{"nameWithOwner": nil},
+	} {
+		resp := map[string]any{
+			"data": map[string]any{
+				"node": map[string]any{markerAlias: tag, "title": "SECRET-LEAK"},
+			},
+		}
+		out := Filter(resp, authorizeAll)
+		js := mustJSON(out)
+		if strings.Contains(js, "SECRET-LEAK") {
+			t.Errorf("%s: object with unparseable marker must be redacted, got %s", name, js)
+		}
+	}
+}
+
 func mustJSON(v any) string {
 	var b strings.Builder
 	writeJSON(&b, v)
