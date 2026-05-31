@@ -271,7 +271,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		go h.Store.TouchLastUsed(proxyToken.ID)
 	}
 
-	h.forward(w, r, start, norm, body, proxyToken, &classified, respFilter)
+	h.forward(w, r, start, norm, body, pol, proxyToken, &classified, respFilter)
 }
 
 func (h *Handler) augmentGraphQL(body []byte) ([]byte, bool) {
@@ -560,7 +560,37 @@ func (h *Handler) upstreamBase() string {
 	return "https://api.github.com"
 }
 
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, tok *store.ProxyToken, classified *classifier.Result, respFilter func([]byte) ([]byte, bool)) {
+type policyContextKey struct{}
+
+// EnforceRedirectPolicy is the upstream client's CheckRedirect. GitHub 301-redirects
+// renamed/moved repos (preserving sub-paths), so a redirect to a SAME-HOST path is
+// re-classified and re-evaluated against the request's policy — otherwise a request to an
+// allowed path would be silently followed into a denied repo (the original classification
+// only saw the requested path). Cross-host redirects (CDN downloads of already-authorized
+// content; Go strips Authorization across hosts) are allowed. The client MUST be created
+// with this as CheckRedirect; the proxy attaches the policy to the request context.
+func EnforceRedirectPolicy(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+	// Cross-host hop (e.g. codeload/objects CDN): the original request was already
+	// policy-checked and Authorization is dropped across hosts, so this serves only the
+	// authorized resource's content.
+	if len(via) > 0 && req.URL.Host != via[0].URL.Host {
+		return nil
+	}
+	pol, _ := req.Context().Value(policyContextKey{}).(*policy.Policy)
+	if pol == nil {
+		return nil // internal call with no policy attached (node resolution never redirects)
+	}
+	c := classifier.Classify(req.Method, req.URL.Path, nil)
+	if res := evaluateScopes(pol, &c); !res.Allowed {
+		return fmt.Errorf("redirect target %q denied by policy: %s", req.URL.Path, res.Reason)
+	}
+	return nil
+}
+
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, pol *policy.Policy, tok *store.ProxyToken, classified *classifier.Result, respFilter func([]byte) ([]byte, bool)) {
 	base := h.upstreamBase()
 	upstream := base + normPath
 	if normPath == "/graphql" || normPath == "/graphql/" {
@@ -578,7 +608,10 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 		bodyReader = r.Body
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstream, bodyReader)
+	// Carry the policy so the client's CheckRedirect (EnforceRedirectPolicy) can re-check
+	// any same-host redirect target instead of blindly following it into another repo.
+	ctx := context.WithValue(r.Context(), policyContextKey{}, pol)
+	req, err := http.NewRequestWithContext(ctx, r.Method, upstream, bodyReader)
 	if err != nil {
 		slog.Error("creating upstream request", "err", err)
 		jsonError(w, http.StatusBadGateway, "bgh: internal error")

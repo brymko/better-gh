@@ -269,6 +269,9 @@ func cmdServe(configPath string) error {
 			ResponseHeaderTimeout: 30 * time.Second,
 			IdleConnTimeout:       90 * time.Second,
 		},
+		// Re-check same-host redirect targets against the request's policy so a redirect
+		// (e.g. a renamed/moved repo's 301) can't be followed into a denied repo.
+		CheckRedirect: proxy.EnforceRedirectPolicy,
 	}
 	nodeCache := nodecache.New(30 * time.Minute)
 
