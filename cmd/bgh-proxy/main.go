@@ -272,10 +272,13 @@ func cmdServe(configPath string) error {
 	}
 	nodeCache := nodecache.New(30 * time.Minute)
 
+	// The GraphQL response filter IS the read-isolation boundary. Running without it
+	// silently degrades to fail-open (viewer/search/org enumeration reads forwarded
+	// unredacted), so refuse to start rather than serve degraded. The schema is embedded,
+	// so this only fires on a build/corruption fault.
 	gqlSchema, err := gqlfilter.Load()
 	if err != nil {
-		slog.Warn("graphql response filter disabled (schema failed to load)", "err", err)
-		gqlSchema = nil
+		return fmt.Errorf("loading embedded graphql schema (required for read isolation): %w", err)
 	}
 
 	errCh := make(chan error, 3)
