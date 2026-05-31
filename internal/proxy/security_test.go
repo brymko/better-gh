@@ -85,6 +85,37 @@ func mustStore(t *testing.T) *store.Store {
 	return s
 }
 
+// An over-limit request body must be rejected (413), not silently truncated and forwarded
+// as a corrupted write (or mis-parsed GraphQL).
+func TestSec_OversizeBodyRejected(t *testing.T) {
+	var hit int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hit, 1)
+		w.Write([]byte("{}"))
+	}))
+	t.Cleanup(upstream.Close)
+	pol := &policy.Policy{Defaults: policy.Defaults{Mode: policy.ModeAllow}}
+	h := &Handler{
+		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol, UpstreamURL: upstream.URL,
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	big := bytes.Repeat([]byte("a"), maxBodySize+100)
+	resp, err := http.Post(srv.URL+"/repos/o/r/contents/big", "application/json", bytes.NewReader(big))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize body should be 413, got %d", resp.StatusCode)
+	}
+	if n := atomic.LoadInt32(&hit); n != 0 {
+		t.Fatalf("oversize body must not be forwarded upstream, got %d hits", n)
+	}
+}
+
 func maybeGunzip(b []byte) []byte {
 	gr, err := gzip.NewReader(bytes.NewReader(b))
 	if err != nil {

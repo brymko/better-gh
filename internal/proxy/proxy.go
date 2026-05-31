@@ -116,9 +116,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize))
+	// Read one byte past the cap so an over-limit body is REJECTED, not silently
+	// truncated: a truncated body would be classified and forwarded as a corrupted write
+	// (and a truncated GraphQL body would mis-parse). 413 is clearer and safe.
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize+1))
 	if err != nil {
 		jsonError(w, http.StatusBadRequest, "bgh: failed to read request body")
+		return
+	}
+	if len(body) > maxBodySize {
+		jsonError(w, http.StatusRequestEntityTooLarge, "bgh: request body too large")
 		return
 	}
 
