@@ -125,17 +125,22 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string) {
 	}
 }
 
+// marker builds the hidden repository-identifying field for a repo-scoped type, following
+// that type's derived path (Repository → nameWithOwner; RepositoryNode → repository{
+// nameWithOwner}; DiscussionComment → discussion{repository{nameWithOwner}}). The outermost
+// field carries markerAlias so the filter/round-trip can find and strip it.
 func (s *Schema) marker(typeName string) *ast.Field {
-	if typeName == "Repository" {
-		return &ast.Field{Alias: markerAlias, Name: "nameWithOwner"}
+	path := s.repoPath[typeName]
+	var field *ast.Field
+	for i := len(path) - 1; i >= 0; i-- {
+		f := &ast.Field{Name: path[i]}
+		if field != nil {
+			f.SelectionSet = ast.SelectionSet{field}
+		}
+		field = f
 	}
-	return &ast.Field{
-		Alias: markerAlias,
-		Name:  "repository",
-		SelectionSet: ast.SelectionSet{
-			&ast.Field{Alias: "nameWithOwner", Name: "nameWithOwner"},
-		},
-	}
+	field.Alias = markerAlias
+	return field
 }
 
 // Filter walks a GraphQL JSON response and redacts (replaces with null) any repo-scoped
@@ -177,18 +182,33 @@ func filterValue(v any, authorized func(owner, repo string) bool) any {
 	}
 }
 
-// repoFromMarker extracts owner/repo from a marker value, which is either a string
-// "owner/repo" (Repository) or an object {nameWithOwner:"owner/repo"} (RepositoryNode).
+// repoFromMarker extracts owner/repo from a marker value. The marker subtree contains only
+// the path to a single nameWithOwner (a bare "owner/repo" string for Repository, or a
+// nested object like {repository:{nameWithOwner:"owner/repo"}} or {discussion:{repository:
+// {nameWithOwner:"owner/repo"}}}), so the repository is the one "owner/repo" string within.
 func repoFromMarker(tag any) (owner, repo string, ok bool) {
-	var nwo string
-	switch t := tag.(type) {
-	case string:
-		nwo = t
-	case map[string]any:
-		nwo, _ = t["nameWithOwner"].(string)
-	}
+	nwo := findNameWithOwner(tag)
 	if i := strings.IndexByte(nwo, '/'); i > 0 && i < len(nwo)-1 {
 		return nwo[:i], nwo[i+1:], true
 	}
 	return "", "", false
+}
+
+// findNameWithOwner returns the single "owner/repo" string within a marker value, recursing
+// through the nested objects the marker path produces. A null/absent link (e.g. a comment
+// whose discussion is null) yields "" → the caller redacts (fail closed).
+func findNameWithOwner(v any) string {
+	switch t := v.(type) {
+	case string:
+		if strings.Contains(t, "/") {
+			return t
+		}
+	case map[string]any:
+		for _, child := range t {
+			if s := findNameWithOwner(child); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }

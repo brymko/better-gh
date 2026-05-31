@@ -508,18 +508,42 @@ func parseResolvedNode(raw json.RawMessage) (typename, nwo string) {
 		if k == "__typename" {
 			continue
 		}
-		var s string
-		if json.Unmarshal(v, &s) == nil && strings.Contains(s, "/") {
+		var val any
+		if json.Unmarshal(v, &val) != nil {
+			continue
+		}
+		// The resolve query's marker aliases hold only the path to nameWithOwner (e.g.
+		// repository{nameWithOwner} or discussion{repository{nameWithOwner}}), so the one
+		// "owner/repo" string anywhere within is this node's repository.
+		if s := findNWO(val); s != "" {
 			return typename, s
-		}
-		var obj struct {
-			NameWithOwner string `json:"nameWithOwner"`
-		}
-		if json.Unmarshal(v, &obj) == nil && obj.NameWithOwner != "" {
-			return typename, obj.NameWithOwner
 		}
 	}
 	return typename, ""
+}
+
+// findNWO returns the first "owner/repo" string anywhere within a resolved node's marker
+// value, recursing through the nested objects the resolve path produces.
+func findNWO(v any) string {
+	switch t := v.(type) {
+	case string:
+		if strings.Contains(t, "/") {
+			return t
+		}
+	case map[string]any:
+		for _, c := range t {
+			if s := findNWO(c); s != "" {
+				return s
+			}
+		}
+	case []any:
+		for _, c := range t {
+			if s := findNWO(c); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 func splitNameWithOwner(nwo string) (owner, repo string, ok bool) {
