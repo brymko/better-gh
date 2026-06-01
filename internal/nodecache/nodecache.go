@@ -17,6 +17,14 @@ type entry struct {
 	expiresAt time.Time
 }
 
+// maxEntries caps the cache so a client reading many distinct node IDs cannot grow it
+// without bound (each entry is a verified repo mapping held for the TTL). At capacity, new
+// mappings are simply not cached — a miss just re-resolves against GitHub, so correctness is
+// unaffected; the periodic evictLoop and TTL free space as entries expire. Only verified
+// repo nodes are ever stored (invalid/fake IDs resolve to null and are never Put), so this
+// cannot be filled with junk.
+const maxEntries = 100_000
+
 type Cache struct {
 	mu      sync.RWMutex
 	entries map[string]entry
@@ -60,6 +68,9 @@ func (c *Cache) Put(id, owner, repo string) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if _, exists := c.entries[id]; !exists && len(c.entries) >= maxEntries {
+		return // at capacity; a miss re-resolves, and evictLoop/TTL will free space
+	}
 	c.entries[id] = entry{owner: owner, repo: repo, expiresAt: time.Now().Add(c.ttl)}
 }
 
