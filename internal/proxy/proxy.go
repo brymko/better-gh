@@ -17,6 +17,7 @@ import (
 	"better-gh/internal/gqlfilter"
 	"better-gh/internal/nodecache"
 	"better-gh/internal/policy"
+	"better-gh/internal/restfilter"
 	"better-gh/internal/store"
 )
 
@@ -227,6 +228,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			body = aug
 			p := pol
 			respFilter = func(resp []byte) ([]byte, bool) { return filterGraphQLResponse(h.GQLFilter, p, resp) }
+		}
+	}
+
+	// REST enumeration/search endpoints (/user/repos, /orgs/{org}/repos, /search/code, ...)
+	// return repository-bearing entries from many repos; unlike the GraphQL path they are not
+	// otherwise redacted, so a client with the user/search categories could enumerate denied
+	// repos' metadata or read their code/issues. Drop denied-repo entries (defense-in-depth:
+	// an off-shape body passes through, so this never fails an allowed list/search closed).
+	if respFilter == nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) && restfilter.IsRepoEnumPath(norm) {
+		p := pol
+		respFilter = func(resp []byte) ([]byte, bool) {
+			return restfilter.Filter(norm, resp, func(repo string) bool {
+				owner := repo
+				if i := strings.IndexByte(repo, '/'); i > 0 {
+					owner = repo[:i]
+				}
+				return p.CanReadAnything(repo, owner)
+			}), true
 		}
 	}
 	if result.Allowed && classified.NavEscapes && respFilter == nil {

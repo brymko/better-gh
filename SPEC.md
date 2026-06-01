@@ -121,6 +121,8 @@ GraphQL **read isolation** is enforced by schema-aware **response filtering** (`
 
 For the filter to see plaintext, the proxy does **not** forward the client's `Accept-Encoding` upstream — Go's transport then negotiates compression itself and decompresses transparently, so every body can be typed and redacted (a gzipped body would otherwise be unparseable and forwarded unredacted). A GraphQL response the filter cannot parse is **denied**, not passed through (`filterGraphQLResponse` fails closed).
 
+The REST enumeration/search endpoints that return repository-bearing entries from many repos (`/user/repos`, `/user/issues`, `/orgs/{org}/repos`, `/search/{repositories,code,issues,commits}`, …) are filtered analogously by `internal/restfilter`: denied-repo entries are dropped from the array/`items` (keyed on `full_name` / `repository.full_name` / `repository_url`). Without this the `user`/`search` categories would let a client enumerate denied repos' metadata, or read their code via `/search/code`, over REST — bypassing the GraphQL filter. REST filtering is defense-in-depth (an off-shape body passes through rather than failing closed; `total_count` is not adjusted).
+
 Explicitly **not** boundaries (see README → Security model): the response filter is only as current as its embedded schema (newer fields → fail closed); redaction is repo-granular (per-resource limits aren't applied to navigated objects); a fine-grained upstream PAT remains the defense-in-depth floor; socket mode authenticates the user, not the process; node IDs are resolved against the embedded schema, so coverage of newly-added repo-scoped types tracks schema freshness.
 
 ## Technology
@@ -132,4 +134,4 @@ Explicitly **not** boundaries (see README → Security model): the response filt
 
 ## Non-goals (not implemented)
 
-mTLS team mode and per-identity client certs; multi-token upstream routing; encrypted token storage; glob patterns in rules; policy hot-reload; response-body filtering; HA/clustering; an audit-query CLI.
+mTLS team mode and per-identity client certs; multi-token upstream routing; encrypted token storage; glob patterns in rules; policy hot-reload; HA/clustering; an audit-query CLI. (Response-body filtering IS implemented for GraphQL and for the known REST enumeration/search endpoints; arbitrary REST bodies are not otherwise filtered, so a fine-grained upstream PAT remains the floor.)
