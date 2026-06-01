@@ -38,6 +38,11 @@ func IsRepoEnumPath(normPath string) bool {
 		return true
 	case len(s) == 3 && s[0] == "users" && s[2] == "repos":
 		return true
+	case len(s) == 4 && s[0] == "repos" && s[3] == "forks":
+		// /repos/{owner}/{repo}/forks returns repository objects owned by OTHERS; the GraphQL
+		// filter already redacts `forks`, so redact here too (the parent repo is policy-checked
+		// by the classifier; denied forks are dropped by full_name).
+		return true
 	case len(s) == 1 && (s[0] == "repositories" || s[0] == "issues" || s[0] == "notifications"):
 		return true
 	case len(s) == 2 && s[0] == "search" && (s[1] == "repositories" || s[1] == "code" || s[1] == "issues" || s[1] == "commits"):
