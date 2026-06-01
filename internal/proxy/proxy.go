@@ -744,30 +744,38 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 			jsonError(w, http.StatusBadGateway, "bgh: response could not be filtered")
 			return
 		}
-		for key, vals := range resp.Header {
-			if key == "Transfer-Encoding" || key == "Content-Encoding" || key == "Content-Length" {
-				continue
-			}
-			for _, v := range vals {
-				w.Header().Add(key, v)
-			}
-		}
+		copyResponseHeaders(w.Header(), resp.Header, true)
 		w.WriteHeader(resp.StatusCode)
 		w.Write(filtered)
 		return
 	}
 
-	for key, vals := range resp.Header {
-		if key == "Transfer-Encoding" || key == "Content-Encoding" {
+	copyResponseHeaders(w.Header(), resp.Header, false)
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// strippedResponseHeaders are upstream response headers never forwarded to the client.
+// Transfer-Encoding/Content-Encoding are managed by our transport (bodies arrive decoded);
+// the X-OAuth-* headers reveal the custodian token's scopes and OAuth client id, which a
+// proxy-token holder must not learn (the proxy exists to hide that token's reach).
+var strippedResponseHeaders = map[string]bool{
+	"Transfer-Encoding":       true,
+	"Content-Encoding":        true,
+	"X-Oauth-Scopes":          true,
+	"X-Accepted-Oauth-Scopes": true,
+	"X-Oauth-Client-Id":       true,
+}
+
+func copyResponseHeaders(dst, src http.Header, stripContentLength bool) {
+	for key, vals := range src {
+		if strippedResponseHeaders[key] || (stripContentLength && key == "Content-Length") {
 			continue
 		}
 		for _, v := range vals {
-			w.Header().Add(key, v)
+			dst.Add(key, v)
 		}
 	}
-
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
 }
 
 func jsonError(w http.ResponseWriter, status int, msg string) {

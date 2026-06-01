@@ -38,7 +38,7 @@ func IsRepoEnumPath(normPath string) bool {
 		return true
 	case len(s) == 3 && s[0] == "users" && s[2] == "repos":
 		return true
-	case len(s) == 1 && (s[0] == "repositories" || s[0] == "issues"):
+	case len(s) == 1 && (s[0] == "repositories" || s[0] == "issues" || s[0] == "notifications"):
 		return true
 	case len(s) == 2 && s[0] == "search" && (s[1] == "repositories" || s[1] == "code" || s[1] == "issues" || s[1] == "commits"):
 		return true
@@ -100,8 +100,17 @@ func filterSearch(body []byte, authorized func(string) bool) []byte {
 		return body
 	}
 	obj["items"] = nb
-	// total_count is left as-is: it is a count of all matches and adjusting it per-page would
-	// corrupt pagination. Denied-repo CONTENT is removed; only the residual match COUNT leaks.
+	// If anything was dropped, total_count would otherwise be a denied-repo existence oracle
+	// (e.g. /search/code?q="exact-secret" returns empty items but total_count=1, confirming
+	// the secret exists in a repo the client can't read). Replace it with the kept count and
+	// flag the response incomplete. (A query whose page had no denied matches keeps the true
+	// count; a broad multi-page query may still leak an aggregate count on all-allowed pages.)
+	if len(kept) < len(items) {
+		if c, e := json.Marshal(len(kept)); e == nil {
+			obj["total_count"] = c
+		}
+		obj["incomplete_results"] = json.RawMessage("true")
+	}
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body

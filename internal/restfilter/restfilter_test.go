@@ -15,10 +15,10 @@ func allowOnly(allowed ...string) func(string) bool {
 
 func TestIsRepoEnumPath(t *testing.T) {
 	yes := []string{"/user/repos", "/user/starred", "/user/issues", "/orgs/o/repos", "/orgs/o/issues",
-		"/users/u/repos", "/repositories", "/issues", "/search/repositories", "/search/code",
-		"/search/issues", "/search/commits"}
+		"/users/u/repos", "/repositories", "/issues", "/notifications", "/search/repositories",
+		"/search/code", "/search/issues", "/search/commits"}
 	no := []string{"/repos/o/r/pulls", "/repos/o/r", "/user", "/search/users", "/search/topics",
-		"/orgs/o", "/orgs/o/members", "/graphql", "/notifications"}
+		"/orgs/o", "/orgs/o/members", "/graphql", "/repos/o/r/notifications"}
 	for _, p := range yes {
 		if !IsRepoEnumPath(p) {
 			t.Errorf("%s should be a repo-enum path", p)
@@ -66,6 +66,45 @@ func TestFilterSearchItems(t *testing.T) {
 	}
 	if !strings.Contains(s, "a/keep") {
 		t.Fatalf("allowed item lost: %s", s)
+	}
+}
+
+// Regression for FINDING L: total_count would otherwise be a denied-repo existence oracle
+// (items redacted but count reveals a match exists). When items are dropped it is replaced
+// with the kept count and the response flagged incomplete.
+func TestFilterSearchClosesCountOracle(t *testing.T) {
+	body := []byte(`{"total_count":1,"incomplete_results":false,"items":[{"name":"x","repository":{"full_name":"b/drop"}}]}`)
+	out := string(Filter("/search/code", body, allowOnly("a/keep")))
+	if strings.Contains(out, `"total_count":1`) {
+		t.Fatalf("count oracle not closed (total_count still 1): %s", out)
+	}
+	if !strings.Contains(out, `"total_count":0`) {
+		t.Fatalf("total_count should be set to kept count 0: %s", out)
+	}
+	if !strings.Contains(out, `"incomplete_results":true`) {
+		t.Fatalf("incomplete_results should be set: %s", out)
+	}
+}
+
+// A search whose page had no denied matches keeps its true count untouched.
+func TestFilterSearchKeepsCountWhenNothingDropped(t *testing.T) {
+	body := []byte(`{"total_count":42,"items":[{"name":"x","repository":{"full_name":"a/keep"}}]}`)
+	out := string(Filter("/search/code", body, allowOnly("a/keep")))
+	if !strings.Contains(out, `"total_count":42`) {
+		t.Fatalf("true count should be preserved when nothing dropped: %s", out)
+	}
+}
+
+// /notifications returns threads carrying their repository; denied repos' threads (with
+// their issue/PR subject titles) must be dropped.
+func TestFilterNotifications(t *testing.T) {
+	body := []byte(`[{"subject":{"title":"OK"},"repository":{"full_name":"a/keep"}},{"subject":{"title":"LEAK"},"repository":{"full_name":"b/drop"}}]`)
+	out := string(Filter("/notifications", body, allowOnly("a/keep")))
+	if strings.Contains(out, "LEAK") || strings.Contains(out, "b/drop") {
+		t.Fatalf("denied-repo notification not dropped: %s", out)
+	}
+	if !strings.Contains(out, "OK") {
+		t.Fatalf("allowed notification lost: %s", out)
 	}
 }
 
