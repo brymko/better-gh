@@ -114,12 +114,22 @@ func (s *Store) Lookup(secret string) *ProxyToken {
 	return nil
 }
 
+// lastUsedFlushInterval debounces LastUsed persistence. Without it, every allowed GHE
+// request rewrites the whole tokens.json (temp+rename) — a client flooding cheap requests
+// would amplify into unbounded disk writes and goroutines blocked on them. Persisting at
+// most once per interval per token caps that; LastUsed is then accurate to the interval.
+const lastUsedFlushInterval = time.Minute
+
 func (s *Store) TouchLastUsed(id string) {
+	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.tokens {
 		if s.tokens[i].ID == id {
-			s.tokens[i].LastUsed = time.Now().UTC()
+			if now.Sub(s.tokens[i].LastUsed) < lastUsedFlushInterval {
+				return // recorded recently; skip the rewrite to cap write amplification
+			}
+			s.tokens[i].LastUsed = now
 			_ = s.flush()
 			return
 		}
