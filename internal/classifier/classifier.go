@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/vektah/gqlparser/v2/ast"
@@ -307,28 +308,71 @@ func isScopeField(name string) bool {
 	return false
 }
 
-func gqlRepoResource(repoField *ast.Field) string {
-	found := ""
-	for _, sel := range repoField.SelectionSet {
-		f, ok := sel.(*ast.Field)
-		if !ok {
-			continue
-		}
-		if r, ok := gqlFieldToResource[f.Name]; ok {
-			if found != "" && found != r {
-				return ""
+// gqlRepoResources returns EVERY distinct per-resource key a repository() selection
+// touches (pullRequests → "pulls", issues → "issues", object → "contents", …). Each
+// becomes its own scope so the policy must allow all of them.
+//
+// The previous version collapsed a selection touching more than one resource — or a
+// resource alongside any non-metadata field — to a single "" ("ambiguous") resource, and
+// the policy engine treats "" as "use the rule's BASE access". That let a query mix a
+// restricted resource with a harmless sibling to dodge a per-resource rule, e.g.
+// `repository(){ pullRequests{…} issues{…} }` or `repository(){ pullRequests{…}
+// viewerPermission }` slipped past `pulls = "none"`. It also only inspected DIRECT
+// *ast.Field children, so wrapping the resource in a fragment
+// (`repository(){ ...on Repository{ pullRequests } }`) hid it the same way. This walks
+// through inline-fragment / fragment-spread boundaries (but NOT into a field's own
+// sub-selection) and emits each resource it finds.
+//
+// Fields that map to no resource (metadata, unmapped fields) add a "metadata" scope so
+// the rule's base access still governs them; __typename never contributes. A selection
+// with no resource fields yields just "metadata" (unchanged behaviour).
+func gqlRepoResources(repoField *ast.Field, fragments ast.FragmentDefinitionList) []string {
+	set := map[string]struct{}{}
+	baseGoverned := false
+	collectRepoResources(repoField.SelectionSet, fragments, set, &baseGoverned, 0)
+	if len(set) == 0 {
+		return []string{"metadata"}
+	}
+	out := make([]string, 0, len(set)+1)
+	for r := range set {
+		out = append(out, r)
+	}
+	sort.Strings(out) // deterministic; a real resource stays the primary (audit) scope
+	if baseGoverned {
+		out = append(out, "metadata") // base-governed fields get their own scope, listed last
+	}
+	return out
+}
+
+// collectRepoResources flattens the repository selection across fragment boundaries to
+// find the per-resource keys of its direct fields. It does NOT descend into a field's own
+// sub-selection (a resource is fixed by the repository's direct child, not by fields
+// nested under it). The depth bound is the cyclic-fragment guard; on exceed it sets
+// baseGoverned (require the rule's base access) and stops — fail closed, never silently
+// drop a resource.
+func collectRepoResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, depth int) {
+	if depth > maxGraphQLDepth {
+		*baseGoverned = true
+		return
+	}
+	for _, sel := range sels {
+		switch s := sel.(type) {
+		case *ast.Field:
+			if r, ok := gqlFieldToResource[s.Name]; ok {
+				set[r] = struct{}{}
+			} else if s.Name != "__typename" {
+				*baseGoverned = true // metadata or any unmapped field → rule's base access
 			}
-			found = r
-		} else if !gqlMetadataFields[f.Name] && f.Name != "__typename" {
-			if found != "" && found != "metadata" {
-				return ""
+		case *ast.InlineFragment:
+			collectRepoResources(s.SelectionSet, fragments, set, baseGoverned, depth+1)
+		case *ast.FragmentSpread:
+			if frag := fragments.ForName(s.Name); frag != nil {
+				collectRepoResources(frag.SelectionSet, fragments, set, baseGoverned, depth+1)
+			} else {
+				*baseGoverned = true // unresolvable spread → can't see its fields → require base
 			}
 		}
 	}
-	if found == "" {
-		return "metadata"
-	}
-	return found
 }
 
 func gqlUnscopedCategory(doc *ast.QueryDocument) string {
@@ -435,7 +479,11 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 				owner := resolveStringArg(s.Arguments, "owner", vars)
 				name := resolveStringArg(s.Arguments, "name", vars)
 				if owner != "" && name != "" {
-					add(Scope{Owner: owner, Repo: name, Resource: gqlRepoResource(s)})
+					// Emit a scope per distinct resource the selection touches so a query
+					// mixing a restricted resource with a sibling can't dodge its policy.
+					for _, res := range gqlRepoResources(s, fragments) {
+						add(Scope{Owner: owner, Repo: name, Resource: res})
+					}
 					scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, depth+1, tooComplex)
 					continue
 				}
@@ -806,15 +854,6 @@ var gqlFieldToResource = map[string]string{
 	"commitComments": "commits",
 
 	"deployments": "deployments",
-}
-
-var gqlMetadataFields = map[string]bool{
-	"name": true, "owner": true, "url": true, "id": true,
-	"isPrivate": true, "isFork": true, "isArchived": true,
-	"stargazers": true, "watchers": true, "description": true,
-	"licenseInfo": true, "repositoryTopics": true, "languages": true,
-	"forkCount": true, "stargazerCount": true, "visibility": true,
-	"createdAt": true, "updatedAt": true,
 }
 
 func gqlMutationResource(name string) string {

@@ -326,12 +326,32 @@ func (h *Handler) augmentGraphQL(body []byte) ([]byte, bool) {
 // (This is why the proxy drops Accept-Encoding upstream: a gzipped body would otherwise
 // be unparseable here and, before, was forwarded unredacted.)
 func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte) ([]byte, bool) {
+	// UseNumber so integers beyond float64's 53-bit mantissa (large databaseIds, counts)
+	// round-trip exactly: decoding to the default float64 and re-marshaling would corrupt
+	// them (and reformat, e.g. 1e21). json.Number re-marshals as the original literal, and
+	// the filter never interprets numbers (only string markers), so this is purely lossless.
+	dec := json.NewDecoder(bytes.NewReader(resp))
+	dec.UseNumber()
 	var parsed map[string]any
-	if json.Unmarshal(resp, &parsed) != nil {
+	if dec.Decode(&parsed) != nil {
 		return nil, false
 	}
-	filtered := gqlfilter.Filter(parsed, func(owner, repo string) bool {
-		return pol.CanReadAnything(owner+"/"+repo, owner)
+	// Per-resource aware: evaluate each repo-scoped object against its (repo, resource) so a
+	// restriction like pulls="none" is enforced wherever the object appears — including via
+	// navigation back to the same readable repo, which the repo-granular check could not catch.
+	//
+	// The repository container itself (and bare metadata / unmapped types → resource
+	// "metadata") is kept whenever the repo is readable in ANY way: redacting the container
+	// would null the allowed CHILD objects inside it, breaking a base="none" + per-resource
+	// "read" grant (e.g. "read only this repo's issues"). Per-resource restrictions are
+	// enforced on the specific child objects (pulls/issues/…) below. A fully-denied repo is
+	// not readable in any way, so its container — and everything in it — is still redacted.
+	filtered := gqlfilter.Filter(parsed, func(owner, repo, resource string) bool {
+		full := owner + "/" + repo
+		if resource == "metadata" {
+			return pol.CanReadAnything(full, owner)
+		}
+		return pol.Evaluate(full, owner, classifier.Read, resource, "").Allowed
 	})
 	out, err := json.Marshal(filtered)
 	if err != nil {
@@ -599,7 +619,14 @@ func EnforceRedirectPolicy(req *http.Request, via []*http.Request) error {
 
 func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, pol *policy.Policy, tok *store.ProxyToken, classified *classifier.Result, respFilter func([]byte) ([]byte, bool)) {
 	base := h.upstreamBase()
-	upstream := base + normPath
+	// Forward the path with the SAME percent-encoding the client sent (EscapedPath), not the
+	// decoded normPath. Reassembling the decoded path into a URL string lets an encoded '?'
+	// or '#' inside a segment re-split the URL: `/repos/o/r%3Fx/pulls` decodes to
+	// `/repos/o/r?x/pulls`, which url.Parse then splits into path `/repos/o/r` + query
+	// `x/pulls` — so GitHub serves repo `o/r` even though the classifier authorized `o/r?x`
+	// (an org-allow + repo-deny policy would be bypassed). Keeping it escaped makes GitHub
+	// route the exact (owner, repo) the classifier checked.
+	upstream := base + classifier.NormalizePath(r.URL.EscapedPath())
 	if normPath == "/graphql" || normPath == "/graphql/" {
 		upstream = base + "/graphql"
 	}

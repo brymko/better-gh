@@ -379,9 +379,12 @@ func TestGraphQLResourceExtraction(t *testing.T) {
 			"branches",
 		},
 		{
-			"mixed-resources-ambiguous",
+			// Mixed resources now classify to a concrete primary (alphabetically first) with
+			// BOTH resource scopes emitted (see TestGraphQLRepoResourceMixedResourcesBothEnforced);
+			// the old "" ("ambiguous") result was a per-resource bypass.
+			"mixed-resources",
 			`{"query":"{ repository(owner: \"o\", name: \"r\") { pullRequests(first:1) { nodes { title } } issues(first:1) { nodes { title } } } }"}`,
-			"",
+			"issues",
 		},
 		{
 			"contents-object",
@@ -577,10 +580,15 @@ func TestGraphQLMutationDisablePRAutoMerge(t *testing.T) {
 }
 
 func TestGraphQLRepoResourceWithUnknownField(t *testing.T) {
+	// Regression (per-resource bypass): mixing a restricted resource with an unmapped
+	// sibling field must NOT drop the resource. The old classifier returned "" here, which
+	// the policy engine treats as the rule's base access — letting `repository(){
+	// pullRequests customField }` slip past a `pulls = "none"` rule. The pulls scope must
+	// still be emitted (and a metadata scope for customField).
 	body := []byte(`{"query":"{ repository(owner: \"o\", name: \"r\") { pullRequests(first:1) { nodes { title } } customField } }"}`)
 	r := Classify(http.MethodPost, "/graphql", body)
-	if r.Resource != "" {
-		t.Errorf("resource + unknown field should be ambiguous (empty), got %q", r.Resource)
+	if !hasRepoResourceScope(r, "o", "r", "pulls") {
+		t.Errorf("pulls+unknown must still emit a pulls scope, got %+v", r.AllScopes())
 	}
 }
 
@@ -646,13 +654,42 @@ func TestGraphQLMutationOnlyScopeFields(t *testing.T) {
 }
 
 func TestGraphQLRepoResourceInlineFragment(t *testing.T) {
+	// Regression (per-resource bypass): a resource wrapped in an inline fragment must be
+	// classified. The old classifier only scanned direct *ast.Field children, so
+	// `repository(){ ...on Repository{ pullRequests } }` was seen as "metadata" → base
+	// access, dodging a `pulls = "none"` rule. The pulls scope must now be emitted.
 	body := []byte(`{"query":"{ repository(owner: \"o\", name: \"r\") { ... on Repository { pullRequests(first:1) { nodes { title } } } } }"}`)
 	r := Classify(http.MethodPost, "/graphql", body)
 	if r.Owner != "o" || r.Repo != "r" {
 		t.Fatalf("expected o/r, got %s/%s", r.Owner, r.Repo)
 	}
-	if r.Resource != "metadata" {
-		t.Errorf("inline fragment: Resource = %q, want %q", r.Resource, "metadata")
+	if !hasRepoResourceScope(r, "o", "r", "pulls") {
+		t.Errorf("inline-fragment-wrapped pulls must emit a pulls scope, got %+v", r.AllScopes())
+	}
+}
+
+// hasRepoResourceScope reports whether the classified result emits a scope for the given
+// repo + per-resource key (checking every scope the request touches, not just the primary).
+func hasRepoResourceScope(r Result, owner, repo, resource string) bool {
+	for _, s := range r.AllScopes() {
+		if s.Owner == owner && s.Repo == repo && s.Resource == resource {
+			return true
+		}
+	}
+	return false
+}
+
+// TestGraphQLRepoResourceMixedResourcesBothEnforced locks in the per-resource bypass fix:
+// a repository() selection touching two resources must emit a scope for EACH, so a query
+// can't combine a restricted resource with another to escape policy.
+func TestGraphQLRepoResourceMixedResourcesBothEnforced(t *testing.T) {
+	body := []byte(`{"query":"{ repository(owner: \"o\", name: \"r\") { pullRequests(first:1){nodes{title}} issues(first:1){nodes{title}} } }"}`)
+	r := Classify(http.MethodPost, "/graphql", body)
+	if !hasRepoResourceScope(r, "o", "r", "pulls") {
+		t.Errorf("missing pulls scope, got %+v", r.AllScopes())
+	}
+	if !hasRepoResourceScope(r, "o", "r", "issues") {
+		t.Errorf("missing issues scope, got %+v", r.AllScopes())
 	}
 }
 

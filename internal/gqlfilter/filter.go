@@ -15,6 +15,13 @@ import (
 // plain (collision-unlikely) alias.
 const markerAlias = "bghRepoTagZ9"
 
+// markerTypeAlias is injected alongside markerAlias as `bghRepoTypeZ9: __typename`, so the
+// filter learns each repo-scoped object's RUNTIME type and can map it to a per-resource key
+// (PullRequest→"pulls", Issue→"issues", …). This makes per-resource policy enforceable no
+// matter how an object is reached — including navigating back to the same repo — which the
+// repo-only marker cannot do (it is repo-granular). Stripped from the response like markerAlias.
+const markerTypeAlias = "bghRepoTypeZ9"
+
 // Augment validates a read query against the GitHub schema and injects, into every
 // repo-scoped selection set, a hidden field revealing that object's repository. It
 // returns the rewritten query. An invalid/untypable query yields an error so the
@@ -71,7 +78,7 @@ func usesReservedAlias(sels ast.SelectionSet, depth int) bool {
 			if key == "" {
 				key = f.Name
 			}
-			if key == markerAlias {
+			if key == markerAlias || key == markerTypeAlias {
 				return true
 			}
 			if usesReservedAlias(f.SelectionSet, depth+1) {
@@ -121,8 +128,17 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string) {
 		}
 	}
 	if s.isRepoScoped(typeName) {
-		*sels = append(*sels, s.marker(typeName))
+		// Repo marker (which repository) + type marker (which resource), so the filter can
+		// apply per-resource policy to this object regardless of how it was reached.
+		*sels = append(*sels, s.marker(typeName), typenameMarker())
 	}
+}
+
+// typenameMarker injects `bghRepoTypeZ9: __typename` so the filter can map the object's
+// runtime type to a per-resource key. __typename is valid in every object/interface
+// selection and adds negligible cost.
+func typenameMarker() *ast.Field {
+	return &ast.Field{Alias: markerTypeAlias, Name: "__typename"}
 }
 
 // marker builds the hidden repository-identifying field for a repo-scoped type, following
@@ -144,9 +160,12 @@ func (s *Schema) marker(typeName string) *ast.Field {
 }
 
 // Filter walks a GraphQL JSON response and redacts (replaces with null) any repo-scoped
-// object whose repository the authorized predicate rejects, then strips the injected
-// markers. authorized receives "owner", "repo".
-func Filter(resp map[string]any, authorized func(owner, repo string) bool) map[string]any {
+// object the authorized predicate rejects, then strips the injected markers. authorized
+// receives "owner", "repo", and the per-resource key derived from the object's runtime
+// __typename (PullRequest→"pulls", Issue→"issues", …; "metadata" for the repository itself
+// and unmapped types). Passing the resource lets per-resource policy (e.g. pulls="none") be
+// enforced on objects reached by ANY path — navigation included — not just the entry point.
+func Filter(resp map[string]any, authorized func(owner, repo, resource string) bool) map[string]any {
 	v := filterValue(resp, authorized)
 	if m, ok := v.(map[string]any); ok {
 		return m
@@ -154,20 +173,23 @@ func Filter(resp map[string]any, authorized func(owner, repo string) bool) map[s
 	return map[string]any{}
 }
 
-func filterValue(v any, authorized func(owner, repo string) bool) any {
+func filterValue(v any, authorized func(owner, repo, resource string) bool) any {
 	switch val := v.(type) {
 	case map[string]any:
 		if tag, ok := val[markerAlias]; ok {
-			// A marker is only injected onto repo-scoped objects, so its presence means
-			// this object belongs to a repository. Redact if that repository is denied OR
-			// if the marker is unparseable (anomalous null/malformed repository) — failing
-			// closed, since we cannot prove the object's repository is authorized.
+			// A repo marker is only injected onto repo-scoped objects, so its presence means
+			// this object belongs to a repository. Redact if that (repo, resource) is denied
+			// OR if the marker is unparseable (anomalous null/malformed repository) — failing
+			// closed, since we cannot prove the object is authorized. The resource comes from
+			// the runtime type marker (markerTypeAlias); absent/unmapped → "metadata" (base).
 			owner, repo, parsed := repoFromMarker(tag)
-			if !parsed || !authorized(owner, repo) {
+			resource := typeResource(markerTypename(val))
+			if !parsed || !authorized(owner, repo, resource) {
 				return nil
 			}
 			delete(val, markerAlias)
 		}
+		delete(val, markerTypeAlias) // strip the injected type marker (whether or not a repo marker rode with it)
 		for k, child := range val {
 			val[k] = filterValue(child, authorized)
 		}
@@ -180,6 +202,57 @@ func filterValue(v any, authorized func(owner, repo string) bool) any {
 	default:
 		return v
 	}
+}
+
+// markerTypename returns the runtime __typename injected under markerTypeAlias, or "" if
+// absent (which maps to the "metadata" resource — base access).
+func markerTypename(val map[string]any) string {
+	s, _ := val[markerTypeAlias].(string)
+	return s
+}
+
+// gqlTypeToResource maps a GraphQL object's __typename to the per-resource policy key (the
+// same keys internal/classifier and the policy engine use). A type not listed maps to
+// "metadata", governed by the rule's base access — so unmapped objects keep the prior
+// repo-granular behaviour and no over-broad resource restriction is applied. Only types
+// with a single, unambiguous resource are listed.
+var gqlTypeToResource = map[string]string{
+	"PullRequest":              "pulls",
+	"PullRequestReview":        "pulls",
+	"PullRequestReviewComment": "pulls",
+	"PullRequestReviewThread":  "pulls",
+	"PullRequestCommit":        "pulls",
+	"Issue":                    "issues",
+	"IssueComment":             "issues",
+	"Commit":                   "commits",
+	"CommitComment":            "commits",
+	"Release":                  "releases",
+	"ReleaseAsset":             "releases",
+	"Ref":                      "branches",
+	"Deployment":               "deployments",
+	"DeploymentStatus":         "deployments",
+	"CheckRun":                 "checks",
+	"CheckSuite":               "checks",
+	// Commit statuses are the "checks" resource (the classifier maps REST `statuses`→checks).
+	// They are reached via commit.status / commit.statusCheckRollup, whose parent Commit is a
+	// DIFFERENT resource (commits), so without these a checks="none" rule would not redact
+	// commit-status data (CI state, target URLs) read over GraphQL.
+	"Status":            "checks",
+	"StatusContext":     "checks",
+	"StatusCheckRollup": "checks",
+	"Tree":              "contents",
+	"Blob":              "contents",
+	// Branch protection config is the "branches" resource (REST: /branches/{b}/protection).
+	// Reached directly via repository().branchProtectionRules, so it is gated only by repo
+	// metadata unless mapped here.
+	"BranchProtectionRule": "branches",
+}
+
+func typeResource(typename string) string {
+	if r, ok := gqlTypeToResource[typename]; ok {
+		return r
+	}
+	return "metadata"
 }
 
 // repoFromMarker extracts owner/repo from a marker value. The marker subtree contains only
