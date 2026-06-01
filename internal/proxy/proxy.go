@@ -248,19 +248,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}), true
 		}
 	}
+	// Fallback when the filter is DISABLED entirely (GQLFilter == nil, e.g. tests): rely on
+	// the classifier's cross-repo-nav denylist to deny navigating requests.
 	if result.Allowed && classified.NavEscapes && respFilter == nil {
 		result = policy.Result{Reason: "cross-repo navigation without a response filter"}
 	}
-	// When the filter IS configured but could not type this read (schema drift: the query
-	// uses a field newer than the embedded schema), a read that enumerates beyond explicit
-	// repository() scopes — viewer/search/org — cannot be redacted, so fail closed instead
-	// of forwarding it unfiltered. A read that types fine gets a respFilter (and is redacted);
-	// when the filter is disabled entirely GQLFilter is nil and this does not apply.
+	// A GraphQL request is fully filtered or denied — never forwarded unfiltered. When the
+	// filter is configured but could not type this request (schema drift: a field newer than
+	// the embedded schema; or an invalid / reserved-alias query), respFilter is nil and no
+	// response can be redacted, so fail closed. Relying instead on the classifier's nav
+	// denylist was unsound: it is not complete (e.g. associatedPullRequests, task-list refs),
+	// so an untyped scoped read could navigate cross-repo through a non-listed field and be
+	// streamed unredacted. A request that types fine has a respFilter and is unaffected.
 	if result.Allowed && h.GQLFilter != nil && respFilter == nil &&
-		classified.Access == classifier.Read &&
-		(norm == "/graphql" || norm == "/graphql/") &&
-		graphQLReadReachesUnscopedRepos(&classified) {
-		result = policy.Result{Reason: "un-typeable read enumerates beyond scoped repos"}
+		(norm == "/graphql" || norm == "/graphql/") {
+		result = policy.Result{Reason: "graphql request could not be typed against the embedded schema"}
 	}
 
 	if forceDenyReason != "" || !result.Allowed {
@@ -336,20 +338,6 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 		return nil, false
 	}
 	return out, true
-}
-
-// graphQLReadReachesUnscopedRepos reports whether a GraphQL read can reach repositories
-// beyond the explicit repository() scopes the classifier enumerated — via viewer/search
-// unscoped enumeration or an organization()/repositoryOwner() entry. Such a read relies on
-// the response filter to redact denied repos, so the proxy must fail closed when the filter
-// could not type it. (rateLimit/meta reach no repos and are not flagged.)
-func graphQLReadReachesUnscopedRepos(c *classifier.Result) bool {
-	for _, s := range c.AllScopes() {
-		if s.UnscopedCategory == "user" || s.UnscopedCategory == "search" || s.Org != "" {
-			return true
-		}
-	}
-	return false
 }
 
 // evaluateScopes allows a request only if EVERY scope it touches is allowed. A
