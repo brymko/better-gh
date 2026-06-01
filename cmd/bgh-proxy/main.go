@@ -24,6 +24,7 @@ import (
 	"better-gh/internal/loginflow"
 	"better-gh/internal/nodecache"
 	"better-gh/internal/oauth"
+	"better-gh/internal/owner"
 	"better-gh/internal/policy"
 	"better-gh/internal/proxy"
 	"better-gh/internal/store"
@@ -252,6 +253,19 @@ func cmdServe(configPath string) error {
 		return fmt.Errorf("opening token store: %w", err)
 	}
 
+	// Deployment owner + captured custodian token. The first GitHub sign-in (web or
+	// `gh auth login`) claims the deployment and captures its token here; cfg.GithubToken
+	// (if set) is the fallback custodian until then.
+	ownerStore, err := owner.Open(filepath.Join(config.DefaultDir(), "owner.json"), cfg.GithubToken)
+	if err != nil {
+		return fmt.Errorf("opening owner store: %w", err)
+	}
+	if !ownerStore.Claimed() && cfg.GithubToken == "" {
+		slog.Warn("no custodian yet — sign in via the web UI or `gh auth login` to provision the proxy")
+	} else if ownerStore.Claimed() {
+		slog.Info("deployment owner", "login", ownerStore.Login())
+	}
+
 	auditLogger := audit.NewLogger(cfg.AuditLog)
 
 	adminSecretPath := filepath.Join(config.DefaultDir(), "admin-secret")
@@ -312,7 +326,7 @@ func cmdServe(configPath string) error {
 
 	if cfg.Mode == "socket" || cfg.Mode == "both" {
 		socketHandler := &proxy.Handler{
-			GithubToken:  cfg.GithubToken,
+			Custodian:    ownerStore.Token,
 			Store:        tokenStore,
 			Audit:        auditLogger,
 			Client:       httpClient,
@@ -353,13 +367,13 @@ func cmdServe(configPath string) error {
 
 	if cfg.Mode == "ghe" || cfg.Mode == "both" {
 		gheHandler := &proxy.Handler{
-			GithubToken: cfg.GithubToken,
-			Store:       tokenStore,
-			Audit:       auditLogger,
-			Client:      httpClient,
-			Mode:        proxy.GHEMode,
-			NodeCache:   nodeCache,
-			GQLFilter:   gqlSchema,
+			Custodian: ownerStore.Token,
+			Store:     tokenStore,
+			Audit:     auditLogger,
+			Client:    httpClient,
+			Mode:      proxy.GHEMode,
+			NodeCache: nodeCache,
+			GQLFilter: gqlSchema,
 		}
 
 		// /login/* serves the OAuth identity-provider flow so a client can run the normal
@@ -369,13 +383,15 @@ func cmdServe(configPath string) error {
 		// endpoints). Uses a plain client — no policy/redirect rewriting — for github.com.
 		loginHandler := loginflow.NewHandler(&loginflow.Handler{
 			Store:         tokenStore,
-			UpstreamToken: cfg.GithubToken,
+			Owner:         ownerStore,
 			OAuthClientID: ghCLIClientID,
 			HTTPClient:    &http.Client{Timeout: 30 * time.Second},
 			ExternalURL:   cfg.ExternalURL,
 		})
 		gheMux := http.NewServeMux()
-		gheMux.Handle("/login/", loginHandler)
+		gheMux.Handle("/login/", loginHandler) // OAuth IdP for `gh auth login`
+		gheMux.Handle("/ui", loginHandler)     // web "create a token" page
+		gheMux.Handle("/ui/", loginHandler)    // its /ui/api/* endpoints
 		gheMux.Handle("/", gheHandler)
 
 		certs, err := tlsgen.EnsureCerts(cfg.TLSDir)

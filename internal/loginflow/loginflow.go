@@ -9,10 +9,10 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"better-gh/internal/oauth"
+	"better-gh/internal/owner"
 	"better-gh/internal/policy"
 	"better-gh/internal/store"
 )
@@ -27,14 +27,18 @@ const (
 //go:embed authorize.html
 var authorizePage []byte
 
+//go:embed ui.html
+var uiPage []byte
+
 // Handler implements the proxy's OAuth identity-provider endpoints under /login/*. It runs a
-// GitHub device flow to authenticate the operator, requires the resulting GitHub login to be
-// the custodian token's owner, then mints a scoped bgh_ proxy token and returns it to gh.
+// GitHub device flow to authenticate the operator, applies it to the deployment owner store
+// (the first sign-in claims the deployment and captures the GitHub token as the custodian;
+// later sign-ins must be that same owner), then mints a scoped bgh_ token and returns it to gh.
 type Handler struct {
 	Store         *store.Store
-	UpstreamToken string       // custodian token; its owner is the only login allowed to authorize
+	Owner         *owner.Store // TOFU owner; sign-in claims/refreshes the captured custodian token
 	OAuthClientID string       // gh's public app id; no registration needed
-	OAuthScopes   string       // minimal scopes for the identity device flow (default "read:user")
+	OAuthScopes   string       // scopes captured as the custodian (default "repo read:org gist workflow")
 	GitHubBaseURL string       // device-flow base; default https://github.com (overridden in tests)
 	APIBaseURL    string       // viewer{login} base; default https://api.github.com (overridden in tests)
 	HTTPClient    *http.Client // used for the inner GitHub calls
@@ -43,10 +47,8 @@ type Handler struct {
 	// verification_uri the proxy hands gh must point at the public URL, not the backend the
 	// front forwards to. Empty → derive from the request Host (correct for direct serving).
 
-	mux     *http.ServeMux
-	grants  *grantStore
-	ownerMu sync.Mutex
-	owner   string // cached custodian-owner login
+	mux    *http.ServeMux
+	grants *grantStore
 }
 
 func NewHandler(h *Handler) *Handler {
@@ -57,7 +59,9 @@ func NewHandler(h *Handler) *Handler {
 		h.APIBaseURL = apiBaseDefault
 	}
 	if h.OAuthScopes == "" {
-		h.OAuthScopes = "read:user"
+		// Captured as the custodian, so it must be broad enough to serve the proxy's traffic
+		// — gh's own default scopes (the public app supports them via device flow).
+		h.OAuthScopes = "repo read:org gist workflow"
 	}
 	if h.HTTPClient == nil {
 		h.HTTPClient = http.DefaultClient
@@ -72,6 +76,11 @@ func NewHandler(h *Handler) *Handler {
 	m.HandleFunc("POST /login/api/begin", h.apiBegin)
 	m.HandleFunc("POST /login/api/poll", h.apiPoll)
 	m.HandleFunc("POST /login/api/approve", h.apiApprove)
+	// Standalone web "create a token" page (reuses poll/approve; approve returns the secret).
+	m.HandleFunc("GET /ui", h.uiPageHandler)
+	m.HandleFunc("POST /ui/api/start", h.apiStartStandalone)
+	m.HandleFunc("POST /ui/api/poll", h.apiPoll)
+	m.HandleFunc("POST /ui/api/approve", h.apiApprove)
 	h.mux = m
 	return h
 }
@@ -154,6 +163,37 @@ func (h *Handler) verificationBase(r *http.Request) string {
 func (h *Handler) authorizePageDevice(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(authorizePage)
+}
+
+func (h *Handler) uiPageHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(uiPage)
+}
+
+// apiStartStandalone backs the web "create a token" page: it creates a standalone grant (not
+// tied to a gh OAuth flow) and starts the GitHub device flow to sign the operator in. The
+// minted secret is returned to the browser by apiApprove rather than handed to gh.
+func (h *Handler) apiStartStandalone(w http.ResponseWriter, r *http.Request) {
+	g := &grant{flow: "standalone", status: statusPending}
+	h.grants.add(g)
+	da, err := oauth.RequestDeviceCode(r.Context(), oauth.Config{
+		ClientID: h.OAuthClientID, Scopes: h.OAuthScopes, BaseURL: h.GitHubBaseURL, Client: h.HTTPClient,
+	})
+	if err != nil {
+		jsonResp(w, http.StatusBadGateway, map[string]string{"error": "could not start GitHub login: " + err.Error()})
+		return
+	}
+	var interval int
+	h.grants.withGrant(byID(g.id), func(g *grant) {
+		g.ghDeviceCode, g.ghInterval = da.DeviceCode, da.Interval
+		interval = g.ghInterval
+	})
+	jsonResp(w, http.StatusOK, map[string]any{
+		"grant_id":            g.id,
+		"github_user_code":    da.UserCode,
+		"github_verification": da.VerificationURI,
+		"interval":            interval,
+	})
 }
 
 // authorizePageWeb handles gh's browser (web) flow: record the grant keyed by gh's state +
@@ -278,21 +318,21 @@ func (h *Handler) apiPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authorized by GitHub — now the identity gate: the login MUST be the custodian owner.
+	// Authorized by GitHub. Resolve the login and apply it as a deployment sign-in: the first
+	// sign-in claims the deployment (TOFU) and captures this token as the custodian; later
+	// sign-ins must be that same owner and refresh the custodian. A different login is denied.
 	who, err := h.resolveLogin(r.Context(), tok)
 	if err != nil {
 		jsonResp(w, http.StatusBadGateway, map[string]string{"status": "error", "error": "could not read GitHub identity"})
 		return
 	}
-	owner, err := h.ownerLogin(r.Context())
-	if err != nil {
-		jsonResp(w, http.StatusBadGateway, map[string]string{"status": "error", "error": "could not resolve custodian owner"})
+	if _, ok, err := h.Owner.SignIn(who, tok); err != nil {
+		jsonResp(w, http.StatusBadGateway, map[string]string{"status": "error", "error": "could not record sign-in"})
 		return
-	}
-	if !strings.EqualFold(who, owner) {
+	} else if !ok {
 		h.grants.withGrant(byID(req.GrantID), func(g *grant) { g.status = statusDenied })
 		jsonResp(w, http.StatusOK, map[string]string{"status": "denied",
-			"error": fmt.Sprintf("%q is not authorized; only the custodian owner (%q) may mint tokens", who, owner)})
+			"error": fmt.Sprintf("%q is not the owner of this deployment", who)})
 		return
 	}
 	h.grants.withGrant(byID(req.GrantID), func(g *grant) {
@@ -363,29 +403,16 @@ func (h *Handler) apiApprove(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if flow == "standalone" {
+		// Web "create a token" page: hand the secret straight to the browser to copy (there is
+		// no gh client polling /access_token for it).
+		jsonResp(w, http.StatusOK, map[string]string{"status": "approved", "secret": secret})
+		return
+	}
 	jsonResp(w, http.StatusOK, map[string]string{"status": "approved"})
 }
 
 // --- identity --------------------------------------------------------------------------
-
-// ownerLogin resolves and caches the custodian token's GitHub login — the only identity
-// allowed to authorize a token mint. A failure is not cached, so it is retried next time.
-func (h *Handler) ownerLogin(ctx context.Context) (string, error) {
-	h.ownerMu.Lock()
-	defer h.ownerMu.Unlock()
-	if h.owner != "" {
-		return h.owner, nil
-	}
-	who, err := h.resolveLogin(ctx, h.UpstreamToken)
-	if err != nil {
-		return "", err
-	}
-	if who == "" {
-		return "", fmt.Errorf("custodian token returned an empty login")
-	}
-	h.owner = who
-	return who, nil
-}
 
 // resolveLogin returns viewer{login} for a token via GitHub's GraphQL API.
 func (h *Handler) resolveLogin(ctx context.Context, token string) (string, error) {

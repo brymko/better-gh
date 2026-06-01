@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bgh-proxy — create a token</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
+          --accent:#2f81f7; --ok:#3fb950; --bad:#f85149; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,Segoe UI,Helvetica,Arial,sans-serif; }
+  .card { width:480px; max-width:94vw; background:var(--card); border:1px solid var(--border);
+          border-radius:12px; padding:28px 30px; box-shadow:0 16px 48px rgba(0,0,0,.5); }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 20px; }
+  .step { display:none; } .step.active { display:block; }
+  .code { font:600 26px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:3px;
+          background:#0d1117; border:1px solid var(--border); border-radius:8px; padding:14px; text-align:center; color:#58a6ff; user-select:all; }
+  label { display:block; font-size:12px; color:var(--muted); margin:14px 0 4px; text-transform:uppercase; letter-spacing:.04em; }
+  input, select { width:100%; background:#0d1117; color:var(--fg); border:1px solid var(--border); border-radius:7px; padding:9px 10px; font-size:14px; }
+  button { width:100%; margin-top:18px; padding:11px; border:0; border-radius:7px; font-size:15px; font-weight:600; color:#fff; background:var(--accent); cursor:pointer; }
+  button:hover { filter:brightness(1.1); } button:disabled { opacity:.5; cursor:default; }
+  button.secondary { background:#21262d; border:1px solid var(--border); }
+  a { color:var(--accent); }
+  .row { display:flex; gap:8px; margin-top:8px; }
+  .row input { flex:1; } .row select { width:130px; } .row button { width:38px; margin:0; padding:0; background:#21262d; border:1px solid var(--border); }
+  .hint { font-size:12px; color:var(--muted); margin-top:10px; }
+  .status { font-size:14px; margin-top:14px; } .status.ok { color:var(--ok); } .status.bad { color:var(--bad); }
+  .spin { display:inline-block; width:13px; height:13px; border:2px solid var(--muted); border-top-color:var(--accent); border-radius:50%; animation:s .8s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes s { to { transform:rotate(360deg); } }
+  .who { color:var(--ok); font-weight:600; }
+  .secret { font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; word-break:break-all; background:#0d1117; border:1px solid var(--border); border-radius:8px; padding:12px; user-select:all; }
+  pre { background:#0d1117; border:1px solid var(--border); border-radius:8px; padding:10px; font-size:12px; overflow-x:auto; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Create a scoped token</h1>
+  <p class="sub">Sign in with GitHub, choose what the token may do, and copy it. The proxy keeps the real GitHub token; you only carry this scoped one.</p>
+
+  <!-- Step 1: sign in -->
+  <div class="step active" id="step-signin">
+    <p class="hint">The first sign-in claims this deployment; afterwards only that GitHub account can sign in.</p>
+    <button id="signinBtn">Sign in with GitHub</button>
+    <p class="status bad" id="signinErr" style="display:none"></p>
+  </div>
+
+  <!-- Step 2: github device login -->
+  <div class="step" id="step-github">
+    <label>Log in to GitHub</label>
+    <div class="code" id="ghCode">····-····</div>
+    <p class="hint">Open <a id="ghLink" target="_blank" rel="noopener">github.com/login/device</a>, enter the code, and authorize.</p>
+    <p class="status"><span class="spin"></span><span id="ghStatus">Waiting for GitHub authorization…</span></p>
+  </div>
+
+  <!-- Step 3: policy -->
+  <div class="step" id="step-policy">
+    <p class="status ok">✓ Signed in as <span class="who" id="whoLogin"></span></p>
+    <label>Token name (optional)</label>
+    <input id="tokName" placeholder="e.g. laptop, ci-bot">
+    <label>Repositories — <span style="text-transform:none">owner/repo</span></label>
+    <div id="repos"></div>
+    <button class="secondary" id="addRepo" type="button" style="margin-top:6px">+ add repo</button>
+    <label>Organizations</label>
+    <div id="orgs"></div>
+    <button class="secondary" id="addOrg" type="button" style="margin-top:6px">+ add org</button>
+    <label style="margin-top:16px"><input type="checkbox" id="allowSearch" style="width:auto;vertical-align:-1px"> allow search</label>
+    <p class="hint">Default is deny; <code>user</code>/<code>meta</code> reads are always granted so <code>gh</code> works. Everything else is blocked unless listed.</p>
+    <button id="createBtn">Create token</button>
+    <p class="status bad" id="createErr" style="display:none"></p>
+  </div>
+
+  <!-- Step 4: the token -->
+  <div class="step" id="step-token">
+    <p class="status ok">✓ Token created — copy it now, it won't be shown again.</p>
+    <div class="secret" id="secret"></div>
+    <button class="secondary" id="copyBtn" type="button">Copy</button>
+    <label>Use it with gh</label>
+    <pre id="usage"></pre>
+    <button id="anotherBtn" type="button">Create another</button>
+  </div>
+
+  <div class="step" id="step-error">
+    <p class="status bad" id="errMsg"></p>
+    <button class="secondary" onclick="location.reload()">Start over</button>
+  </div>
+</div>
+
+<script>
+let grantId = null, pollTimer = null;
+function show(id){ document.querySelectorAll(".step").forEach(s=>s.classList.remove("active")); document.getElementById(id).classList.add("active"); }
+function fail(msg){ document.getElementById("errMsg").textContent = msg; show("step-error"); if(pollTimer) clearInterval(pollTimer); }
+async function postJSON(url, body){
+  const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: body?JSON.stringify(body):"{}"});
+  let j={}; try{ j=await r.json(); }catch(e){}
+  return {ok:r.ok, body:j};
+}
+
+document.getElementById("signinBtn").onclick = async () => {
+  document.getElementById("signinBtn").disabled = true;
+  const {ok, body} = await postJSON("/ui/api/start", null);
+  if(!ok){ const e=document.getElementById("signinErr"); e.style.display="block"; e.textContent=body.error||"Could not start sign-in."; document.getElementById("signinBtn").disabled=false; return; }
+  grantId = body.grant_id;
+  document.getElementById("ghCode").textContent = body.github_user_code || "";
+  const link = document.getElementById("ghLink");
+  link.href = body.github_verification || "https://github.com/login/device";
+  link.textContent = (body.github_verification || "github.com/login/device").replace(/^https?:\/\//,"");
+  show("step-github");
+  pollTimer = setInterval(poll, Math.max((body.interval||5)*1000, 2000)); poll();
+};
+async function poll(){
+  const {body} = await postJSON("/ui/api/poll", {grant_id: grantId});
+  if(body.status === "authenticated"){ clearInterval(pollTimer); document.getElementById("whoLogin").textContent = body.login||""; show("step-policy"); }
+  else if(body.status === "denied"){ fail(body.error || "Not authorized."); }
+  else if(body.status === "error"){ fail(body.error || "Something went wrong."); }
+}
+
+function repoRow(ph){
+  const d=document.createElement("div"); d.className="row";
+  d.innerHTML=`<input placeholder="${ph}"><select><option value="read">read</option><option value="read-write">read-write</option><option value="none">none</option></select><button type="button">×</button>`;
+  d.querySelector("button").onclick=()=>d.remove(); return d;
+}
+document.getElementById("addRepo").onclick=()=>document.getElementById("repos").appendChild(repoRow("owner/repo"));
+document.getElementById("addOrg").onclick =()=>document.getElementById("orgs").appendChild(repoRow("org"));
+document.getElementById("repos").appendChild(repoRow("owner/repo"));
+
+document.getElementById("createBtn").onclick = async () => {
+  const collect = sel => [...document.querySelectorAll(sel+" .row")].map(r=>({name:r.querySelector("input").value.trim(), access:r.querySelector("select").value})).filter(x=>x.name);
+  const unscoped = {user:"read", meta:"read"};
+  if(document.getElementById("allowSearch").checked) unscoped.search="read";
+  const policy = {defaults:{mode:"deny", unscoped}, org:collect("#orgs"), repo:collect("#repos")};
+  document.getElementById("createBtn").disabled = true;
+  const {ok, body} = await postJSON("/ui/api/approve", {grant_id:grantId, name:document.getElementById("tokName").value.trim(), policy});
+  if(!ok || !body.secret){ const e=document.getElementById("createErr"); e.style.display="block"; e.textContent=body.error||"Could not create token."; document.getElementById("createBtn").disabled=false; return; }
+  document.getElementById("secret").textContent = body.secret;
+  const host = location.host;
+  document.getElementById("usage").textContent =
+    "gh auth login --hostname " + host + " --with-token <<< " + body.secret + "\n# or paste it when gh prompts after: gh auth login --hostname " + host;
+  show("step-token");
+};
+document.getElementById("copyBtn").onclick = () => navigator.clipboard.writeText(document.getElementById("secret").textContent);
+document.getElementById("anotherBtn").onclick = () => location.reload();
+</script>
+</body>
+</html>

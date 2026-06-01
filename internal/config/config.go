@@ -55,18 +55,16 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	// Upstream-token resolution order: env var, then github_token in config, then the
-	// token file written by `bgh-proxy login`.
+	// Optional fallback custodian token, resolved env → github_token in config → the file
+	// written by `bgh-proxy login`. It is NOT required: the proxy can start unprovisioned and
+	// be bootstrapped by the first GitHub sign-in (which captures + stores the custodian via
+	// internal/owner). When set, it serves as the custodian until a sign-in claims ownership.
 	if tok := os.Getenv("BGH_GITHUB_TOKEN"); tok != "" {
 		c.GithubToken = tok
 	} else if c.GithubToken == "" {
 		if data, err := os.ReadFile(GithubTokenFilePath()); err == nil {
 			c.GithubToken = strings.TrimSpace(string(data))
 		}
-	}
-
-	if c.GithubToken == "" {
-		return nil, fmt.Errorf("no GitHub token: run `bgh-proxy login`, set BGH_GITHUB_TOKEN, or set github_token in config")
 	}
 
 	if c.AuditLog == "" {

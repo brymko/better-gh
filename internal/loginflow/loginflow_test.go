@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"better-gh/internal/owner"
 	"better-gh/internal/store"
 )
 
@@ -36,15 +37,27 @@ func mockGitHub(t *testing.T, accessToken string) *httptest.Server {
 	return s
 }
 
-func newTestHandler(t *testing.T, innerToken string) (*Handler, *store.Store, *httptest.Server) {
+// newTestHandler builds a loginflow against a mock GitHub. preOwner, if set, pre-claims the
+// deployment for that login so a *different* sign-in can be tested as a non-owner; empty
+// means unclaimed, so the first sign-in claims it (TOFU).
+func newTestHandler(t *testing.T, innerToken, preOwner string) (*Handler, *store.Store, *httptest.Server) {
 	t.Helper()
 	gh := mockGitHub(t, innerToken)
 	st, err := store.Open(t.TempDir() + "/tokens.json")
 	if err != nil {
 		t.Fatal(err)
 	}
+	ow, err := owner.Open(t.TempDir()+"/owner.json", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preOwner != "" {
+		if _, _, err := ow.SignIn(preOwner, "tok-"+preOwner); err != nil {
+			t.Fatal(err)
+		}
+	}
 	h := NewHandler(&Handler{
-		Store: st, UpstreamToken: "tok-alice", OAuthClientID: "x",
+		Store: st, Owner: ow, OAuthClientID: "x",
 		GitHubBaseURL: gh.URL, APIBaseURL: gh.URL, HTTPClient: &http.Client{},
 	})
 	t.Cleanup(h.Stop)
@@ -81,7 +94,7 @@ func postForm(t *testing.T, srv *httptest.Server, path string, form url.Values) 
 // Full device-flow happy path: gh gets a device code, operator authenticates as the custodian
 // owner via GitHub, picks a policy, and gh's access_token poll returns a working bgh_ token.
 func TestDeviceFlow_HappyPath(t *testing.T) {
-	srv, st := newServerOnly(t, "tok-alice")
+	srv, st := newServerOnly(t, "tok-alice", "")
 
 	_, dc := postForm(t, srv, "/login/device/code", url.Values{"client_id": {"x"}, "scope": {"repo"}})
 	deviceCode, _ := dc["device_code"].(string)
@@ -149,7 +162,7 @@ func TestDeviceFlow_HappyPath(t *testing.T) {
 // The identity gate: a GitHub login that is NOT the custodian owner must be denied and must
 // not be able to mint anything.
 func TestIdentityGate_NonOwnerDenied(t *testing.T) {
-	srv, st := newServerOnly(t, "tok-bob") // owner is alice (UpstreamToken tok-alice)
+	srv, st := newServerOnly(t, "tok-bob", "alice") // deployment pre-claimed by alice
 
 	_, dc := postForm(t, srv, "/login/device/code", url.Values{"client_id": {"x"}})
 	userCode := dc["user_code"].(string)
@@ -179,7 +192,7 @@ func TestIdentityGate_NonOwnerDenied(t *testing.T) {
 // Web (browser) flow: authorize page is bound to gh's state; approval returns a redirect with
 // an auth code that gh exchanges for the token.
 func TestWebFlow_HappyPath(t *testing.T) {
-	srv, st := newServerOnly(t, "tok-alice")
+	srv, st := newServerOnly(t, "tok-alice", "")
 
 	// gh opens the authorize page with state + redirect_uri.
 	state := "st123"
@@ -224,8 +237,12 @@ func TestDeviceFlow_VerificationURIUsesExternalURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ow, err := owner.Open(t.TempDir()+"/owner.json", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	h := NewHandler(&Handler{
-		Store: st, UpstreamToken: "tok-alice", OAuthClientID: "x",
+		Store: st, Owner: ow, OAuthClientID: "x",
 		GitHubBaseURL: gh.URL, APIBaseURL: gh.URL, HTTPClient: &http.Client{},
 		ExternalURL: "https://vps.tailnet.ts.net/", // trailing slash should be trimmed
 	})
@@ -243,9 +260,9 @@ func TestDeviceFlow_VerificationURIUsesExternalURL(t *testing.T) {
 	}
 }
 
-func newServerOnly(t *testing.T, innerToken string) (*httptest.Server, *store.Store) {
+func newServerOnly(t *testing.T, innerToken, preOwner string) (*httptest.Server, *store.Store) {
 	t.Helper()
-	_, st, srv := newTestHandler(t, innerToken)
+	_, st, srv := newTestHandler(t, innerToken, preOwner)
 	t.Cleanup(srv.Close)
 	return srv, st
 }

@@ -55,16 +55,22 @@ func TestLoadEnvVarOverridesFile(t *testing.T) {
 	}
 }
 
-func TestLoadMissingTokenReturnsError(t *testing.T) {
+// No upstream token is no longer an error: the proxy can start unprovisioned and be
+// bootstrapped by the first GitHub sign-in (which captures the custodian). Load must succeed
+// with an empty GithubToken.
+func TestLoadMissingTokenIsAllowed(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir) // isolate DefaultDir so no stray github-token file is found
 	cfgPath := filepath.Join(dir, "config.toml")
 	os.WriteFile(cfgPath, []byte(`mode = "socket"`), 0o644)
 
 	t.Setenv("BGH_GITHUB_TOKEN", "")
-	_, err := Load(cfgPath)
-	if err == nil {
-		t.Fatal("expected error for missing github token")
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("missing token should not error now, got %v", err)
+	}
+	if cfg.GithubToken != "" {
+		t.Fatalf("expected empty GithubToken, got %q", cfg.GithubToken)
 	}
 }
 

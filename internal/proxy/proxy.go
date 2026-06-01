@@ -36,7 +36,8 @@ func (m ListenerMode) String() string {
 }
 
 type Handler struct {
-	GithubToken  string
+	GithubToken  string        // static custodian token (fallback / tests)
+	Custodian    func() string // dynamic custodian; overrides GithubToken when set (captured via sign-in)
 	Store        *store.Store
 	Audit        *audit.Logger
 	Client       *http.Client
@@ -45,6 +46,15 @@ type Handler struct {
 	NodeCache    *nodecache.Cache
 	GQLFilter    *gqlfilter.Schema // schema-aware GraphQL response filter (read isolation)
 	UpstreamURL  string            // default "" → "https://api.github.com"
+}
+
+// custodianToken is the GitHub token the proxy forwards with: the dynamic Custodian (the
+// token captured by the owner's sign-in) when set, else the static GithubToken.
+func (h *Handler) custodianToken() string {
+	if h.Custodian != nil {
+		return h.Custodian()
+	}
+	return h.GithubToken
 }
 
 const maxBodySize = 10 << 20 // 10 MB
@@ -466,7 +476,7 @@ func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[stri
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "token "+h.GithubToken)
+	req.Header.Set("Authorization", "token "+h.custodianToken())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("User-Agent", "bgh-proxy/0.1")
@@ -664,7 +674,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set("Authorization", "token "+h.GithubToken)
+	req.Header.Set("Authorization", "token "+h.custodianToken())
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	if req.Header.Get("Accept") == "" {
 		req.Header.Set("Accept", "application/vnd.github+json")
