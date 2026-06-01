@@ -21,6 +21,7 @@ import (
 	"better-gh/internal/auth"
 	"better-gh/internal/config"
 	"better-gh/internal/gqlfilter"
+	"better-gh/internal/loginflow"
 	"better-gh/internal/nodecache"
 	"better-gh/internal/oauth"
 	"better-gh/internal/policy"
@@ -361,6 +362,22 @@ func cmdServe(configPath string) error {
 			GQLFilter:   gqlSchema,
 		}
 
+		// /login/* serves the OAuth identity-provider flow so a client can run the normal
+		// `gh auth login` against the proxy. It mints a scoped proxy token after the operator
+		// proves they own the custodian token via GitHub's device flow. Mounted ahead of the
+		// proxy (the proxy 401s anything without a token; these ARE the token-acquisition
+		// endpoints). Uses a plain client — no policy/redirect rewriting — for github.com.
+		loginHandler := loginflow.NewHandler(&loginflow.Handler{
+			Store:         tokenStore,
+			UpstreamToken: cfg.GithubToken,
+			OAuthClientID: ghCLIClientID,
+			HTTPClient:    &http.Client{Timeout: 30 * time.Second},
+			ExternalURL:   cfg.ExternalURL,
+		})
+		gheMux := http.NewServeMux()
+		gheMux.Handle("/login/", loginHandler)
+		gheMux.Handle("/", gheHandler)
+
 		certs, err := tlsgen.EnsureCerts(cfg.TLSDir)
 		if err != nil {
 			return fmt.Errorf("ensuring TLS certs: %w", err)
@@ -382,14 +399,15 @@ func cmdServe(configPath string) error {
 		}
 
 		fmt.Fprintf(os.Stderr, "bgh-proxy: listening on https://%s\n", cfg.Bind)
-		fmt.Fprintf(os.Stderr, "bgh-proxy: setup gh (GHE mode):\n\n")
+		fmt.Fprintf(os.Stderr, "bgh-proxy: setup gh (GHE mode) — interactive login (mints a scoped token):\n\n")
+		fmt.Fprintf(os.Stderr, "  gh auth login --hostname %s   # then pick a policy in the browser\n\n", cfg.Bind)
+		fmt.Fprintf(os.Stderr, "bgh-proxy: or pre-mint a token and paste it:\n\n")
 		fmt.Fprintf(os.Stderr, "  bgh-proxy token create --name my-client --default deny --org my-company=read\n")
-		fmt.Fprintf(os.Stderr, "  echo <secret> | gh auth login --hostname localhost:%s --with-token\n\n",
-			portFromAddr(cfg.Bind))
+		fmt.Fprintf(os.Stderr, "  echo <secret> | gh auth login --hostname %s --with-token\n\n", cfg.Bind)
 
 		go func() {
 			errCh <- (&http.Server{
-				Handler:      gheHandler,
+				Handler:      gheMux,
 				ReadTimeout:  30 * time.Second,
 				WriteTimeout: 120 * time.Second,
 				IdleTimeout:  120 * time.Second,

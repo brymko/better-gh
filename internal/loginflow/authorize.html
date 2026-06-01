@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bgh-proxy — authorize device</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
+          --accent:#2f81f7; --ok:#3fb950; --bad:#f85149; --code:#1f6feb; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,Segoe UI,Helvetica,Arial,sans-serif; }
+  .card { width:440px; max-width:94vw; background:var(--card); border:1px solid var(--border);
+          border-radius:12px; padding:28px 30px; box-shadow:0 16px 48px rgba(0,0,0,.5); }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 20px; }
+  .step { display:none; }
+  .step.active { display:block; }
+  .code { font:600 26px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:3px;
+          background:#0d1117; border:1px solid var(--border); border-radius:8px; padding:14px;
+          text-align:center; color:#58a6ff; user-select:all; }
+  label { display:block; font-size:12px; color:var(--muted); margin:14px 0 4px; text-transform:uppercase; letter-spacing:.04em; }
+  input, select { width:100%; background:#0d1117; color:var(--fg); border:1px solid var(--border);
+                  border-radius:7px; padding:9px 10px; font-size:14px; }
+  button { width:100%; margin-top:18px; padding:11px; border:0; border-radius:7px; font-size:15px;
+           font-weight:600; color:#fff; background:var(--accent); cursor:pointer; }
+  button:hover { filter:brightness(1.1); }
+  button.secondary { background:#21262d; border:1px solid var(--border); }
+  button:disabled { opacity:.5; cursor:default; }
+  a { color:var(--accent); }
+  .row { display:flex; gap:8px; margin-top:8px; }
+  .row input { flex:1; } .row select { width:130px; } .row button { width:38px; margin:0; padding:0; background:#21262d; border:1px solid var(--border); }
+  .hint { font-size:12px; color:var(--muted); margin-top:10px; }
+  .status { font-size:14px; margin-top:14px; }
+  .status.ok { color:var(--ok); } .status.bad { color:var(--bad); }
+  .spin { display:inline-block; width:13px; height:13px; border:2px solid var(--muted); border-top-color:var(--accent);
+          border-radius:50%; animation:s .8s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes s { to { transform:rotate(360deg); } }
+  .who { color:var(--ok); font-weight:600; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Authorize <code>gh</code> on this proxy</h1>
+  <p class="sub">bgh-proxy will verify you with GitHub, then mint a scoped token for this device.</p>
+
+  <!-- Step 1: confirm device code -->
+  <div class="step active" id="step-code">
+    <label>One-time code from your terminal</label>
+    <div class="code" id="userCode">········</div>
+    <p class="hint">Make sure this matches the code <code>gh</code> printed in your terminal.</p>
+    <button id="beginBtn">Authenticate with GitHub</button>
+  </div>
+
+  <!-- Step 2: github device login -->
+  <div class="step" id="step-github">
+    <label>Step 1 — log in to GitHub</label>
+    <div class="code" id="ghCode">····-····</div>
+    <p class="hint">Open <a id="ghLink" target="_blank" rel="noopener">github.com/login/device</a>,
+       enter the code above, and authorize.</p>
+    <p class="status"><span class="spin"></span><span id="ghStatus">Waiting for GitHub authorization…</span></p>
+  </div>
+
+  <!-- Step 3: choose policy -->
+  <div class="step" id="step-policy">
+    <p class="status ok">✓ Authenticated as <span class="who" id="whoLogin"></span></p>
+    <label>Token name (optional)</label>
+    <input id="tokName" placeholder="e.g. laptop, ci-bot">
+    <label>Repositories — <span style="text-transform:none">owner/repo</span></label>
+    <div id="repos"></div>
+    <button class="secondary" id="addRepo" type="button" style="margin-top:6px">+ add repo</button>
+    <label>Organizations</label>
+    <div id="orgs"></div>
+    <button class="secondary" id="addOrg" type="button" style="margin-top:6px">+ add org</button>
+    <label style="margin-top:16px"><input type="checkbox" id="allowSearch" style="width:auto;vertical-align:-1px"> allow search</label>
+    <p class="hint">Default is deny. <code>user</code> and <code>meta</code> reads are always granted so
+       <code>gh</code> works. Everything else is blocked unless listed above.</p>
+    <button id="approveBtn">Mint token &amp; finish</button>
+    <p class="status bad" id="approveErr" style="display:none"></p>
+  </div>
+
+  <!-- Step 4: done -->
+  <div class="step" id="step-done">
+    <p class="status ok" id="doneMsg">✓ Done — return to your terminal; <code>gh</code> is now authenticated.</p>
+  </div>
+
+  <!-- error -->
+  <div class="step" id="step-error">
+    <p class="status bad" id="errMsg"></p>
+    <button class="secondary" onclick="location.reload()">Start over</button>
+  </div>
+</div>
+
+<script>
+const qs = new URLSearchParams(location.search);
+let ref = { user_code: qs.get("user_code") || "", state: qs.get("state") || "" };
+let grantId = null, pollTimer = null;
+
+function show(id) { document.querySelectorAll(".step").forEach(s => s.classList.remove("active"));
+                    document.getElementById(id).classList.add("active"); }
+function fail(msg) { document.getElementById("errMsg").textContent = msg; show("step-error"); if (pollTimer) clearInterval(pollTimer); }
+async function postJSON(url, body) {
+  const r = await fetch(url, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  let j = {}; try { j = await r.json(); } catch (e) {}
+  return { ok: r.ok, status: r.status, body: j };
+}
+
+// If we already have a user_code (device verification_uri_complete), prefill it; for the web
+// flow there is no user code to confirm, so skip straight to GitHub auth.
+if (ref.user_code) document.getElementById("userCode").textContent = ref.user_code;
+if (ref.state && !ref.user_code) {
+  document.getElementById("step-code").classList.remove("active");
+  begin();
+}
+
+document.getElementById("beginBtn").onclick = begin;
+
+async function begin() {
+  const btn = document.getElementById("beginBtn"); if (btn) btn.disabled = true;
+  const { ok, body } = await postJSON("/login/api/begin", ref);
+  if (!ok) { fail(body.error || "Could not start GitHub login."); return; }
+  grantId = body.grant_id;
+  if (body.github_user_code) {
+    document.getElementById("ghCode").textContent = body.github_user_code;
+    const link = document.getElementById("ghLink");
+    link.href = body.github_verification || "https://github.com/login/device";
+    link.textContent = (body.github_verification || "github.com/login/device").replace(/^https?:\/\//, "");
+  }
+  show("step-github");
+  startPolling((body.interval || 5) * 1000);
+}
+
+function startPolling(ms) {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(poll, Math.max(ms, 2000));
+  poll();
+}
+async function poll() {
+  const { body } = await postJSON("/login/api/poll", { grant_id: grantId });
+  if (body.status === "authenticated") {
+    clearInterval(pollTimer);
+    document.getElementById("whoLogin").textContent = body.login || "";
+    show("step-policy");
+  } else if (body.status === "denied") {
+    fail(body.error || "Authorization denied.");
+  } else if (body.status === "error") {
+    fail(body.error || "Something went wrong.");
+  }
+}
+
+// policy form
+function repoRow(ph) {
+  const d = document.createElement("div"); d.className = "row";
+  d.innerHTML = `<input placeholder="${ph}"><select><option value="read">read</option>
+    <option value="read-write">read-write</option><option value="none">none</option></select>
+    <button type="button">×</button>`;
+  d.querySelector("button").onclick = () => d.remove();
+  return d;
+}
+document.getElementById("addRepo").onclick = () => document.getElementById("repos").appendChild(repoRow("owner/repo"));
+document.getElementById("addOrg").onclick  = () => document.getElementById("orgs").appendChild(repoRow("org"));
+document.getElementById("repos").appendChild(repoRow("owner/repo"));
+
+document.getElementById("approveBtn").onclick = async () => {
+  const collect = (sel) => [...document.querySelectorAll(sel + " .row")].map(r => ({
+    name: r.querySelector("input").value.trim(), access: r.querySelector("select").value,
+  })).filter(x => x.name);
+  const unscoped = { user: "read", meta: "read" };
+  if (document.getElementById("allowSearch").checked) unscoped.search = "read";
+  const policy = { defaults: { mode: "deny", unscoped }, org: collect("#orgs"), repo: collect("#repos") };
+  document.getElementById("approveBtn").disabled = true;
+  const { ok, body } = await postJSON("/login/api/approve",
+    { grant_id: grantId, name: document.getElementById("tokName").value.trim(), policy });
+  if (!ok) {
+    const e = document.getElementById("approveErr"); e.style.display = "block";
+    e.textContent = body.error || "Could not mint token."; document.getElementById("approveBtn").disabled = false;
+    return;
+  }
+  if (body.redirect) { document.getElementById("doneMsg").textContent = "✓ Done — returning to gh…"; show("step-done"); location.href = body.redirect; }
+  else show("step-done");
+};
+</script>
+</body>
+</html>

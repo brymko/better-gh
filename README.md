@@ -88,6 +88,19 @@ access = "read-write"
 
 Listens on HTTPS with a self-signed cert. Each client gets a **proxy token** with its own scoped policy. Clients send the proxy token in the `Authorization` header.
 
+**Interactive login (recommended) — `gh auth login`, no token to copy.** The proxy serves the OAuth endpoints `gh` expects, so the normal browser login works against it:
+
+```bash
+# On the client: trust the proxy's CA (browser must trust it too — see below), then:
+gh auth login --hostname proxy.example.com   # pick "Login with a web browser"
+```
+
+`gh` opens the proxy's **authorize page**. There you prove you're the proxy's operator by logging into GitHub (the proxy drives GitHub's own device flow — *the GitHub login must be the same account that owns the proxy's upstream token*), pick a policy for this token (deny-default + the repos/orgs you want), and approve. The proxy mints a scoped `bgh_` token and hands it straight to `gh` — nothing to copy-paste. Every `gh` command from then on is policy-checked and audited.
+
+> The **browser** (not just `gh`) must trust the proxy's CA, or front the proxy with a real TLS cert (e.g. a domain + Let's Encrypt) — otherwise the authorize page shows a certificate warning. Only the GitHub account that owns the upstream token can authorize, so a stranger who reaches the proxy can't mint anything.
+
+**Or pre-mint a token and paste it** (good for CI bots / headless, or when you don't want the browser step):
+
 ```bash
 # On the proxy host: create a token scoped to one repo
 bgh-proxy token create --name ci-bot --default deny --repo my-org/my-repo=read
@@ -95,7 +108,7 @@ bgh-proxy token create --name ci-bot --default deny --repo my-org/my-repo=read
 
 # On the client: trust the proxy's CA and authenticate
 cp ca.pem /usr/local/share/ca-certificates/bgh.crt && update-ca-certificates  # or add to keychain on macOS
-gh auth login --hostname localhost:7843 --with-token <<< "bgh_xxxxxxxxxxxx"
+gh auth login --hostname proxy.example.com --with-token <<< "bgh_xxxxxxxxxxxx"
 
 # All gh commands now go through the proxy, policy-checked and audited:
 gh pr list -R my-org/my-repo

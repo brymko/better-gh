@@ -187,3 +187,90 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
+
+// DeviceAuth is the result of starting a device flow without blocking on authorization, so
+// a caller (the proxy's login page) can show the user code and poll on its own schedule.
+type DeviceAuth struct {
+	DeviceCode      string
+	UserCode        string
+	VerificationURI string
+	Interval        int
+	ExpiresIn       int
+}
+
+// RequestDeviceCode starts a device flow and returns its codes immediately (the stepwise
+// counterpart to DeviceFlow, which blocks). ClientID is required.
+func RequestDeviceCode(ctx context.Context, cfg Config) (*DeviceAuth, error) {
+	if cfg.ClientID == "" {
+		return nil, fmt.Errorf("no OAuth client id")
+	}
+	base := cfg.BaseURL
+	if base == "" {
+		base = defaultBaseURL
+	}
+	client := cfg.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	dc, err := requestDeviceCode(ctx, client, base, cfg.ClientID, cfg.Scopes)
+	if err != nil {
+		return nil, err
+	}
+	interval := dc.Interval
+	if interval <= 0 {
+		interval = 5
+	}
+	return &DeviceAuth{
+		DeviceCode:      dc.DeviceCode,
+		UserCode:        dc.UserCode,
+		VerificationURI: dc.VerificationURI,
+		Interval:        interval,
+		ExpiresIn:       maxInt(dc.ExpiresIn, 60),
+	}, nil
+}
+
+// PollStatus is the outcome of one device-flow token poll.
+type PollStatus int
+
+const (
+	PollPending PollStatus = iota
+	PollSlowDown
+	PollAuthorized
+	PollDenied
+	PollExpired
+)
+
+// Poll performs ONE access-token poll for an in-progress device flow. On PollAuthorized the
+// token is returned; OAuth-level states map to a PollStatus; transport/decoding faults are
+// returned as err (so the caller can keep polling rather than abort).
+func Poll(ctx context.Context, cfg Config, deviceCode string) (token string, status PollStatus, err error) {
+	base := cfg.BaseURL
+	if base == "" {
+		base = defaultBaseURL
+	}
+	client := cfg.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	tok, err := pollToken(ctx, client, base, cfg.ClientID, deviceCode)
+	if err != nil {
+		return "", PollPending, err
+	}
+	switch tok.Error {
+	case "":
+		if tok.AccessToken == "" {
+			return "", PollPending, fmt.Errorf("authorization succeeded but no access token was returned")
+		}
+		return tok.AccessToken, PollAuthorized, nil
+	case "authorization_pending":
+		return "", PollPending, nil
+	case "slow_down":
+		return "", PollSlowDown, nil
+	case "expired_token":
+		return "", PollExpired, nil
+	case "access_denied":
+		return "", PollDenied, nil
+	default:
+		return "", PollPending, fmt.Errorf("oauth error: %s (%s)", tok.Error, tok.ErrorDesc)
+	}
+}
