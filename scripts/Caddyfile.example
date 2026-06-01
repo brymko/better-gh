@@ -1,0 +1,17 @@
+# Front bgh-proxy with Caddy + automatic Let's Encrypt, so remote `gh` clients trust it with
+# zero setup. Replace proxy.example.com with your domain (A/AAAA record → this host; ports
+# 80 and 443 open). In the proxy config set:  external_url = "https://proxy.example.com"
+#
+# Run:  caddy run --config Caddyfile.example
+#   (Caddy provisions and renews the cert automatically.)
+
+proxy.example.com {
+	# bgh-proxy serves its GHE listener on loopback with a self-signed cert; Caddy terminates
+	# the real (Let's Encrypt) cert and reverse-proxies to it. tls_insecure_skip_verify only
+	# applies to the loopback hop to 127.0.0.1, which is not attacker-reachable.
+	reverse_proxy https://127.0.0.1:7843 {
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
+}
