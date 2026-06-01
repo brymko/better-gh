@@ -42,18 +42,15 @@ gh config set http_unix_socket ~/.config/bgh/proxy.sock
 
 ## Upstream token
 
-The proxy needs exactly one real GitHub token to reach `api.github.com`. Resolution order: `BGH_GITHUB_TOKEN` env → `github_token` in config → the token written by `bgh-proxy login`. Three ways to provide it:
+The proxy uses one real GitHub token to reach `api.github.com` (the **custodian**). You don't have to pre-provide it: the **first GitHub sign-in** (web `/ui` or `gh auth login`) captures that account's token as the custodian and claims the deployment (trust-on-first-use; recorded in `~/.config/bgh/owner.json`, `0600`). After that, only that same account can sign in, and each sign-in refreshes the captured token. This is the easiest path — just start the proxy and sign in.
 
-1. **Reuse an existing token** — `export BGH_GITHUB_TOKEN=$(gh auth token)`. Quickest, but that token is as broad as your `gh` login.
-2. **A fine-grained PAT** — create one at *Settings → Developer settings → Fine-grained tokens*, scoped as narrowly as possible, and set it as `BGH_GITHUB_TOKEN` or `github_token`. **Narrowest option; recommended for anything real.**
-3. **`bgh-proxy login` (device flow)** — works like `gh auth login`, with **no setup**:
-   ```bash
-   bgh-proxy login
-   #   First copy your one-time code: ABCD-1234
-   #   Then open: https://github.com/login/device
-   #   ...authorized. Upstream token stored at ~/.config/bgh/github-token
-   ```
-   By default it uses the GitHub CLI's public OAuth app — nothing to register — and you get the same kind of `gho_` token `gh` would, with the same scopes (`repo read:org gist workflow`). Authorize as whichever account should own the upstream token. To use your **own** OAuth App instead (custom scopes/branding), register one with **Device Flow** enabled and pass `--client-id` (or `BGH_OAUTH_CLIENT_ID` / `oauth_client_id`); override scopes with `--scopes` / `oauth_scopes`. This yields a broad classic OAuth token — fine for the proxy-as-custodian model, though a fine-grained PAT (option 2) is narrower.
+If you'd rather **pre-seed** a custodian (so the proxy can forward before the first sign-in, e.g. for CI), provide one of these — they become the fallback custodian until a sign-in claims ownership:
+
+1. **A fine-grained PAT** — *Settings → Developer settings → Fine-grained tokens*, scoped as narrowly as possible, set as `BGH_GITHUB_TOKEN` or `github_token`. **Narrowest; recommended for high-stakes setups.**
+2. **Reuse an existing token** — `export BGH_GITHUB_TOKEN=$(gh auth token)`. Quickest, but as broad as your `gh` login.
+3. **`bgh-proxy login` (device flow)** — writes a `gho_` token (gh's public app, no registration) to `~/.config/bgh/github-token`.
+
+The captured/sign-in token carries gh's standard scopes (`repo read:org gist workflow`); a pre-seeded fine-grained PAT is narrower. Storage is plaintext (`0600`); encrypted-at-rest is a non-goal.
 
 The token is stored in plaintext (`github-token`, mode `0600`), same as the env/config options — encrypted storage is not implemented. Whichever you choose, the proxy then narrows access per client via policy.
 
@@ -86,18 +83,18 @@ access = "read-write"
 
 ### GHE mode (remote clients, CI bots)
 
-Listens on HTTPS with a self-signed cert. Each client gets a **proxy token** with its own scoped policy. Clients send the proxy token in the `Authorization` header.
+Listens on HTTPS. Each client gets a **proxy token** with its own scoped policy. Clients send the proxy token in the `Authorization` header.
 
-**Interactive login (recommended) — `gh auth login`, no token to copy.** The proxy serves the OAuth endpoints `gh` expects, so the normal browser login works against it:
+**Sign in with GitHub — bootstrap + tokens, nothing to pre-configure.** Signing in with GitHub *is* the setup: the proxy captures your GitHub token as its custodian and hands you scoped tokens. The **first** sign-in claims the deployment (trust-on-first-use); after that, only that same GitHub account may sign in (web *and* CLI).
 
-```bash
-# On the client: trust the proxy's CA (browser must trust it too — see below), then:
-gh auth login --hostname proxy.example.com   # pick "Login with a web browser"
-```
+- **Web — create a token in the browser.** Open `https://proxy.example.com/ui`, click **Sign in with GitHub**, authorize, pick a policy (deny-default + the repos/orgs you want), and copy the `bgh_` token it shows you.
+- **CLI — `gh auth login`, nothing to copy.**
+  ```bash
+  gh auth login --hostname proxy.example.com   # pick "Login with a web browser"
+  ```
+  `gh` opens the proxy's authorize page; you sign in with GitHub and pick a policy, and the scoped token is handed straight to `gh`. Every `gh` command from then on is policy-checked and audited.
 
-`gh` opens the proxy's **authorize page**. There you prove you're the proxy's operator by logging into GitHub (the proxy drives GitHub's own device flow — *the GitHub login must be the same account that owns the proxy's upstream token*), pick a policy for this token (deny-default + the repos/orgs you want), and approve. The proxy mints a scoped `bgh_` token and hands it straight to `gh` — nothing to copy-paste. Every `gh` command from then on is policy-checked and audited.
-
-> The **browser** (not just `gh`) must trust the proxy's CA, or front the proxy with a real TLS cert (e.g. a domain + Let's Encrypt) — otherwise the authorize page shows a certificate warning. Only the GitHub account that owns the upstream token can authorize, so a stranger who reaches the proxy can't mint anything.
+> The first GitHub sign-in claims the deployment and **captures that account's GitHub token as the proxy's custodian** — no `BGH_GITHUB_TOKEN` needed (it's an optional fallback). Sign in immediately after starting, before exposing the proxy, so you claim it first. The **browser** (and `gh`) must trust the proxy's cert — front it with a real cert (Tailscale Serve or Caddy + Let's Encrypt; see [docs/deployment.md](docs/deployment.md)) so remote clients need zero trust setup.
 
 **Or pre-mint a token and paste it** (good for CI bots / headless, or when you don't want the browser step):
 
@@ -487,7 +484,8 @@ policy_file = "~/.config/bgh/policy.toml"
 ├── config.toml        # Server configuration
 ├── policy.toml        # Socket mode policy
 ├── tokens.json        # Proxy token store
-├── github-token       # Upstream token from `bgh-proxy login` (0600)
+├── owner.json         # Deployment owner login + captured custodian token (0600)
+├── github-token       # Fallback upstream token from `bgh-proxy login` (0600)
 ├── admin-secret       # Admin API/UI secret
 ├── audit.jsonl        # Request audit log
 ├── proxy.sock         # Unix socket

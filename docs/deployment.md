@@ -44,8 +44,10 @@ public address from the request — set it to exactly what clients type after `-
 ```bash
 # 1. set external_url to this node's MagicDNS name, e.g.:
 #    external_url = "https://vps.tailnet.ts.net"
-# 2. start the proxy (loopback) with its upstream token:
-BGH_GITHUB_TOKEN=… bgh-proxy serve            # or `bgh-proxy login` first
+# 2. start the proxy (loopback). No token needed — the first GitHub sign-in below
+#    captures the custodian and claims the deployment (TOFU). (Pre-seed BGH_GITHUB_TOKEN
+#    only if the proxy must forward before anyone signs in.)
+bgh-proxy serve
 # 3. front it with a real cert (helper: scripts/serve-behind-tailscale.sh):
 tailscale serve --bg https+insecure://127.0.0.1:7843
 #    serves https://vps.tailnet.ts.net/  → proxies to the loopback proxy
@@ -54,7 +56,11 @@ tailscale serve --bg https+insecure://127.0.0.1:7843
 Tailscale and the proxy on the same host); the cert clients see is the real Let's Encrypt one.
 
 ### On any tailnet client — zero trust setup
+Sign in once (the first sign-in claims the deployment + captures the custodian; afterwards
+only that GitHub account may sign in):
 ```bash
+# Web: open https://vps.tailnet.ts.net/ui → Sign in with GitHub → pick a policy → copy the token
+# CLI:
 gh auth login --hostname vps.tailnet.ts.net   # browser flow; mints a scoped token
 gh pr list -R allowed/repo
 ```
@@ -107,11 +113,12 @@ proxy.example.com {
 ### Run
 ```bash
 # config.toml: external_url = "https://proxy.example.com"
-BGH_GITHUB_TOKEN=… bgh-proxy serve     # loopback proxy
-caddy run --config Caddyfile           # auto-provisions the Let's Encrypt cert
+bgh-proxy serve              # loopback proxy; sign in (below) to bootstrap the custodian
+caddy run --config Caddyfile # auto-provisions the Let's Encrypt cert
 ```
 
 ### Client — zero trust setup
+Open `https://proxy.example.com/ui` to sign in + create a token, or:
 ```bash
 gh auth login --hostname proxy.example.com
 ```

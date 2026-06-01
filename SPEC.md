@@ -37,7 +37,9 @@ The real GitHub token never reaches the client.
 | `internal/auth` | Client/admin secret extraction and generation |
 | `internal/audit` | Async JSONL audit logger |
 | `internal/config`, `internal/tlsgen`, `internal/web` | Config loading, self-signed TLS, admin UI/API |
-| `internal/oauth` | GitHub OAuth device flow for `bgh-proxy login` |
+| `internal/oauth` | GitHub OAuth device flow (`bgh-proxy login` and the sign-in IdP) |
+| `internal/owner` | Deployment owner: TOFU GitHub login + captured custodian token (`owner.json`) |
+| `internal/loginflow` | Sign-in IdP under `/login/*` + `/ui`: GitHub device flow → owner gate → mint scoped token |
 | `internal/gqlfilter` | Schema-aware GraphQL response filter (redacts denied-repo data) |
 | `cmd/bgh-proxy` | CLI: `init`, `login`, `serve`, `token …` |
 
@@ -109,7 +111,7 @@ A node that resolves to a repo-scoped **type** but yields no repository (anomalo
 - **Proxy tokens** (GHE mode): random 256-bit secrets, stored as SHA-256 hashes in `tokens.json` (`0600`), each carrying an embedded policy. Looked up in constant time; revocation and hard-deletion both go through the running server so they take effect immediately. `tokens.json` is written atomically (temp + rename).
 - **Admin secret**: gates the token-minting API/UI; generated once and reused across restarts; file `0600`.
 - **Socket**: created with a restrictive umask so it is `0600` from the moment it exists; only the owning user can connect.
-- **Real GitHub token**: the proxy's single upstream credential, resolved from `BGH_GITHUB_TOKEN`, then `github_token` in config, then the file written by `bgh-proxy login`. Held only on the proxy host, never sent to clients. `bgh-proxy login` runs GitHub's OAuth **device flow** (`internal/oauth`) — by default with the GitHub CLI's public OAuth app client id, so it works with no registration like `gh auth login` (override with `--client-id` for your own app) — and stores the resulting token at `~/.config/bgh/github-token` (`0600`). Storage is plaintext (encrypted-at-rest is a non-goal).
+- **Real GitHub token (custodian)**: the proxy's single upstream credential, held only on the proxy host, never sent to clients. It is normally **captured by the first GitHub sign-in** (web `/ui` or `gh auth login`): the proxy runs GitHub's OAuth **device flow** (`internal/oauth`, the GitHub CLI's public app — no registration), resolves `viewer{login}`, and on the first sign-in records that login as the deployment **owner** and stores the captured token as the custodian (`internal/owner`, `owner.json`, `0600`) — trust-on-first-use. Every later sign-in must be that same owner and refreshes the captured token; a different login is denied. A pre-seeded token (`BGH_GITHUB_TOKEN` → `github_token` → the file written by `bgh-proxy login`) is an optional **fallback** custodian used only until a sign-in claims ownership. Storage is plaintext (encrypted-at-rest is a non-goal).
 
 ## Security properties & threat model
 
