@@ -387,7 +387,7 @@ func gqlUnscopedCategory(doc *ast.QueryDocument) string {
 				return "user"
 			case "search":
 				return "search"
-			case "rateLimit":
+			case "rateLimit", "__schema", "__type", "__typename":
 				return "meta"
 			}
 		}
@@ -487,11 +487,15 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, depth+1, tooComplex)
 					continue
 				}
-			case "organization", "repositoryOwner":
+			case "organization", "repositoryOwner", "user":
+				// owner-navigation roots: organization(login:)/repositoryOwner(login:)/user(login:)
+				// all enumerate one owner's repos/orgs, so scope to that owner. user(login:) is
+				// what `gh org list` uses; without this it was unscoped (denied) and a
+				// user(login:){repositories} read dodged the owner scope.
 				login := resolveStringArg(s.Arguments, "login", vars)
 				if login != "" {
 					add(Scope{Org: login})
-					// Enumerating this owner's own repos is allowed; reaching forks/
+					// Enumerating this owner's own repos/orgs is allowed; reaching forks/
 					// parents in other owners is not.
 					scanCrossRepoNav(s.SelectionSet, fragments, gqlForkNavFields, escapes, depth+1, tooComplex)
 					continue
@@ -513,6 +517,12 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 				add(Scope{UnscopedCategory: "user"})
 				continue
 			case "rateLimit":
+				add(Scope{UnscopedCategory: "meta"})
+				continue
+			case "__schema", "__type", "__typename":
+				// Schema introspection — public GraphQL metadata, no repo/user data. gh runs an
+				// introspection query (e.g. to discover Repository's fields before `gh repo
+				// list`) so classify it as "meta" (which minted tokens always get) not deny.
 				add(Scope{UnscopedCategory: "meta"})
 				continue
 			case "node", "nodes":
