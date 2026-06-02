@@ -26,6 +26,10 @@ type Config struct {
 	BaseURL  string // default https://github.com; overridden in tests
 	Client   *http.Client
 	Out      io.Writer // device-flow instructions are written here (stderr)
+	// OnCode, if set, is called once with the user code and verification URI as soon as the
+	// device code is obtained — before polling begins. The proxy uses it to surface the code
+	// to the operator while DeviceFlow keeps polling for authorization in the background.
+	OnCode func(userCode, verificationURI string)
 }
 
 type deviceCode struct {
@@ -74,6 +78,9 @@ func DeviceFlow(ctx context.Context, cfg Config) (string, error) {
 
 	fmt.Fprintf(out, "\n  First copy your one-time code: %s\n  Then open: %s\n\n  Waiting for authorization...\n",
 		dc.UserCode, dc.VerificationURI)
+	if cfg.OnCode != nil {
+		cfg.OnCode(dc.UserCode, dc.VerificationURI)
+	}
 
 	interval := dc.Interval
 	if interval <= 0 {
@@ -88,33 +95,36 @@ func DeviceFlow(ctx context.Context, cfg Config) (string, error) {
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("device code expired before authorization; run login again")
 		}
-		sleep(time.Duration(interval) * time.Second)
 
+		// Poll first, then wait the interval before the next poll — and never poll faster than
+		// the server-advertised interval (raised on slow_down). Polling faster trips GitHub's
+		// slow_down, which then withholds the token until the caller backs off.
 		tok, err := pollToken(ctx, client, base, cfg.ClientID, dc.DeviceCode)
-		if err != nil {
-			return "", err
-		}
-		switch tok.Error {
-		case "":
-			if tok.AccessToken == "" {
-				return "", fmt.Errorf("authorization succeeded but no access token was returned")
+		if err == nil {
+			switch tok.Error {
+			case "":
+				if tok.AccessToken == "" {
+					return "", fmt.Errorf("authorization succeeded but no access token was returned")
+				}
+				return tok.AccessToken, nil
+			case "authorization_pending":
+				// keep waiting
+			case "slow_down":
+				if tok.Interval > 0 {
+					interval = tok.Interval
+				} else {
+					interval += 5
+				}
+			case "expired_token":
+				return "", fmt.Errorf("device code expired before authorization; run login again")
+			case "access_denied":
+				return "", fmt.Errorf("authorization was denied")
+			default:
+				return "", fmt.Errorf("oauth error: %s (%s)", tok.Error, tok.ErrorDesc)
 			}
-			return tok.AccessToken, nil
-		case "authorization_pending":
-			// keep waiting
-		case "slow_down":
-			if tok.Interval > 0 {
-				interval = tok.Interval
-			} else {
-				interval += 5
-			}
-		case "expired_token":
-			return "", fmt.Errorf("device code expired before authorization; run login again")
-		case "access_denied":
-			return "", fmt.Errorf("authorization was denied")
-		default:
-			return "", fmt.Errorf("oauth error: %s (%s)", tok.Error, tok.ErrorDesc)
 		}
+		// A transient transport/decoding fault is not fatal: keep polling until the deadline.
+		sleep(time.Duration(interval) * time.Second)
 	}
 }
 
@@ -186,91 +196,4 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// DeviceAuth is the result of starting a device flow without blocking on authorization, so
-// a caller (the proxy's login page) can show the user code and poll on its own schedule.
-type DeviceAuth struct {
-	DeviceCode      string
-	UserCode        string
-	VerificationURI string
-	Interval        int
-	ExpiresIn       int
-}
-
-// RequestDeviceCode starts a device flow and returns its codes immediately (the stepwise
-// counterpart to DeviceFlow, which blocks). ClientID is required.
-func RequestDeviceCode(ctx context.Context, cfg Config) (*DeviceAuth, error) {
-	if cfg.ClientID == "" {
-		return nil, fmt.Errorf("no OAuth client id")
-	}
-	base := cfg.BaseURL
-	if base == "" {
-		base = defaultBaseURL
-	}
-	client := cfg.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
-	dc, err := requestDeviceCode(ctx, client, base, cfg.ClientID, cfg.Scopes)
-	if err != nil {
-		return nil, err
-	}
-	interval := dc.Interval
-	if interval <= 0 {
-		interval = 5
-	}
-	return &DeviceAuth{
-		DeviceCode:      dc.DeviceCode,
-		UserCode:        dc.UserCode,
-		VerificationURI: dc.VerificationURI,
-		Interval:        interval,
-		ExpiresIn:       maxInt(dc.ExpiresIn, 60),
-	}, nil
-}
-
-// PollStatus is the outcome of one device-flow token poll.
-type PollStatus int
-
-const (
-	PollPending PollStatus = iota
-	PollSlowDown
-	PollAuthorized
-	PollDenied
-	PollExpired
-)
-
-// Poll performs ONE access-token poll for an in-progress device flow. On PollAuthorized the
-// token is returned; OAuth-level states map to a PollStatus; transport/decoding faults are
-// returned as err (so the caller can keep polling rather than abort).
-func Poll(ctx context.Context, cfg Config, deviceCode string) (token string, status PollStatus, err error) {
-	base := cfg.BaseURL
-	if base == "" {
-		base = defaultBaseURL
-	}
-	client := cfg.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
-	tok, err := pollToken(ctx, client, base, cfg.ClientID, deviceCode)
-	if err != nil {
-		return "", PollPending, err
-	}
-	switch tok.Error {
-	case "":
-		if tok.AccessToken == "" {
-			return "", PollPending, fmt.Errorf("authorization succeeded but no access token was returned")
-		}
-		return tok.AccessToken, PollAuthorized, nil
-	case "authorization_pending":
-		return "", PollPending, nil
-	case "slow_down":
-		return "", PollSlowDown, nil
-	case "expired_token":
-		return "", PollExpired, nil
-	case "access_denied":
-		return "", PollDenied, nil
-	default:
-		return "", PollPending, fmt.Errorf("oauth error: %s (%s)", tok.Error, tok.ErrorDesc)
-	}
 }

@@ -19,6 +19,8 @@
   .code { font:600 26px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:3px;
           background:#0d1117; border:1px solid var(--border); border-radius:8px; padding:14px;
           text-align:center; color:#58a6ff; user-select:all; }
+  input.codeinput { text-align:center; font:600 22px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace;
+                    letter-spacing:4px; text-transform:uppercase; }
   label { display:block; font-size:12px; color:var(--muted); margin:14px 0 4px; text-transform:uppercase; letter-spacing:.04em; }
   input, select { width:100%; background:#0d1117; color:var(--fg); border:1px solid var(--border);
                   border-radius:7px; padding:9px 10px; font-size:14px; }
@@ -47,8 +49,9 @@
   <!-- Step 1: confirm device code -->
   <div class="step active" id="step-code">
     <label>One-time code from your terminal</label>
-    <div class="code" id="userCode">········</div>
-    <p class="hint">Make sure this matches the code <code>gh</code> printed in your terminal.</p>
+    <input id="userCode" class="codeinput" placeholder="XXXX-XXXX" autocomplete="off"
+           autocapitalize="characters" spellcheck="false" inputmode="latin">
+    <p class="hint">Type or paste the code <code>gh</code> printed in your terminal, then continue.</p>
     <button id="beginBtn">Authenticate with GitHub</button>
   </div>
 
@@ -107,7 +110,7 @@ async function postJSON(url, body) {
 
 // If we already have a user_code (device verification_uri_complete), prefill it; for the web
 // flow there is no user code to confirm, so skip straight to GitHub auth.
-if (ref.user_code) document.getElementById("userCode").textContent = ref.user_code;
+if (ref.user_code) document.getElementById("userCode").value = ref.user_code;
 if (ref.state && !ref.user_code) {
   document.getElementById("step-code").classList.remove("active");
   begin();
@@ -117,6 +120,9 @@ document.getElementById("beginBtn").onclick = begin;
 
 async function begin() {
   const btn = document.getElementById("beginBtn"); if (btn) btn.disabled = true;
+  const codeEl = document.getElementById("userCode");
+  if (codeEl && "value" in codeEl) ref.user_code = codeEl.value.trim().toUpperCase();
+  if (!ref.user_code && !ref.state) { fail("Enter the one-time code from your terminal."); return; }
   const { ok, body } = await postJSON("/login/api/begin", ref);
   if (!ok) { fail(body.error || "Could not start GitHub login."); return; }
   grantId = body.grant_id;
@@ -143,8 +149,8 @@ async function poll() {
     show("step-policy");
   } else if (body.status === "denied") {
     fail(body.error || "Authorization denied.");
-  } else if (body.status === "error") {
-    fail(body.error || "Something went wrong.");
+  } else if (body.status === "error" || body.status === "expired") {
+    fail(body.error || "Sign-in expired — start over.");
   }
 }
 

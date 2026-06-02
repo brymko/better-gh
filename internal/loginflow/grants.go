@@ -34,14 +34,15 @@ type grant struct {
 	redirectURI string // web: gh's localhost callback
 	authCode    string // web: code we mint on approval; gh exchanges it at /access_token
 
-	// inner (proxy <-> github), populated when the operator starts GitHub auth
-	ghDeviceCode string
-	ghInterval   int
+	// inner GitHub device flow that authenticates the operator — driven in the background by
+	// runGitHubAuth (which reuses oauth.DeviceFlow); the page only polls this grant's status.
+	started bool // GitHub auth goroutine has been launched
 
-	login     string // verified GitHub login (once authenticated)
-	status    grantStatus
-	secret    string // minted bgh_ token (once approved)
-	expiresAt time.Time
+	login      string // verified GitHub login (once authenticated)
+	status     grantStatus
+	denyReason string // human-readable reason shown to the page when status == statusDenied
+	secret     string // minted bgh_ token (once approved)
+	expiresAt  time.Time
 }
 
 type grantStore struct {

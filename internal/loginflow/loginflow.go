@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -47,8 +48,9 @@ type Handler struct {
 	// verification_uri the proxy hands gh must point at the public URL, not the backend the
 	// front forwards to. Empty → derive from the request Host (correct for direct serving).
 
-	mux    *http.ServeMux
-	grants *grantStore
+	mux      *http.ServeMux
+	grants   *grantStore
+	sessions *sessionStore // owner console sessions (minted after a verified sign-in)
 }
 
 func NewHandler(h *Handler) *Handler {
@@ -67,6 +69,7 @@ func NewHandler(h *Handler) *Handler {
 		h.HTTPClient = http.DefaultClient
 	}
 	h.grants = newGrantStore(grantTTL)
+	h.sessions = newSessionStore(sessionTTL)
 
 	m := http.NewServeMux()
 	m.HandleFunc("POST /login/device/code", h.deviceCode)
@@ -76,16 +79,22 @@ func NewHandler(h *Handler) *Handler {
 	m.HandleFunc("POST /login/api/begin", h.apiBegin)
 	m.HandleFunc("POST /login/api/poll", h.apiPoll)
 	m.HandleFunc("POST /login/api/approve", h.apiApprove)
-	// Standalone web "create a token" page (reuses poll/approve; approve returns the secret).
+	// Owner console: sign in (start/poll), upgrade to a session, then manage tokens.
 	m.HandleFunc("GET /ui", h.uiPageHandler)
 	m.HandleFunc("POST /ui/api/start", h.apiStartStandalone)
 	m.HandleFunc("POST /ui/api/poll", h.apiPoll)
-	m.HandleFunc("POST /ui/api/approve", h.apiApprove)
+	m.HandleFunc("POST /ui/api/session", h.apiSession)
+	m.HandleFunc("GET /ui/api/account", h.apiAccount)
+	m.HandleFunc("GET /ui/api/tokens", h.apiListTokens)
+	m.HandleFunc("POST /ui/api/tokens", h.apiCreateToken)
+	m.HandleFunc("DELETE /ui/api/tokens/{id}", h.apiRevokeToken)
+	m.HandleFunc("POST /ui/api/policy/parse", h.apiParsePolicy)
+	m.HandleFunc("POST /ui/api/logout", h.apiLogout)
 	h.mux = m
 	return h
 }
 
-func (h *Handler) Stop()                                            { h.grants.stop() }
+func (h *Handler) Stop()                                            { h.grants.stop(); h.sessions.stop() }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.ServeHTTP(w, r) }
 
 // --- outer OAuth (gh <-> proxy) ---------------------------------------------------------
@@ -174,25 +183,85 @@ func (h *Handler) uiPageHandler(w http.ResponseWriter, r *http.Request) {
 // tied to a gh OAuth flow) and starts the GitHub device flow to sign the operator in. The
 // minted secret is returned to the browser by apiApprove rather than handed to gh.
 func (h *Handler) apiStartStandalone(w http.ResponseWriter, r *http.Request) {
-	g := &grant{flow: "standalone", status: statusPending}
+	g := &grant{flow: "standalone", status: statusPending, started: true}
 	h.grants.add(g)
-	da, err := oauth.RequestDeviceCode(r.Context(), oauth.Config{
-		ClientID: h.OAuthClientID, Scopes: h.OAuthScopes, BaseURL: h.GitHubBaseURL, Client: h.HTTPClient,
-	})
+	userCode, verification, err := h.runGitHubAuth(g.id)
 	if err != nil {
+		h.grants.remove(g.id)
 		jsonResp(w, http.StatusBadGateway, map[string]string{"error": "could not start GitHub login: " + err.Error()})
 		return
 	}
-	var interval int
-	h.grants.withGrant(byID(g.id), func(g *grant) {
-		g.ghDeviceCode, g.ghInterval = da.DeviceCode, da.Interval
-		interval = g.ghInterval
-	})
 	jsonResp(w, http.StatusOK, map[string]any{
 		"grant_id":            g.id,
-		"github_user_code":    da.UserCode,
-		"github_verification": da.VerificationURI,
-		"interval":            interval,
+		"github_user_code":    userCode,
+		"github_verification": verification,
+	})
+}
+
+// runGitHubAuth starts GitHub's device flow for a grant and returns the user code + verification
+// URI to show the operator. The flow itself runs in a background goroutine that REUSES
+// oauth.DeviceFlow (the same poll loop gh uses, including its interval/slow_down backoff); once
+// GitHub authorizes, it applies the sign-in to the owner store (first sign-in claims the
+// deployment, captures the token as custodian; later sign-ins must be that same owner) and
+// settles the grant's status. The page never drives GitHub's cadence — it just polls our status.
+func (h *Handler) runGitHubAuth(grantID string) (userCode, verification string, err error) {
+	type codeInfo struct{ code, url string }
+	codeCh := make(chan codeInfo, 1)
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), grantTTL)
+
+	go func() {
+		defer cancel()
+		token, ferr := oauth.DeviceFlow(ctx, oauth.Config{
+			ClientID: h.OAuthClientID, Scopes: h.OAuthScopes,
+			BaseURL: h.GitHubBaseURL, Client: h.HTTPClient, Out: io.Discard,
+			OnCode: func(code, url string) { codeCh <- codeInfo{code, url} },
+		})
+		if ferr != nil {
+			select { // surfaced to the caller only if it happened before we got a code
+			case errCh <- ferr:
+			default:
+			}
+			h.denyGrant(grantID, "GitHub authorization failed: "+ferr.Error())
+			return
+		}
+		who, rerr := h.resolveLogin(ctx, token)
+		if rerr != nil {
+			h.denyGrant(grantID, "could not read your GitHub identity")
+			slog.Info("loginflow: could not read GitHub identity", "grant", grantID, "err", rerr)
+			return
+		}
+		if _, ok, serr := h.Owner.SignIn(who, token); serr != nil {
+			h.denyGrant(grantID, "could not record the sign-in")
+			slog.Info("loginflow: could not record sign-in", "grant", grantID, "err", serr)
+			return
+		} else if !ok {
+			h.denyGrant(grantID, fmt.Sprintf("%q is not the owner of this deployment", who))
+			return
+		}
+		h.grants.withGrant(byID(grantID), func(g *grant) {
+			if g.status == statusPending {
+				g.status, g.login = statusAuthenticated, who
+			}
+		})
+	}()
+
+	select {
+	case ci := <-codeCh:
+		return ci.code, ci.url, nil
+	case e := <-errCh:
+		return "", "", e
+	case <-time.After(20 * time.Second):
+		return "", "", fmt.Errorf("timed out starting GitHub device flow")
+	}
+}
+
+// denyGrant settles a still-pending grant as denied with a reason for the page to display.
+func (h *Handler) denyGrant(grantID, reason string) {
+	h.grants.withGrant(byID(grantID), func(g *grant) {
+		if g.status == statusPending {
+			g.status, g.denyReason = statusDenied, reason
+		}
 	})
 }
 
@@ -232,46 +301,41 @@ func (h *Handler) apiBegin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var id, userCode string
-	var started bool
+	var alreadyStarted bool
 	found := h.grants.withGrant(match, func(g *grant) {
-		id, userCode, started = g.id, g.userCode, g.ghDeviceCode != ""
+		id, userCode, alreadyStarted = g.id, g.userCode, g.started
+		if !g.started {
+			g.started = true // claim the start under the lock so concurrent begins don't double-launch
+		}
 	})
 	if !found {
 		jsonResp(w, http.StatusNotFound, map[string]string{"error": "unknown or expired code"})
 		return
 	}
-	if started {
-		// idempotent on page reload: we can't recover GitHub's user_code from the device_code,
-		// so tell the page it's already in progress and to keep polling.
+	if alreadyStarted {
+		// idempotent on page reload: we can't recover GitHub's user_code, so tell the page it's
+		// already in progress and to keep polling.
 		jsonResp(w, http.StatusOK, map[string]any{"grant_id": id, "user_code": userCode, "in_progress": true})
 		return
 	}
 
-	da, err := oauth.RequestDeviceCode(r.Context(), oauth.Config{
-		ClientID: h.OAuthClientID, Scopes: h.OAuthScopes, BaseURL: h.GitHubBaseURL, Client: h.HTTPClient,
-	})
+	ghUserCode, ghVerification, err := h.runGitHubAuth(id)
 	if err != nil {
+		h.grants.withGrant(byID(id), func(g *grant) { g.started = false }) // allow a retry
 		jsonResp(w, http.StatusBadGateway, map[string]string{"error": "could not start GitHub login: " + err.Error()})
 		return
 	}
-	var interval int
-	h.grants.withGrant(byID(id), func(g *grant) {
-		if g.ghDeviceCode == "" {
-			g.ghDeviceCode, g.ghInterval = da.DeviceCode, da.Interval
-		}
-		interval = g.ghInterval
-	})
 	jsonResp(w, http.StatusOK, map[string]any{
 		"grant_id":            id,
 		"user_code":           userCode,
-		"github_user_code":    da.UserCode,
-		"github_verification": da.VerificationURI,
-		"interval":            interval,
+		"github_user_code":    ghUserCode,
+		"github_verification": ghVerification,
 	})
 }
 
-// apiPoll polls the inner GitHub device flow once; on success it verifies the GitHub login is
-// the custodian owner (the identity gate) and marks the grant authenticated or denied.
+// apiPoll reports the current status of a sign-in grant. The GitHub device flow runs in the
+// background (see runGitHubAuth) — this endpoint never talks to GitHub; the page just polls
+// here until the grant settles to authenticated or denied.
 func (h *Handler) apiPoll(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GrantID string `json:"grant_id"`
@@ -279,10 +343,10 @@ func (h *Handler) apiPoll(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
-	var ghDeviceCode, login string
+	var login, denyReason string
 	var st grantStatus
 	found := h.grants.withGrant(byID(req.GrantID), func(g *grant) {
-		ghDeviceCode, st, login = g.ghDeviceCode, g.status, g.login
+		st, login, denyReason = g.status, g.login, g.denyReason
 	})
 	if !found {
 		jsonResp(w, http.StatusNotFound, map[string]string{"status": "expired"})
@@ -291,56 +355,14 @@ func (h *Handler) apiPoll(w http.ResponseWriter, r *http.Request) {
 	switch st {
 	case statusAuthenticated, statusApproved:
 		jsonResp(w, http.StatusOK, map[string]string{"status": "authenticated", "login": login})
-		return
 	case statusDenied:
-		jsonResp(w, http.StatusOK, map[string]string{"status": "denied", "error": "GitHub login is not the proxy's custodian owner"})
-		return
-	}
-	if ghDeviceCode == "" {
-		jsonResp(w, http.StatusOK, map[string]string{"status": "pending"})
-		return
-	}
-
-	tok, status, err := oauth.Poll(r.Context(), oauth.Config{
-		ClientID: h.OAuthClientID, BaseURL: h.GitHubBaseURL, Client: h.HTTPClient,
-	}, ghDeviceCode)
-	if err != nil {
-		jsonResp(w, http.StatusOK, map[string]string{"status": "pending"}) // transient; keep polling
-		return
-	}
-	switch status {
-	case oauth.PollPending, oauth.PollSlowDown:
-		jsonResp(w, http.StatusOK, map[string]string{"status": "pending"})
-		return
-	case oauth.PollDenied, oauth.PollExpired:
-		h.grants.withGrant(byID(req.GrantID), func(g *grant) { g.status = statusDenied })
-		jsonResp(w, http.StatusOK, map[string]string{"status": "denied", "error": "GitHub authorization was declined or expired"})
-		return
-	}
-
-	// Authorized by GitHub. Resolve the login and apply it as a deployment sign-in: the first
-	// sign-in claims the deployment (TOFU) and captures this token as the custodian; later
-	// sign-ins must be that same owner and refresh the custodian. A different login is denied.
-	who, err := h.resolveLogin(r.Context(), tok)
-	if err != nil {
-		jsonResp(w, http.StatusBadGateway, map[string]string{"status": "error", "error": "could not read GitHub identity"})
-		return
-	}
-	if _, ok, err := h.Owner.SignIn(who, tok); err != nil {
-		jsonResp(w, http.StatusBadGateway, map[string]string{"status": "error", "error": "could not record sign-in"})
-		return
-	} else if !ok {
-		h.grants.withGrant(byID(req.GrantID), func(g *grant) { g.status = statusDenied })
-		jsonResp(w, http.StatusOK, map[string]string{"status": "denied",
-			"error": fmt.Sprintf("%q is not the owner of this deployment", who)})
-		return
-	}
-	h.grants.withGrant(byID(req.GrantID), func(g *grant) {
-		if g.status == statusPending {
-			g.status, g.login = statusAuthenticated, who
+		if denyReason == "" {
+			denyReason = "GitHub login is not the owner of this deployment"
 		}
-	})
-	jsonResp(w, http.StatusOK, map[string]string{"status": "authenticated", "login": who})
+		jsonResp(w, http.StatusOK, map[string]string{"status": "denied", "error": denyReason})
+	default:
+		jsonResp(w, http.StatusOK, map[string]string{"status": "pending"})
+	}
 }
 
 type approveReq struct {
@@ -401,12 +423,6 @@ func (h *Handler) apiApprove(w http.ResponseWriter, r *http.Request) {
 			"status":   "approved",
 			"redirect": redirectURI + sep + "code=" + authCode + "&state=" + state,
 		})
-		return
-	}
-	if flow == "standalone" {
-		// Web "create a token" page: hand the secret straight to the browser to copy (there is
-		// no gh client polling /access_token for it).
-		jsonResp(w, http.StatusOK, map[string]string{"status": "approved", "secret": secret})
 		return
 	}
 	jsonResp(w, http.StatusOK, map[string]string{"status": "approved"})

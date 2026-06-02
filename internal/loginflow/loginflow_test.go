@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"better-gh/internal/owner"
 	"better-gh/internal/store"
@@ -31,6 +32,15 @@ func mockGitHub(t *testing.T, accessToken string) *httptest.Server {
 		login := strings.TrimPrefix(tok, "tok-")
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"data":{"viewer":{"login":"`+login+`"}}}`)
+	})
+	// For the console's account prefetch (fetched with the captured custodian token).
+	m.HandleFunc("/user/repos", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `[{"full_name":"alice/app","private":false},{"full_name":"alice/secret","private":true}]`)
+	})
+	m.HandleFunc("/user/orgs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `[{"login":"alice-org"}]`)
 	})
 	s := httptest.NewServer(m)
 	t.Cleanup(s.Close)
@@ -91,6 +101,22 @@ func postForm(t *testing.T, srv *httptest.Server, path string, form url.Values) 
 	return resp.StatusCode, out
 }
 
+// waitStatus polls a grant-status endpoint until the sign-in settles (status != "pending") or
+// times out. The sign-in runs in a background goroutine (runGitHubAuth drives GitHub's device
+// flow), so callers wait for the result exactly as the real page does.
+func waitStatus(t *testing.T, srv *httptest.Server, path, grantID string) map[string]any {
+	t.Helper()
+	for i := 0; i < 250; i++ {
+		_, p := post(t, srv, path, map[string]string{"grant_id": grantID})
+		if p["status"] != "pending" {
+			return p
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("grant %q did not settle (still pending)", grantID)
+	return nil
+}
+
 // Full device-flow happy path: gh gets a device code, operator authenticates as the custodian
 // owner via GitHub, picks a policy, and gh's access_token poll returns a working bgh_ token.
 func TestDeviceFlow_HappyPath(t *testing.T) {
@@ -116,8 +142,8 @@ func TestDeviceFlow_HappyPath(t *testing.T) {
 		t.Fatalf("begin missing grant_id/github_user_code: %v", b)
 	}
 
-	// Poll: GitHub returns tok-alice == owner -> authenticated.
-	_, p := post(t, srv, "/login/api/poll", map[string]string{"grant_id": grantID})
+	// Poll (background goroutine drives GitHub): tok-alice == owner -> authenticated.
+	p := waitStatus(t, srv, "/login/api/poll", grantID)
 	if p["status"] != "authenticated" || p["login"] != "alice" {
 		t.Fatalf("expected authenticated as alice, got %v", p)
 	}
@@ -169,7 +195,7 @@ func TestIdentityGate_NonOwnerDenied(t *testing.T) {
 	_, b := post(t, srv, "/login/api/begin", map[string]string{"user_code": userCode})
 	grantID := b["grant_id"].(string)
 
-	_, p := post(t, srv, "/login/api/poll", map[string]string{"grant_id": grantID})
+	p := waitStatus(t, srv, "/login/api/poll", grantID)
 	if p["status"] != "denied" {
 		t.Fatalf("non-owner must be denied, got %v", p)
 	}
@@ -208,7 +234,9 @@ func TestWebFlow_HappyPath(t *testing.T) {
 
 	_, b := post(t, srv, "/login/api/begin", map[string]string{"state": state})
 	grantID := b["grant_id"].(string)
-	post(t, srv, "/login/api/poll", map[string]string{"grant_id": grantID})
+	if p := waitStatus(t, srv, "/login/api/poll", grantID); p["status"] != "authenticated" {
+		t.Fatalf("expected authenticated, got %v", p)
+	}
 
 	pol := map[string]any{"defaults": map[string]any{"mode": "deny"}}
 	_, ap := post(t, srv, "/login/api/approve", map[string]any{"grant_id": grantID, "policy": pol})

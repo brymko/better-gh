@@ -3,144 +3,361 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bgh-proxy — create a token</title>
+<title>bgh-proxy — owner console</title>
 <style>
   :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
           --accent:#2f81f7; --ok:#3fb950; --bad:#f85149; }
   * { box-sizing: border-box; }
-  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
-         background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,Segoe UI,Helvetica,Arial,sans-serif; }
-  .card { width:480px; max-width:94vw; background:var(--card); border:1px solid var(--border);
-          border-radius:12px; padding:28px 30px; box-shadow:0 16px 48px rgba(0,0,0,.5); }
-  h1 { font-size:18px; margin:0 0 4px; }
-  .sub { color:var(--muted); font-size:13px; margin:0 0 20px; }
+  body { margin:0; min-height:100vh; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system,Segoe UI,Helvetica,Arial,sans-serif; }
+  .wrap { max-width:1120px; margin:0 auto; padding:26px 20px 64px; }
+  .center { min-height:100vh; display:flex; align-items:center; justify-content:center; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:22px 24px; margin-bottom:18px; box-shadow:0 8px 28px rgba(0,0,0,.35); }
+  .signin-card { width:460px; max-width:94vw; }
+  .cols { display:grid; grid-template-columns:minmax(0,440px) 1fr; gap:20px; align-items:start; }
+  @media (max-width:920px){ .cols { grid-template-columns:1fr; } }
+  h1 { font-size:18px; margin:0 0 4px; } h2 { font-size:15px; margin:0 0 12px; }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 18px; }
   .step { display:none; } .step.active { display:block; }
+  .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
+  .topbar .who { color:var(--muted); font-size:13px; } .topbar .who b { color:var(--ok); }
   .code { font:600 26px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:3px;
           background:#0d1117; border:1px solid var(--border); border-radius:8px; padding:14px; text-align:center; color:#58a6ff; user-select:all; }
   label { display:block; font-size:12px; color:var(--muted); margin:14px 0 4px; text-transform:uppercase; letter-spacing:.04em; }
-  input, select { width:100%; background:#0d1117; color:var(--fg); border:1px solid var(--border); border-radius:7px; padding:9px 10px; font-size:14px; }
-  button { width:100%; margin-top:18px; padding:11px; border:0; border-radius:7px; font-size:15px; font-weight:600; color:#fff; background:var(--accent); cursor:pointer; }
+  input, select, textarea { width:100%; background:#0d1117; color:var(--fg); border:1px solid var(--border); border-radius:7px; padding:9px 10px; font-size:14px; font-family:inherit; }
+  textarea { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; min-height:300px; resize:vertical; white-space:pre; }
+  button { padding:9px 14px; border:0; border-radius:7px; font-size:14px; font-weight:600; color:#fff; background:var(--accent); cursor:pointer; }
   button:hover { filter:brightness(1.1); } button:disabled { opacity:.5; cursor:default; }
-  button.secondary { background:#21262d; border:1px solid var(--border); }
+  button.secondary { background:#21262d; border:1px solid var(--border); color:var(--fg); }
+  button.danger { background:#21262d; border:1px solid var(--border); color:var(--bad); }
+  button.wide { width:100%; margin-top:16px; padding:11px; }
   a { color:var(--accent); }
-  .row { display:flex; gap:8px; margin-top:8px; }
-  .row input { flex:1; } .row select { width:130px; } .row button { width:38px; margin:0; padding:0; background:#21262d; border:1px solid var(--border); }
-  .hint { font-size:12px; color:var(--muted); margin-top:10px; }
-  .status { font-size:14px; margin-top:14px; } .status.ok { color:var(--ok); } .status.bad { color:var(--bad); }
+  .row { display:flex; gap:8px; margin-top:8px; align-items:center; }
+  .row input { flex:1; } .row select { width:140px; flex:none; } .row button { background:#21262d; border:1px solid var(--border); color:var(--muted); padding:8px 11px; }
+  .hint { font-size:12px; color:var(--muted); margin-top:8px; }
+  .status { font-size:14px; margin-top:12px; } .status.ok { color:var(--ok); } .status.bad { color:var(--bad); }
   .spin { display:inline-block; width:13px; height:13px; border:2px solid var(--muted); border-top-color:var(--accent); border-radius:50%; animation:s .8s linear infinite; vertical-align:-2px; margin-right:6px; }
   @keyframes s { to { transform:rotate(360deg); } }
-  .who { color:var(--ok); font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:6px 8px; border-bottom:1px solid var(--border); }
+  td { padding:9px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+  td.pol { color:var(--muted); font:12px/1.4 ui-monospace,Menlo,monospace; max-width:320px; }
+  .tag { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid var(--border); }
+  .tag.live { color:var(--ok); border-color:#1f6f3f; } .tag.revoked { color:var(--bad); border-color:#5c2626; }
+  .tabs { display:flex; gap:6px; margin:6px 0 4px; }
+  .tabs button { background:transparent; border:1px solid transparent; color:var(--muted); padding:6px 12px; font-weight:500; }
+  .tabs button.on { color:var(--fg); border-color:var(--border); background:#0d1117; }
+  .panel { display:none; } .panel.on { display:block; }
   .secret { font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; word-break:break-all; background:#0d1117; border:1px solid var(--border); border-radius:8px; padding:12px; user-select:all; }
   pre { background:#0d1117; border:1px solid var(--border); border-radius:8px; padding:10px; font-size:12px; overflow-x:auto; }
+  .muted { color:var(--muted); }
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>Create a scoped token</h1>
-  <p class="sub">Sign in with GitHub, choose what the token may do, and copy it. The proxy keeps the real GitHub token; you only carry this scoped one.</p>
+<div class="wrap">
 
-  <!-- Step 1: sign in -->
-  <div class="step active" id="step-signin">
-    <p class="hint">The first sign-in claims this deployment; afterwards only that GitHub account can sign in.</p>
-    <button id="signinBtn">Sign in with GitHub</button>
-    <p class="status bad" id="signinErr" style="display:none"></p>
+  <!-- sign in -->
+  <div class="center step active" id="step-signin">
+    <div class="card signin-card">
+      <h1>bgh-proxy console</h1>
+      <p class="sub">Sign in with GitHub to manage scoped tokens for this deployment.</p>
+      <p class="hint">The first sign-in claims this deployment; afterwards only that GitHub account can sign in.</p>
+      <button class="wide" id="signinBtn">Sign in with GitHub</button>
+      <p class="status bad" id="signinErr" style="display:none"></p>
+    </div>
   </div>
 
-  <!-- Step 2: github device login -->
-  <div class="step" id="step-github">
-    <label>Log in to GitHub</label>
-    <div class="code" id="ghCode">····-····</div>
-    <p class="hint">Open <a id="ghLink" target="_blank" rel="noopener">github.com/login/device</a>, enter the code, and authorize.</p>
-    <p class="status"><span class="spin"></span><span id="ghStatus">Waiting for GitHub authorization…</span></p>
+  <!-- github device code -->
+  <div class="center step" id="step-github">
+    <div class="card signin-card">
+      <label>Log in to GitHub</label>
+      <div class="code" id="ghCode">····-····</div>
+      <p class="hint">Open <a id="ghLink" target="_blank" rel="noopener">github.com/login/device</a>, enter the code, and authorize.</p>
+      <p class="status"><span class="spin"></span><span id="ghStatus">Waiting for GitHub authorization…</span></p>
+    </div>
   </div>
 
-  <!-- Step 3: policy -->
-  <div class="step" id="step-policy">
-    <p class="status ok">✓ Signed in as <span class="who" id="whoLogin"></span></p>
-    <label>Token name (optional)</label>
-    <input id="tokName" placeholder="e.g. laptop, ci-bot">
-    <label>Repositories — <span style="text-transform:none">owner/repo</span></label>
-    <div id="repos"></div>
-    <button class="secondary" id="addRepo" type="button" style="margin-top:6px">+ add repo</button>
-    <label>Organizations</label>
-    <div id="orgs"></div>
-    <button class="secondary" id="addOrg" type="button" style="margin-top:6px">+ add org</button>
-    <label style="margin-top:16px"><input type="checkbox" id="allowSearch" style="width:auto;vertical-align:-1px"> allow search</label>
-    <p class="hint">Default is deny; <code>user</code>/<code>meta</code> reads are always granted so <code>gh</code> works. Everything else is blocked unless listed.</p>
-    <button id="createBtn">Create token</button>
-    <p class="status bad" id="createErr" style="display:none"></p>
+  <!-- console -->
+  <div class="step" id="console">
+    <div class="topbar">
+      <h1 style="margin:0">Scoped tokens</h1>
+      <span class="who">Signed in as <b id="whoami"></b> · <a href="#" id="signoutBtn">sign out</a></span>
+    </div>
+
+    <div class="cols">
+      <!-- create / edit -->
+      <div class="card" id="createCard">
+        <h2 id="createTitle">Create a token</h2>
+        <p class="hint" id="editNote" style="display:none">Editing re-issues: a new secret is minted and the old token is revoked.</p>
+        <label>Token name (optional)</label>
+        <input id="tokName" placeholder="e.g. laptop, ci-bot">
+
+        <div class="tabs">
+          <button id="tabBuilder" class="on" type="button">Builder</button>
+          <button id="tabToml" type="button">TOML</button>
+        </div>
+
+        <div class="panel on" id="panelBuilder">
+          <p class="hint">Default <b>deny</b>; <code>user</code>/<code>meta</code> always granted so <code>gh</code> works. <code>gh repo list</code> needs an <b>org</b> entry (your account counts).</p>
+          <label>Repositories</label>
+          <div id="repos"></div>
+          <button class="secondary" id="addRepo" type="button" style="margin-top:8px">+ add repo</button>
+          <label>Organizations / owners</label>
+          <div id="orgs"></div>
+          <button class="secondary" id="addOrg" type="button" style="margin-top:8px">+ add org</button>
+          <label style="margin-top:16px"><input type="checkbox" id="allowSearch" style="width:auto;vertical-align:-1px"> allow search</label>
+        </div>
+
+        <div class="panel" id="panelToml">
+          <p class="hint">Full policy in TOML (same shape as <code>policy.toml</code>). Switching tabs converts both ways. <code>user</code>/<code>meta</code> are raised to <code>read</code>.</p>
+          <textarea id="tomlSpec" spellcheck="false"></textarea>
+        </div>
+
+        <button class="wide" id="createBtn">Create token</button>
+        <button class="secondary" id="cancelEdit" type="button" style="display:none; width:100%; margin-top:8px">Cancel edit</button>
+        <p class="status bad" id="createErr" style="display:none"></p>
+      </div>
+
+      <!-- tokens -->
+      <div class="card">
+        <h2>Your tokens</h2>
+        <table id="tokensTable" style="display:none">
+          <thead><tr><th>Name</th><th>Policy</th><th>Last used</th><th>Status</th><th></th></tr></thead>
+          <tbody id="tokensBody"></tbody>
+        </table>
+        <p class="muted" id="tokensEmpty">No tokens yet — create one on the left.</p>
+      </div>
+    </div>
   </div>
 
-  <!-- Step 4: the token -->
-  <div class="step" id="step-token">
-    <p class="status ok">✓ Token created — copy it now, it won't be shown again.</p>
-    <div class="secret" id="secret"></div>
-    <button class="secondary" id="copyBtn" type="button">Copy</button>
-    <label>Use it with gh</label>
-    <pre id="usage"></pre>
-    <button id="anotherBtn" type="button">Create another</button>
+  <!-- secret -->
+  <div class="center step" id="step-secret">
+    <div class="card signin-card">
+      <p class="status ok">✓ Token created — copy it now, it won't be shown again.</p>
+      <div class="secret" id="secret"></div>
+      <div class="row" style="margin-top:10px"><button class="secondary" id="copyBtn" type="button">Copy</button></div>
+      <label>Use it with gh</label>
+      <pre id="usage"></pre>
+      <button class="wide" id="backBtn" type="button">Back to console</button>
+    </div>
   </div>
 
-  <div class="step" id="step-error">
-    <p class="status bad" id="errMsg"></p>
-    <button class="secondary" onclick="location.reload()">Start over</button>
+  <div class="center step" id="step-error">
+    <div class="card signin-card">
+      <p class="status bad" id="errMsg"></p>
+      <button class="wide secondary" onclick="location.reload()">Reload</button>
+    </div>
   </div>
+
+  <datalist id="dlRepos"></datalist>
+  <datalist id="dlOrgs"></datalist>
 </div>
 
 <script>
-let grantId = null, pollTimer = null;
+let grantId = null, pollTimer = null, account = { repos: [], orgs: [] }, editId = null;
+
 function show(id){ document.querySelectorAll(".step").forEach(s=>s.classList.remove("active")); document.getElementById(id).classList.add("active"); }
 function fail(msg){ document.getElementById("errMsg").textContent = msg; show("step-error"); if(pollTimer) clearInterval(pollTimer); }
-async function postJSON(url, body){
-  const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: body?JSON.stringify(body):"{}"});
-  let j={}; try{ j=await r.json(); }catch(e){}
-  return {ok:r.ok, body:j};
+function $(id){ return document.getElementById(id); }
+async function api(method, url, body){
+  const opt = { method, headers:{} };
+  if(body !== undefined){ opt.headers["Content-Type"]="application/json"; opt.body=JSON.stringify(body); }
+  const r = await fetch(url, opt);
+  let j=null; try{ j=await r.json(); }catch(e){}
+  return { ok:r.ok, status:r.status, body:j };
 }
 
-document.getElementById("signinBtn").onclick = async () => {
-  document.getElementById("signinBtn").disabled = true;
-  const {ok, body} = await postJSON("/ui/api/start", null);
-  if(!ok){ const e=document.getElementById("signinErr"); e.style.display="block"; e.textContent=body.error||"Could not start sign-in."; document.getElementById("signinBtn").disabled=false; return; }
-  grantId = body.grant_id;
-  document.getElementById("ghCode").textContent = body.github_user_code || "";
-  const link = document.getElementById("ghLink");
-  link.href = body.github_verification || "https://github.com/login/device";
-  link.textContent = (body.github_verification || "github.com/login/device").replace(/^https?:\/\//,"");
+// On load: if a session cookie is still valid, jump straight to the console.
+(async function init(){ const r = await api("GET", "/ui/api/tokens"); if(r.ok) loadConsole(); })();
+
+// ---- sign in ----
+$("signinBtn").onclick = async () => {
+  $("signinBtn").disabled = true;
+  const r = await api("POST", "/ui/api/start", {});
+  if(!r.ok){ const e=$("signinErr"); e.style.display="block"; e.textContent=(r.body&&r.body.error)||"Could not start sign-in."; $("signinBtn").disabled=false; return; }
+  grantId = r.body.grant_id;
+  $("ghCode").textContent = r.body.github_user_code || "";
+  const link = $("ghLink");
+  link.href = r.body.github_verification || "https://github.com/login/device";
+  link.textContent = (r.body.github_verification || "github.com/login/device").replace(/^https?:\/\//,"");
   show("step-github");
-  pollTimer = setInterval(poll, Math.max((body.interval||5)*1000, 2000)); poll();
+  pollTimer = setInterval(poll, 2500); poll();
 };
 async function poll(){
-  const {body} = await postJSON("/ui/api/poll", {grant_id: grantId});
-  if(body.status === "authenticated"){ clearInterval(pollTimer); document.getElementById("whoLogin").textContent = body.login||""; show("step-policy"); }
-  else if(body.status === "denied"){ fail(body.error || "Not authorized."); }
-  else if(body.status === "error"){ fail(body.error || "Something went wrong."); }
+  const r = await api("POST", "/ui/api/poll", { grant_id: grantId });
+  const b = r.body || {};
+  if(b.status === "authenticated"){
+    clearInterval(pollTimer);
+    const s = await api("POST", "/ui/api/session", { grant_id: grantId });
+    if(!s.ok){ fail((s.body&&s.body.error)||"Could not start session."); return; }
+    loadConsole();
+  } else if(b.status === "denied"){ fail(b.error || "Not authorized."); }
+  else if(b.status === "error" || b.status === "expired"){ fail(b.error || "Sign-in expired — start over."); }
 }
 
-function repoRow(ph){
-  const d=document.createElement("div"); d.className="row";
-  d.innerHTML=`<input placeholder="${ph}"><select><option value="read">read</option><option value="read-write">read-write</option><option value="none">none</option></select><button type="button">×</button>`;
-  d.querySelector("button").onclick=()=>d.remove(); return d;
+// ---- console ----
+async function loadConsole(){
+  show("console");
+  const [acc, toks] = await Promise.all([ api("GET","/ui/api/account"), api("GET","/ui/api/tokens") ]);
+  if(acc.ok){
+    account = acc.body;
+    $("whoami").textContent = account.login || "";
+    fillDatalist("dlRepos", (account.repos||[]).map(r=>r.name));
+    fillDatalist("dlOrgs", account.orgs||[]);
+  }
+  if(toks.ok) renderTokens(toks.body||[]);
+  if(!document.querySelector("#repos .row")) addRepoRow();
+  if(!document.querySelector("#orgs .row")) addOrgRow();
 }
-document.getElementById("addRepo").onclick=()=>document.getElementById("repos").appendChild(repoRow("owner/repo"));
-document.getElementById("addOrg").onclick =()=>document.getElementById("orgs").appendChild(repoRow("org"));
-document.getElementById("repos").appendChild(repoRow("owner/repo"));
+async function refreshTokens(){ const x = await api("GET","/ui/api/tokens"); if(x.ok) renderTokens(x.body||[]); }
+function fillDatalist(id, items){ const dl=$(id); dl.innerHTML=""; items.forEach(v=>{ const o=document.createElement("option"); o.value=v; dl.appendChild(o); }); }
+function policySummary(p){
+  p = p || {}; const d = p.defaults || {}; const parts = ["default "+(d.mode||"deny")];
+  (p.repo||[]).forEach(r=>parts.push(r.name+"="+r.access));
+  (p.org||[]).forEach(o=>parts.push("org:"+o.name+"="+o.access));
+  if(d.unscoped && d.unscoped.search) parts.push("search");
+  return parts.join(" · ");
+}
+function renderTokens(list){
+  const body = $("tokensBody"); body.innerHTML = "";
+  $("tokensTable").style.display = list.length ? "" : "none";
+  $("tokensEmpty").style.display = list.length ? "none" : "";
+  list.forEach(t => {
+    const tr = document.createElement("tr");
+    const lu = t.last_used ? new Date(t.last_used).toLocaleString() : "never";
+    tr.innerHTML = `<td>${esc(t.name)}</td><td class="pol">${esc(policySummary(t.policy))}</td>`+
+      `<td class="muted">${lu}</td>`+
+      `<td>${t.revoked?'<span class="tag revoked">revoked</span>':'<span class="tag live">live</span>'}</td>`+
+      `<td style="white-space:nowrap"></td>`;
+    const actions = tr.lastChild;
+    if(!t.revoked){
+      const edit = document.createElement("button"); edit.className="secondary"; edit.textContent="Edit"; edit.style.padding="5px 10px"; edit.onclick=()=>startEdit(t);
+      const rev = document.createElement("button"); rev.className="danger"; rev.textContent="Revoke"; rev.style.cssText="padding:5px 10px;margin-left:6px"; rev.onclick=()=>revoke(t);
+      actions.append(edit, rev);
+    }
+    body.appendChild(tr);
+  });
+}
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
 
-document.getElementById("createBtn").onclick = async () => {
-  const collect = sel => [...document.querySelectorAll(sel+" .row")].map(r=>({name:r.querySelector("input").value.trim(), access:r.querySelector("select").value})).filter(x=>x.name);
-  const unscoped = {user:"read", meta:"read"};
-  if(document.getElementById("allowSearch").checked) unscoped.search="read";
-  const policy = {defaults:{mode:"deny", unscoped}, org:collect("#orgs"), repo:collect("#repos")};
-  document.getElementById("createBtn").disabled = true;
-  const {ok, body} = await postJSON("/ui/api/approve", {grant_id:grantId, name:document.getElementById("tokName").value.trim(), policy});
-  if(!ok || !body.secret){ const e=document.getElementById("createErr"); e.style.display="block"; e.textContent=body.error||"Could not create token."; document.getElementById("createBtn").disabled=false; return; }
-  document.getElementById("secret").textContent = body.secret;
-  const host = location.host;
-  document.getElementById("usage").textContent =
-    "gh auth login --hostname " + host + " --with-token <<< " + body.secret + "\n# or paste it when gh prompts after: gh auth login --hostname " + host;
-  show("step-token");
+async function revoke(t){
+  if(!confirm(`Revoke token "${t.name}"? Any client using it stops working immediately.`)) return;
+  const r = await api("DELETE", "/ui/api/tokens/"+encodeURIComponent(t.id));
+  if(r.ok) refreshTokens(); else alert((r.body&&r.body.error)||"Could not revoke.");
+}
+
+// ---- builder rows ----
+function picker(listId, ph){
+  const d = document.createElement("div"); d.className="row";
+  d.innerHTML = `<input list="${listId}" placeholder="${ph}" autocomplete="off">`+
+    `<select><option value="read">read</option><option value="read-write">read-write</option><option value="none">none</option></select>`+
+    `<button type="button" title="remove">×</button>`;
+  d.querySelector("button").onclick = () => d.remove();
+  return d;
+}
+function addRepoRow(name, access){ const d=picker("dlRepos","owner/repo"); if(name)d.querySelector("input").value=name; if(access)d.querySelector("select").value=access; $("repos").appendChild(d); return d; }
+function addOrgRow(name, access){ const d=picker("dlOrgs","org or your username"); if(name)d.querySelector("input").value=name; if(access)d.querySelector("select").value=access; $("orgs").appendChild(d); return d; }
+$("addRepo").onclick = () => addRepoRow();
+$("addOrg").onclick = () => addOrgRow();
+function collect(sel){ return [...document.querySelectorAll(sel+" .row")].map(r=>({name:r.querySelector("input").value.trim(), access:r.querySelector("select").value})).filter(x=>x.name); }
+
+function currentBuilderPolicy(){
+  const unscoped = { user:"read", meta:"read" };
+  if($("allowSearch").checked) unscoped.search = "read";
+  return { defaults:{ mode:"deny", unscoped }, org:collect("#orgs"), repo:collect("#repos") };
+}
+function applyPolicyToBuilder(p){
+  p = p || {};
+  $("repos").innerHTML = ""; $("orgs").innerHTML = "";
+  (p.repo||[]).forEach(r=>addRepoRow(r.name, r.access));
+  (p.org||[]).forEach(o=>addOrgRow(o.name, o.access));
+  if(!document.querySelector("#repos .row")) addRepoRow();
+  if(!document.querySelector("#orgs .row")) addOrgRow();
+  $("allowSearch").checked = !!(p.defaults && p.defaults.unscoped && p.defaults.unscoped.search);
+}
+function builderToToml(){
+  const p = currentBuilderPolicy();
+  let s = '[defaults]\nmode = "deny"\n';
+  const u = p.defaults.unscoped || {}; const keys = Object.keys(u).filter(k=>u[k] && u[k] !== "none");
+  if(keys.length){ s += "\n[defaults.unscoped]\n"; keys.forEach(k=> s += `${k} = "${u[k]}"\n`); }
+  p.org.forEach(o=> s += `\n[[org]]\nname = "${o.name}"\naccess = "${o.access}"\n`);
+  p.repo.forEach(r=> s += `\n[[repo]]\nname = "${r.name}"\naccess = "${r.access}"\n`);
+  return s;
+}
+// returns true if the TOML parsed (and was applied to the builder); false keeps you on the TOML tab.
+async function tomlToBuilder(){
+  const spec = $("tomlSpec").value.trim();
+  if(!spec) return true;
+  const r = await api("POST","/ui/api/policy/parse",{ spec_toml: spec });
+  if(!r.ok){ showCreateErr((r.body&&r.body.error)||"Invalid TOML — fix it to switch back."); return false; }
+  applyPolicyToBuilder(r.body.policy); $("createErr").style.display="none"; return true;
+}
+
+// ---- tabs (convert both ways on switch) ----
+function setTab(which){
+  const b = which==="builder";
+  $("tabBuilder").classList.toggle("on", b); $("tabToml").classList.toggle("on", !b);
+  $("panelBuilder").classList.toggle("on", b); $("panelToml").classList.toggle("on", !b);
+}
+$("tabBuilder").onclick = async () => { if($("panelBuilder").classList.contains("on")) return; if(await tomlToBuilder()) setTab("builder"); };
+$("tabToml").onclick = () => { if($("panelToml").classList.contains("on")) return; $("tomlSpec").value = builderToToml(); setTab("toml"); };
+
+// ---- create / edit ----
+function startEdit(t){
+  editId = t.id;
+  $("createTitle").textContent = 'Edit "'+t.name+'" (re-issues)';
+  $("editNote").style.display = "block";
+  $("createBtn").textContent = "Re-issue token";
+  $("cancelEdit").style.display = "block";
+  $("tokName").value = t.name || "";
+  applyPolicyToBuilder(t.policy || {});
+  $("tomlSpec").value = ""; setTab("builder");
+  $("createCard").scrollIntoView({behavior:"smooth"});
+}
+function resetCreate(){
+  editId = null;
+  $("createTitle").textContent = "Create a token";
+  $("editNote").style.display = "none";
+  $("createBtn").textContent = "Create token";
+  $("cancelEdit").style.display = "none";
+  $("tokName").value = "";
+  $("repos").innerHTML=""; $("orgs").innerHTML=""; $("tomlSpec").value=""; $("allowSearch").checked=false;
+  addRepoRow(); addOrgRow(); setTab("builder");
+}
+$("cancelEdit").onclick = resetCreate;
+
+$("createBtn").onclick = async () => {
+  const usingToml = $("panelToml").classList.contains("on");
+  let payload = { name: $("tokName").value.trim() };
+  if(editId) payload.replace_id = editId;
+  if(usingToml){
+    const spec = $("tomlSpec").value.trim();
+    if(!spec) return showCreateErr("Paste a TOML policy first.");
+    payload.spec_toml = spec;
+  } else {
+    payload.policy = currentBuilderPolicy();
+  }
+  $("createBtn").disabled = true;
+  const r = await api("POST", "/ui/api/tokens", payload);
+  $("createBtn").disabled = false;
+  if(!r.ok || !r.body || !r.body.secret) return showCreateErr((r.body&&r.body.error)||"Could not create token.");
+  showSecret(r.body.secret);
+  resetCreate();
 };
-document.getElementById("copyBtn").onclick = () => navigator.clipboard.writeText(document.getElementById("secret").textContent);
-document.getElementById("anotherBtn").onclick = () => location.reload();
+function showCreateErr(msg){ const e=$("createErr"); e.style.display="block"; e.textContent=msg; }
+
+function showSecret(secret){
+  $("createErr").style.display = "none";
+  $("secret").textContent = secret;
+  const host = location.host;
+  $("usage").textContent =
+    "gh auth login --hostname " + host + " --with-token <<< " + secret +
+    "\n# make sure gh uses the proxy: unset GITHUB_TOKEN and gh config unset http_unix_socket";
+  show("step-secret");
+}
+$("copyBtn").onclick = () => navigator.clipboard.writeText($("secret").textContent);
+$("backBtn").onclick = async () => { await refreshTokens(); show("console"); };
+$("signoutBtn").onclick = async (e) => { e.preventDefault(); await api("POST","/ui/api/logout"); location.reload(); };
 </script>
 </body>
 </html>

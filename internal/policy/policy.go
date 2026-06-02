@@ -97,9 +97,15 @@ func LoadFromFile(path string) (*Policy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading policy file: %w", err)
 	}
+	return ParseTOML(data)
+}
+
+// ParseTOML parses a policy from a TOML document (the same shape as policy.toml). The owner
+// console's "paste the spec" box uses it so an operator can author a full policy by hand.
+func ParseTOML(data []byte) (*Policy, error) {
 	var p Policy
 	if err := toml.Unmarshal(data, &p); err != nil {
-		return nil, fmt.Errorf("parsing policy file: %w", err)
+		return nil, fmt.Errorf("parsing policy: %w", err)
 	}
 	return &p, nil
 }
