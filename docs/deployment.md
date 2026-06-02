@@ -137,3 +137,38 @@ gh auth login --hostname proxy.example.com
 `gh auth login`'s OAuth client also bypasses `http_unix_socket` (it dials the host directly
 over TLS), so a forwarded unix socket can't carry the interactive login — another reason the
 trusted-cert route is the one that "just works".
+
+## Client gotchas — make sure gh actually uses the proxy
+
+The proxy only enforces policy on traffic that reaches it. `gh` has two ways to silently route
+around it — both bit us in testing:
+
+- **`GITHUB_TOKEN` / `GH_TOKEN` env var** — if set, `gh` uses it and talks to `github.com`
+  directly, *ignoring `--hostname`*. `unset GITHUB_TOKEN GH_TOKEN`.
+- **`http_unix_socket`** — if `gh config get http_unix_socket` returns a path (e.g. a local
+  socket-mode proxy you ran earlier), `gh` routes **everything** through that socket regardless
+  of `--hostname`, and socket mode applies its *own* policy + custodian, ignoring the client
+  token. Clear it: `gh config set http_unix_socket ""`.
+
+Confirm you're actually on the proxy: `gh api user --hostname <proxy>` returns
+`{"login":"bgh-proxy"}` (a synthetic identity). If it returns your real GitHub profile, one of
+the above is bypassing the proxy.
+
+## Policy tips
+
+`gh repo list` / `gh org list` enumerate **an owner** (your account) via
+`repositoryOwner(login:)` / `user(login:)`, so they are classified as an **org** scope — they
+need an `org` rule for your username, not just per-repo rules:
+
+```toml
+[[org]]
+name = "your-login"               # lets `gh repo list` / `gh org list` enumerate your account
+access = "read"
+
+[[repo]]
+name = "your-login/private-thing" # ...while still redacting a specific repo from the listing
+access = "none"
+```
+
+(A fully denied repo is redacted to `null` in the GraphQL response, so `gh repo list` shows it
+as a blank row rather than dropping it — its name and data never leave the proxy.)
