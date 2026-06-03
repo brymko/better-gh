@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"better-gh/internal/policy"
@@ -35,8 +36,8 @@ func TestCreateAndLookup(t *testing.T) {
 	if tok.Name != "ci-bot" {
 		t.Fatalf("expected name ci-bot, got %s", tok.Name)
 	}
-	if len(secret) != 64 {
-		t.Fatalf("expected 64-char hex secret, got len %d", len(secret))
+	if !strings.HasPrefix(secret, "bgh_") || len(secret) != 68 {
+		t.Fatalf("expected bgh_-prefixed 64-hex secret (len 68), got %q (len %d)", secret, len(secret))
 	}
 
 	found := s.Lookup(secret)

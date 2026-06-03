@@ -76,7 +76,10 @@ func (s *Store) Create(name string, pol policy.Policy) (*ProxyToken, string, err
 		return nil, "", err
 	}
 
-	secret := hex.EncodeToString(secretBytes)
+	// "bgh_" prefix makes a proxy token visually distinguishable from a real GitHub token
+	// (gho_/ghp_/github_pat_) — handy when debugging which credential a client is actually
+	// using. The prefix is part of the secret and is hashed with it.
+	secret := "bgh_" + hex.EncodeToString(secretBytes)
 	hash := sha256.Sum256([]byte(secret))
 
 	tok := ProxyToken{
