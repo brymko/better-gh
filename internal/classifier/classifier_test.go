@@ -141,10 +141,10 @@ func TestGraphQLOrganization(t *testing.T) {
 }
 
 func TestGraphQLRepositoryOwner(t *testing.T) {
-	body := []byte(`{"query":"query($owner: String!) { repositoryOwner(login: $owner) { repositories(first: 30) { nodes { name } } } }","variables":{"owner":"brymko"}}`)
+	body := []byte(`{"query":"query($owner: String!) { repositoryOwner(login: $owner) { repositories(first: 30) { nodes { name } } } }","variables":{"owner":"octocat"}}`)
 	r := Classify(http.MethodPost, "/graphql", body)
-	if r.Org != "brymko" {
-		t.Fatalf("expected org brymko, got %s", r.Org)
+	if r.Org != "octocat" {
+		t.Fatalf("expected org octocat, got %s", r.Org)
 	}
 	if r.HasRepo() {
 		t.Fatal("should not have repo")

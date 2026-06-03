@@ -75,7 +75,7 @@ func TestLookupReturnsCopyNotSlicePointer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	victimID := victim.ID // copy the value now; Create also returns a slice pointer
+	victimID := victim.ID    // copy the value now; Create also returns a slice pointer
 	for i := 0; i < 8; i++ { // tokens AFTER victim so its slot is overwritten on shift
 		if _, _, err := s.Create(fmt.Sprintf("after-%d", i), testPolicy()); err != nil {
 			t.Fatal(err)
