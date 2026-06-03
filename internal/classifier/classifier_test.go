@@ -556,10 +556,13 @@ func TestGraphQLOrgScopedHasNoResourceOrCategory(t *testing.T) {
 }
 
 func TestGraphQLMutationMergeBranch(t *testing.T) {
+	// mergeBranch advances a branch tip (merge commit on the base branch), so it is a
+	// "branches" write — not "pulls". Mapping it to pulls let it escape a branches="none"
+	// rule under pulls="read-write" (round-12 audit H3).
 	body := []byte(`{"query":"mutation { mergeBranch(input: {repositoryId: \"id\", base: \"main\", head: \"dev\"}) { mergeCommit { oid } } }"}`)
 	r := Classify(http.MethodPost, "/graphql", body)
-	if r.Resource != "pulls" {
-		t.Errorf("mergeBranch: Resource = %q, want %q", r.Resource, "pulls")
+	if r.Resource != "branches" {
+		t.Errorf("mergeBranch: Resource = %q, want %q", r.Resource, "branches")
 	}
 }
 

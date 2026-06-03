@@ -31,6 +31,96 @@ func TestIsRepoEnumPath(t *testing.T) {
 	}
 }
 
+// Round-12 audit H4/M2: org-wide alert feeds, events, starred/subscriptions, team repos are now
+// repo-enum paths, and repoAllowed understands the repo.name / repo.full_name shapes they use.
+func TestIsRepoEnumPath_Round12Additions(t *testing.T) {
+	for _, p := range []string{
+		"/orgs/o/secret-scanning/alerts", "/orgs/o/dependabot/alerts", "/orgs/o/code-scanning/alerts",
+		"/orgs/o/events", "/users/u/events", "/users/u/received_events",
+		"/users/u/starred", "/users/u/subscriptions", "/orgs/o/teams/t/repos", "/events",
+	} {
+		if !IsRepoEnumPath(p) {
+			t.Errorf("%s should be a repo-enum path", p)
+		}
+	}
+	// Not over-broad: other org alert subpaths / single-repo alerts stay out.
+	for _, p := range []string{"/orgs/o/secret-scanning", "/repos/o/r/secret-scanning/alerts", "/orgs/o/teams/t"} {
+		if IsRepoEnumPath(p) {
+			t.Errorf("%s should NOT be a repo-enum path", p)
+		}
+	}
+}
+
+func TestFilterSecretScanningAlertsDropsDeniedRepo(t *testing.T) {
+	// Org secret-scanning feed: each alert carries the cleartext secret + repository.full_name.
+	body := []byte(`[{"secret":"AKIA_VISIBLE","repository":{"full_name":"a/keep"}},` +
+		`{"secret":"AKIA_TOPSECRET","repository":{"full_name":"a/denied"}}]`)
+	out := string(Filter("/orgs/a/secret-scanning/alerts", body, allowOnly("a/keep")))
+	if strings.Contains(out, "AKIA_TOPSECRET") || strings.Contains(out, "a/denied") {
+		t.Fatalf("denied repo's secret leaked: %s", out)
+	}
+	if !strings.Contains(out, "AKIA_VISIBLE") {
+		t.Fatalf("allowed repo's alert was wrongly dropped: %s", out)
+	}
+}
+
+func TestFilterEventsRepoNameShape(t *testing.T) {
+	// Events: entry repository is under repo.name as the FULL "owner/repo".
+	body := []byte(`[{"type":"PushEvent","repo":{"name":"a/keep"}},{"type":"PushEvent","repo":{"name":"a/denied"}}]`)
+	out := string(Filter("/orgs/a/events", body, allowOnly("a/keep")))
+	if strings.Contains(out, "a/denied") {
+		t.Fatalf("denied repo activity leaked: %s", out)
+	}
+	if !strings.Contains(out, "a/keep") {
+		t.Fatalf("allowed repo activity wrongly dropped: %s", out)
+	}
+}
+
+func TestFilterStarredStarJSONWrapper(t *testing.T) {
+	// star+json Accept wraps the repo: {starred_at, repo:{full_name}}.
+	body := []byte(`[{"starred_at":"t","repo":{"full_name":"a/keep"}},{"starred_at":"t","repo":{"full_name":"a/denied"}}]`)
+	out := string(Filter("/users/u/starred", body, allowOnly("a/keep")))
+	if strings.Contains(out, "a/denied") {
+		t.Fatalf("denied starred repo leaked: %s", out)
+	}
+	if !strings.Contains(out, "a/keep") {
+		t.Fatalf("allowed starred repo wrongly dropped: %s", out)
+	}
+}
+
+// Migrations nest a repositories[] of MANY repos per entry; the denied ones are dropped from
+// within each entry while the migration metadata is kept (round-12 follow-up).
+func TestFilterMigrationsRedactsNestedRepos(t *testing.T) {
+	allow := allowOnly("a/keep")
+	// List of migrations, each with a mixed repositories[].
+	list := []byte(`[{"id":1,"state":"exported","repositories":[{"full_name":"a/keep"},{"full_name":"a/denied"}]}]`)
+	out := string(Filter("/orgs/a/migrations", list, allow))
+	if strings.Contains(out, "a/denied") {
+		t.Fatalf("denied repo leaked from migration list: %s", out)
+	}
+	if !strings.Contains(out, "a/keep") || !strings.Contains(out, `"state":"exported"`) {
+		t.Fatalf("allowed repo / migration metadata wrongly dropped: %s", out)
+	}
+	// Single migration object.
+	one := []byte(`{"id":2,"repositories":[{"full_name":"a/keep"},{"full_name":"a/denied"}]}`)
+	out = string(Filter("/orgs/a/migrations/2", one, allow))
+	if strings.Contains(out, "a/denied") || !strings.Contains(out, "a/keep") {
+		t.Fatalf("single migration object not redacted correctly: %s", out)
+	}
+	// The .../repositories sub-path is a plain repo array → standard array filtering.
+	repos := []byte(`[{"full_name":"a/keep"},{"full_name":"a/denied"}]`)
+	out = string(Filter("/orgs/a/migrations/2/repositories", repos, allow))
+	if strings.Contains(out, "a/denied") || !strings.Contains(out, "a/keep") {
+		t.Fatalf("migration repositories sub-path not filtered: %s", out)
+	}
+	for _, p := range []string{"/orgs/a/migrations", "/orgs/a/migrations/2", "/user/migrations",
+		"/user/migrations/2", "/orgs/a/migrations/2/repositories", "/user/migrations/2/repositories"} {
+		if !IsRepoEnumPath(p) {
+			t.Errorf("%s should be a repo-enum path", p)
+		}
+	}
+}
+
 func TestFilterRepoArray(t *testing.T) {
 	body := []byte(`[{"full_name":"a/keep"},{"full_name":"b/drop","description":"SECRET"},{"owner":{"login":"c"},"name":"keep2"}]`)
 	out := Filter("/user/repos", body, allowOnly("a/keep", "c/keep2"))

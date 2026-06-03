@@ -189,7 +189,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if !canResolve {
 			forceDenyReason = "node-scoped request not permitted by policy"
-		} else if scopes, ok := h.resolveNodeScopes(r.Context(), classified.NodeIDs, classified.NodeIDResource); ok {
+		} else if scopes, ok := h.resolveNodeScopes(r.Context(), classified.NodeIDs, classified.NodeIDResource, classified.Access); ok {
 			// Each resolved node carries the resource of the root mutation field that
 			// referenced it (mergePullRequest → "pulls", createIssue → "issues"), so a
 			// per-resource permission applies per the operation that actually touches the
@@ -209,6 +209,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if !classified.HasRepo() && classified.Org == "" {
 					classified.Owner = scopes[0].Owner
 					classified.Repo = scopes[0].Repo
+					// Carry the resolved node's per-resource key into the PRIMARY scope too — not
+					// just Additional. Otherwise the primary scope keeps the mutation's name-derived
+					// Resource ("" for addComment/addReaction/…), which now fails closed under a
+					// per-resource rule and would wrongly deny an allowed write (e.g. commenting on
+					// an issue when issues is writable but pulls is not). round-12 audit H2/H3.
+					classified.Resource = scopes[0].Resource
 					classified.Additional = append(classified.Additional, scopes[1:]...)
 				} else {
 					classified.Additional = append(classified.Additional, scopes...)
@@ -405,6 +411,7 @@ const (
 type nodeRes struct {
 	kind        int
 	owner, repo string
+	typename    string // resolved GraphQL __typename, used to derive the per-resource key
 }
 
 // resolveNodeScopes maps each referenced node ID to the repository GitHub says it belongs
@@ -415,15 +422,16 @@ type nodeRes struct {
 // no repo scope, which the policy denies as an unscoped write. Only a node that resolves
 // to a repo-scoped TYPE without a repository (anomalous) fails the whole request closed.
 // An upstream error also fails closed. Returns (scopes, ok); scopes may be empty.
-func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceByID map[string]string) ([]classifier.Scope, bool) {
+func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceByID map[string]string, access classifier.AccessLevel) ([]classifier.Scope, bool) {
 	if len(ids) > maxResolveIDs {
 		return nil, false
 	}
-	repoOf := make(map[string][2]string, len(ids))
+	type resolved struct{ owner, repo, typename string }
+	repoOf := make(map[string]resolved, len(ids))
 	var missing []string
 	for _, id := range ids {
-		if owner, repo, ok := h.NodeCache.Get(id); ok {
-			repoOf[id] = [2]string{owner, repo} // cache only ever holds verified repo nodes
+		if owner, repo, typename, ok := h.NodeCache.Get(id); ok {
+			repoOf[id] = resolved{owner, repo, typename} // cache only ever holds verified repo nodes
 		} else {
 			missing = append(missing, id)
 		}
@@ -438,8 +446,8 @@ func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceB
 		for _, id := range missing {
 			switch fetched[id].kind { // absent → zero value nodeSkip → ignored
 			case nodeRepo:
-				h.NodeCache.Put(id, fetched[id].owner, fetched[id].repo)
-				repoOf[id] = [2]string{fetched[id].owner, fetched[id].repo}
+				h.NodeCache.Put(id, fetched[id].owner, fetched[id].repo, fetched[id].typename)
+				repoOf[id] = resolved{fetched[id].owner, fetched[id].repo, fetched[id].typename}
 			case nodeDeny:
 				return nil, false // repo-scoped type without a repository → fail closed
 			}
@@ -448,11 +456,27 @@ func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceB
 
 	scopes := make([]classifier.Scope, 0, len(repoOf))
 	for _, id := range ids {
-		if or, ok := repoOf[id]; ok {
-			scopes = append(scopes, classifier.Scope{Owner: or[0], Repo: or[1], Resource: resourceByID[id]})
+		if r, ok := repoOf[id]; ok {
+			scopes = append(scopes, classifier.Scope{Owner: r.owner, Repo: r.repo, Resource: h.nodeResource(access, r.typename, resourceByID[id])})
 		}
 	}
 	return scopes, true
+}
+
+// nodeResource picks the per-resource key for a resolved node. For a WRITE it prefers the key
+// derived from the node's REAL type (PullRequest→pulls, Issue→issues, …) over the mutation
+// field-name guess (resourceByID): a PR node is "pulls" no matter what the mutation is called,
+// so addComment/addReaction/addLabels on a PR can no longer dodge a pulls restriction by having
+// a name gqlMutationResource doesn't recognize. When the node's type maps to no specific
+// resource (e.g. a Repository node targeted by mergeBranch/createRef), it falls back to the
+// name guess. Reads keep the name/primary-resource behavior (the response filter redacts).
+func (h *Handler) nodeResource(access classifier.AccessLevel, typename, nameGuess string) string {
+	if access == classifier.Write && h.GQLFilter != nil {
+		if tr := h.GQLFilter.ResourceForType(typename); tr != "" {
+			return tr
+		}
+	}
+	return nameGuess
 }
 
 // resolveQuery is the static fallback used only when no schema is loaded (GQLFilter nil).
@@ -464,6 +488,11 @@ const resolveQuery = `query($ids:[ID!]!){nodes(ids:$ids){__typename ` +
 	`... on Release{repository{nameWithOwner}}}}`
 
 func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[string]nodeRes, error) {
+	// Bound the resolve call: it returns a small fixed-shape response, so a slow/hung upstream
+	// must not pin the client request indefinitely. Safe here (unlike the streaming forward path,
+	// which carries arbitrarily large artifact downloads and gets no hard deadline).
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 	query := resolveQuery
 	if h.GQLFilter != nil {
 		query = h.GQLFilter.NodeResolveQuery()
@@ -520,9 +549,13 @@ func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[stri
 		id := ids[i]
 		typename, nwo := parseResolvedNode(raw)
 		if owner, repo, ok := splitNameWithOwner(nwo); ok {
-			out[id] = nodeRes{kind: nodeRepo, owner: owner, repo: repo}
+			out[id] = nodeRes{kind: nodeRepo, owner: owner, repo: repo, typename: typename}
 		} else if typename != "" && h.GQLFilter != nil && h.GQLFilter.IsRepoScopedType(typename) {
-			out[id] = nodeRes{kind: nodeDeny} // repo-scoped type but no repository → fail closed
+			// Repo-scoped type but no repository resolved → fail closed. IsRepoScopedType now also
+			// covers union/interface-linked types like RepositoryRuleset (round-12 audit H5), so a
+			// ruleset whose source is a Repository resolves to that repo and is policy-checked,
+			// while an org-level one (no Repository source) yields no nameWithOwner and is denied.
+			out[id] = nodeRes{kind: nodeDeny}
 		} else {
 			out[id] = nodeRes{kind: nodeSkip} // null node or non-repo node → no constraint
 		}
@@ -755,9 +788,18 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 	// When a response filter is set (GraphQL reads), buffer the body, redact denied
 	// repos, and send the filtered bytes; the Content-Length will be recomputed.
 	if respFilter != nil {
-		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+		// Read one byte past the cap to DETECT truncation. A response filtered by restfilter
+		// fails OPEN on an unparseable body (its defense-in-depth pass-through), so a body
+		// silently truncated at maxBodySize would be re-emitted with denied-repo entries intact
+		// (round-12 audit M3). Fail closed on overflow instead, like the request path does.
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBodySize+1))
 		if rerr != nil {
 			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		if len(raw) > maxBodySize {
+			slog.Warn("filtered response exceeds size cap; denying rather than forwarding a truncated (unredactable) body", "status", resp.StatusCode)
+			jsonError(w, http.StatusBadGateway, "bgh: response too large to filter")
 			return
 		}
 		filtered, ok := respFilter(raw)

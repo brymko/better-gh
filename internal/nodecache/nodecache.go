@@ -14,6 +14,7 @@ import (
 type entry struct {
 	owner     string
 	repo      string
+	typename  string // resolved GraphQL __typename, so per-resource policy is type-derived on cache hits too
 	expiresAt time.Time
 }
 
@@ -46,23 +47,25 @@ func (c *Cache) Stop() {
 	close(c.stopCh)
 }
 
-// Get returns a previously verified node-ID → repo mapping, if present and unexpired.
-func (c *Cache) Get(id string) (owner, repo string, ok bool) {
+// Get returns a previously verified node-ID → (repo, __typename) mapping, if present and
+// unexpired. The typename lets the caller derive per-resource policy from the node's real
+// type on a cache hit, exactly as it would on a fresh resolve.
+func (c *Cache) Get(id string) (owner, repo, typename string, ok bool) {
 	if id == "" {
-		return "", "", false
+		return "", "", "", false
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	e, exists := c.entries[id]
 	if !exists || !e.expiresAt.After(time.Now()) {
-		return "", "", false
+		return "", "", "", false
 	}
-	return e.owner, e.repo, true
+	return e.owner, e.repo, e.typename, true
 }
 
-// Put records an authoritative node-ID → repo mapping. Callers MUST only pass
+// Put records an authoritative node-ID → (repo, __typename) mapping. Callers MUST only pass
 // mappings obtained from GitHub, never ones inferred from request/response sniffing.
-func (c *Cache) Put(id, owner, repo string) {
+func (c *Cache) Put(id, owner, repo, typename string) {
 	if id == "" || owner == "" || repo == "" {
 		return
 	}
@@ -71,7 +74,7 @@ func (c *Cache) Put(id, owner, repo string) {
 	if _, exists := c.entries[id]; !exists && len(c.entries) >= maxEntries {
 		return // at capacity; a miss re-resolves, and evictLoop/TTL will free space
 	}
-	c.entries[id] = entry{owner: owner, repo: repo, expiresAt: time.Now().Add(c.ttl)}
+	c.entries[id] = entry{owner: owner, repo: repo, typename: typename, expiresAt: time.Now().Add(c.ttl)}
 }
 
 func (c *Cache) evictLoop() {

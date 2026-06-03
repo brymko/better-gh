@@ -215,6 +215,38 @@ func TestIdentityGate_NonOwnerDenied(t *testing.T) {
 	}
 }
 
+// Round-12 audit H6: a non-loopback redirect_uri (token-exfiltration vector) is rejected at the
+// authorize page, while gh's real loopback callback is accepted.
+func TestWebFlow_RejectsNonLoopbackRedirect(t *testing.T) {
+	srv, _ := newServerOnly(t, "tok-alice", "")
+	bad := []string{
+		"https://evil.example/cb",
+		"http://attacker.test/x",
+		"http://169.254.169.254/", // link-local, not loopback
+		"ftp://127.0.0.1/",        // wrong scheme
+	}
+	for _, rd := range bad {
+		resp, err := http.Get(srv.URL + "/login/oauth/authorize?client_id=x&state=s&redirect_uri=" + url.QueryEscape(rd))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("redirect_uri %q should be rejected 400, got %d", rd, resp.StatusCode)
+		}
+	}
+	for _, ok := range []string{"http://127.0.0.1:9999/callback", "http://localhost:8080/cb", "http://[::1]:7000/"} {
+		resp, err := http.Get(srv.URL + "/login/oauth/authorize?client_id=x&state=s&redirect_uri=" + url.QueryEscape(ok))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("loopback redirect_uri %q should be accepted, got %d", ok, resp.StatusCode)
+		}
+	}
+}
+
 // Web (browser) flow: authorize page is bound to gh's state; approval returns a redirect with
 // an auth code that gh exchanges for the token.
 func TestWebFlow_HappyPath(t *testing.T) {

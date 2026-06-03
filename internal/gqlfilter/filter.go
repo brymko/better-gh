@@ -3,6 +3,7 @@ package gqlfilter
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/vektah/gqlparser/v2"
@@ -78,7 +79,10 @@ func usesReservedAlias(sels ast.SelectionSet, depth int) bool {
 			if key == "" {
 				key = f.Name
 			}
-			if key == markerAlias || key == markerTypeAlias {
+			if strings.HasPrefix(key, markerAlias) || strings.HasPrefix(key, markerTypeAlias) {
+				// Reserve the whole marker namespace (exact aliases AND the per-member
+				// "markerAlias_Type" suffixes augment injects), so a client cannot pre-declare a
+				// look-alike key to spoof/suppress a repository tag and defeat redaction.
 				return true
 			}
 			if usesReservedAlias(f.SelectionSet, depth+1) {
@@ -131,6 +135,47 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string) {
 		// Repo marker (which repository) + type marker (which resource), so the filter can
 		// apply per-resource policy to this object regardless of how it was reached.
 		*sels = append(*sels, s.marker(typeName), typenameMarker())
+		return
+	}
+	// Abstract type (interface/union): the runtime object is one of its concrete members.
+	// Interfaces/unions are NEVER themselves repo-scoped (deriveRepoPaths only pathes concrete
+	// types), so a selection written against the abstract type — `... on Comment { body }`,
+	// `subject { ... }` where subject: ReferencedSubject, `node(id:){ ... }` — received no
+	// marker and the filter forwarded a cross-repo object untagged (round-12 audit H1). Inject
+	// a marker fragment for every repo-scoped concrete possibility, exactly as
+	// buildNodeResolveQuery covers all repo-scoped Node types for nodes(ids:): whichever
+	// concrete type comes back at runtime self-identifies its repository and gets redacted if
+	// denied. Members that are not repo-scoped add nothing.
+	for _, member := range s.repoScopedMembers(typeName) {
+		*sels = append(*sels, s.memberMarkerFragment(member))
+	}
+}
+
+// repoScopedMembers returns the repo-scoped concrete object types of an interface/union, sorted
+// for deterministic output. Empty for concrete types and for abstract types with no repo-scoped
+// member (e.g. Actor = User|Bot|Organization), so no fragment is injected there.
+func (s *Schema) repoScopedMembers(typeName string) []string {
+	def := s.schema.Types[typeName]
+	if def == nil || (def.Kind != ast.Interface && def.Kind != ast.Union) {
+		return nil
+	}
+	var out []string
+	for _, pt := range s.schema.PossibleTypes[typeName] {
+		if s.repoScoped[pt.Name] {
+			out = append(out, pt.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// memberMarkerFragment builds `... on T { bghRepoTagZ9: <repoPath> bghRepoTypeZ9: __typename }`
+// for a repo-scoped concrete type T. T is a possible type of the enclosing abstract selection,
+// so the type condition is always valid where this is injected.
+func (s *Schema) memberMarkerFragment(typeName string) *ast.InlineFragment {
+	return &ast.InlineFragment{
+		TypeCondition: typeName,
+		SelectionSet:  ast.SelectionSet{s.markerWithAlias(typeName, markerAlias+"_"+typeName), typenameMarker()},
 	}
 }
 
@@ -146,17 +191,31 @@ func typenameMarker() *ast.Field {
 // nameWithOwner}; DiscussionComment → discussion{repository{nameWithOwner}}). The outermost
 // field carries markerAlias so the filter/round-trip can find and strip it.
 func (s *Schema) marker(typeName string) *ast.Field {
+	return s.markerWithAlias(typeName, markerAlias)
+}
+
+// markerWithAlias builds the repository-identifying field for a repo-scoped type under a chosen
+// response key. Concrete objects use the canonical markerAlias; interface/union member fragments
+// use a per-member suffixed alias so sibling fragments with differently-shaped paths (scalar
+// Repository.nameWithOwner vs object X.repository{…}) don't trip GraphQL field-merge validation.
+func (s *Schema) markerWithAlias(typeName, alias string) *ast.Field {
 	path := s.repoPath[typeName]
-	var field *ast.Field
+	var inner ast.SelectionSet
 	for i := len(path) - 1; i >= 0; i-- {
-		f := &ast.Field{Name: path[i]}
-		if field != nil {
-			f.SelectionSet = ast.SelectionSet{field}
+		f := &ast.Field{Name: path[i].field}
+		if len(inner) > 0 {
+			if path[i].onType != "" {
+				// union/interface hop: narrow to `... on <onType>` before continuing the path
+				f.SelectionSet = ast.SelectionSet{&ast.InlineFragment{TypeCondition: path[i].onType, SelectionSet: inner}}
+			} else {
+				f.SelectionSet = inner
+			}
 		}
-		field = f
+		inner = ast.SelectionSet{f}
 	}
-	field.Alias = markerAlias
-	return field
+	root := inner[0].(*ast.Field)
+	root.Alias = alias
+	return root
 }
 
 // Filter walks a GraphQL JSON response and redacts (replaces with null) any repo-scoped
@@ -176,7 +235,7 @@ func Filter(resp map[string]any, authorized func(owner, repo, resource string) b
 func filterValue(v any, authorized func(owner, repo, resource string) bool) any {
 	switch val := v.(type) {
 	case map[string]any:
-		if tag, ok := val[markerAlias]; ok {
+		if tag, ok := repoMarker(val); ok {
 			// A repo marker is only injected onto repo-scoped objects, so its presence means
 			// this object belongs to a repository. Redact if that (repo, resource) is denied
 			// OR if the marker is unparseable (anomalous null/malformed repository) — failing
@@ -187,9 +246,8 @@ func filterValue(v any, authorized func(owner, repo, resource string) bool) any 
 			if !parsed || !authorized(owner, repo, resource) {
 				return nil
 			}
-			delete(val, markerAlias)
 		}
-		delete(val, markerTypeAlias) // strip the injected type marker (whether or not a repo marker rode with it)
+		stripMarkers(val) // strip injected repo + type markers (whether or not a repo marker rode along)
 		for k, child := range val {
 			val[k] = filterValue(child, authorized)
 		}
@@ -209,6 +267,32 @@ func filterValue(v any, authorized func(owner, repo, resource string) bool) any 
 func markerTypename(val map[string]any) string {
 	s, _ := val[markerTypeAlias].(string)
 	return s
+}
+
+// repoMarker returns the repository marker injected onto an object, if any. augment keys it by
+// the canonical markerAlias on a concrete repo-scoped object, or by a per-member suffixed alias
+// (markerAlias+"_"+Type) when the object was selected through an interface/union; either way the
+// value carries the single nameWithOwner for this object's own repository.
+func repoMarker(val map[string]any) (any, bool) {
+	if v, ok := val[markerAlias]; ok {
+		return v, true
+	}
+	for k, v := range val {
+		if strings.HasPrefix(k, markerAlias+"_") {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+// stripMarkers removes every injected marker (the repo marker — exact or per-member suffixed —
+// and the type marker) so they never reach the client.
+func stripMarkers(val map[string]any) {
+	for k := range val {
+		if k == markerTypeAlias || k == markerAlias || strings.HasPrefix(k, markerAlias+"_") {
+			delete(val, k)
+		}
+	}
 }
 
 // gqlTypeToResource maps a GraphQL object's __typename to the per-resource policy key (the
@@ -253,6 +337,18 @@ func typeResource(typename string) string {
 		return r
 	}
 	return "metadata"
+}
+
+// ResourceForType returns the per-resource policy key for a GraphQL object's runtime type
+// (PullRequest→"pulls", Issue→"issues", …), or "" when the type maps to no specific resource.
+// The proxy uses it to derive a node-ID mutation's per-resource key from the node's REAL,
+// GitHub-confirmed type rather than from the mutation field's NAME — so e.g. addComment on a
+// pull request is "pulls" and on an issue is "issues", instead of the name-substring guess
+// (gqlMutationResource) that returns "" for either and let the write dodge a per-resource rule.
+// It is a method (not a bare func) only so callers reach it through the loaded *Schema, like
+// the other type lookups; the mapping itself is schema-independent.
+func (s *Schema) ResourceForType(typename string) string {
+	return gqlTypeToResource[typename] // "" when unmapped; caller falls back to the name guess
 }
 
 // repoFromMarker extracts owner/repo from a marker value. The marker subtree contains only

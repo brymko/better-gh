@@ -868,7 +868,6 @@ var gqlFieldToResource = map[string]string{
 
 func gqlMutationResource(name string) string {
 	if strings.Contains(name, "PullRequest") ||
-		name == "mergeBranch" ||
 		name == "enablePullRequestAutoMerge" ||
 		name == "disablePullRequestAutoMerge" {
 		return "pulls"
@@ -876,6 +875,9 @@ func gqlMutationResource(name string) string {
 	if strings.Contains(name, "Issue") {
 		return "issues"
 	}
+	// mergeBranch advances a branch tip (a merge commit on the base branch), so it is a
+	// branches write — NOT pulls. It contains "Branch", so it maps here. (Previously it was
+	// special-cased to "pulls", letting it escape a branches="none" rule under pulls=write.)
 	if strings.Contains(name, "Ref") || strings.Contains(name, "Branch") {
 		return "branches"
 	}

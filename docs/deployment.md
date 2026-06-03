@@ -91,9 +91,19 @@ tailscale serve reset
 
 ## Option B — Caddy + Let's Encrypt (public domain)
 
-Use when clients are not on a tailnet. The proxy becomes reachable on the public internet,
-gated by the `bgh_` token (256-bit; brute force is infeasible) — still, prefer Option A or a
-network allowlist if you can.
+Use when clients are not on a tailnet. The proxy becomes reachable on the public internet.
+Normal API traffic is gated by the `bgh_` token (256-bit; brute force is infeasible) — **but the
+`/login/*` and `/ui` endpoints are NOT token-gated**: they are the token-*acquisition* surface, so
+they accept unauthenticated requests and are protected only by the GitHub owner sign-in (a non-owner
+cannot mint a token). Two consequences for a public deployment:
+
+- **Token minting still requires owning the deployment** (the first-sign-in TOFU gate), so exposure
+  does not let a stranger mint tokens. But the device-flow start endpoints are an unauthenticated
+  surface: they are rate-limited and capped (a flood is refused with `429`/`503`), yet you should
+  still **prefer Option A or a network allowlist** so untrusted clients can't reach them at all.
+- **Device-code phishing** is inherent to the device flow: an attacker who tricks *you* (the owner)
+  into completing a sign-in they initiated could obtain the resulting token. Only complete a sign-in
+  you started yourself, and confirm the user code matches the one in your own terminal/browser.
 
 ### Prerequisites
 - A domain, e.g. `proxy.example.com`, with an A/AAAA record → the VPS.
@@ -113,8 +123,8 @@ proxy.example.com {
 ### Run
 ```bash
 # config.toml: external_url = "https://proxy.example.com"
-bgh-proxy serve              # loopback proxy; sign in (below) to bootstrap the custodian
-caddy run --config Caddyfile # auto-provisions the Let's Encrypt cert
+bgh-proxy serve                      # loopback proxy; sign in (below) to bootstrap the custodian
+caddy run --config Caddyfile.example # auto-provisions the Let's Encrypt cert
 ```
 
 ### Client — zero trust setup

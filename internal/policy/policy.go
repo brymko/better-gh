@@ -116,18 +116,27 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 			// GitHub resolves owner/repo names case-insensitively; match the same
 			// way so a re-cased path cannot dodge an exact-match rule.
 			if strings.EqualFold(r.Name, repo) {
-				if resource != "" && r.Permissions != nil {
-					if permAccess, ok := r.Permissions[resource]; ok {
-						if permits(permAccess, access) {
-							return Result{Allowed: true}
-						}
-						return Result{
-							Reason: fmt.Sprintf("repo '%s' resource '%s' policy is %s, requested %s", repo, resource, accessStr(permAccess), access),
+				if r.Permissions != nil {
+					if resource != "" && resource != classifier.ResourceUnknown {
+						if permAccess, ok := r.Permissions[resource]; ok {
+							if permits(permAccess, access) {
+								return Result{Allowed: true}
+							}
+							return Result{
+								Reason: fmt.Sprintf("repo '%s' resource '%s' policy is %s, requested %s", repo, resource, accessStr(permAccess), access),
+							}
 						}
 					}
-					if resource == classifier.ResourceUnknown && access == classifier.Write {
+					// A WRITE whose resource is unrecognized (ResourceUnknown) or indeterminate
+					// ("" — e.g. a GraphQL mutation whose field/type maps to no known resource)
+					// MUST NOT inherit the rule's base access while per-resource policy is in
+					// effect: otherwise an unmapped write (POST .../dispatches over REST, or
+					// addComment/addReaction/lockLockable over GraphQL) dodges a per-resource
+					// 'none'. Fail closed. Reads still fall back to base (resource-less reads are
+					// always at most as powerful as the base read grant).
+					if access == classifier.Write && (resource == "" || resource == classifier.ResourceUnknown) {
 						return Result{
-							Reason: fmt.Sprintf("repo '%s' write to unrecognized resource denied (per-resource policy in effect)", repo),
+							Reason: fmt.Sprintf("repo '%s' write to indeterminate/unrecognized resource denied (per-resource policy in effect)", repo),
 						}
 					}
 				}
@@ -144,18 +153,22 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 	if org != "" {
 		for _, o := range p.Org {
 			if strings.EqualFold(o.Name, org) {
-				if resource != "" && o.Permissions != nil {
-					if permAccess, ok := o.Permissions[resource]; ok {
-						if permits(permAccess, access) {
-							return Result{Allowed: true}
-						}
-						return Result{
-							Reason: fmt.Sprintf("org '%s' resource '%s' policy is %s, requested %s", org, resource, accessStr(permAccess), access),
+				if o.Permissions != nil {
+					if resource != "" && resource != classifier.ResourceUnknown {
+						if permAccess, ok := o.Permissions[resource]; ok {
+							if permits(permAccess, access) {
+								return Result{Allowed: true}
+							}
+							return Result{
+								Reason: fmt.Sprintf("org '%s' resource '%s' policy is %s, requested %s", org, resource, accessStr(permAccess), access),
+							}
 						}
 					}
-					if resource == classifier.ResourceUnknown && access == classifier.Write {
+					// See the repo block: a write with an indeterminate/unrecognized resource
+					// must fail closed under a per-resource rule rather than inherit base access.
+					if access == classifier.Write && (resource == "" || resource == classifier.ResourceUnknown) {
 						return Result{
-							Reason: fmt.Sprintf("org '%s' write to unrecognized resource denied (per-resource policy in effect)", org),
+							Reason: fmt.Sprintf("org '%s' write to indeterminate/unrecognized resource denied (per-resource policy in effect)", org),
 						}
 					}
 				}

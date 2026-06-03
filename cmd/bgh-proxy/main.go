@@ -381,10 +381,19 @@ func cmdServe(configPath string) error {
 		// proves they own the custodian token via GitHub's device flow. Mounted ahead of the
 		// proxy (the proxy 401s anything without a token; these ARE the token-acquisition
 		// endpoints). Uses a plain client — no policy/redirect rewriting — for github.com.
+		// Honor the documented oauth_client_id / oauth_scopes config keys for the sign-in IdP too
+		// (not just `bgh-proxy login`): an operator who narrows oauth_scopes to shrink the captured
+		// custodian's reach now actually gets it (round-12 audit M4). Empty → gh's public app / its
+		// default scopes (loginflow.NewHandler fills the scope default).
+		oauthClientID := cfg.OAuthClientID
+		if oauthClientID == "" {
+			oauthClientID = ghCLIClientID
+		}
 		loginHandler := loginflow.NewHandler(&loginflow.Handler{
 			Store:         tokenStore,
 			Owner:         ownerStore,
-			OAuthClientID: ghCLIClientID,
+			OAuthClientID: oauthClientID,
+			OAuthScopes:   cfg.OAuthScopes,
 			HTTPClient:    &http.Client{Timeout: 30 * time.Second},
 			ExternalURL:   cfg.ExternalURL,
 		})

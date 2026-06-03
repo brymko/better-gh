@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -19,10 +21,11 @@ import (
 )
 
 const (
-	githubBaseDefault = "https://github.com"
-	apiBaseDefault    = "https://api.github.com"
-	grantTTL          = 15 * time.Minute
-	maxBody           = 1 << 20
+	githubBaseDefault    = "https://github.com"
+	apiBaseDefault       = "https://api.github.com"
+	grantTTL             = 15 * time.Minute
+	maxBody              = 1 << 20
+	deviceFlowsPerMinute = 30 // per-source cap on device-flow-triggering requests (round-12 M1)
 )
 
 //go:embed authorize.html
@@ -48,9 +51,10 @@ type Handler struct {
 	// verification_uri the proxy hands gh must point at the public URL, not the backend the
 	// front forwards to. Empty → derive from the request Host (correct for direct serving).
 
-	mux      *http.ServeMux
-	grants   *grantStore
-	sessions *sessionStore // owner console sessions (minted after a verified sign-in)
+	mux           *http.ServeMux
+	grants        *grantStore
+	sessions      *sessionStore // owner console sessions (minted after a verified sign-in)
+	deviceLimiter *rateLimiter  // per-source cap on the unauthenticated device-flow-triggering endpoints
 }
 
 func NewHandler(h *Handler) *Handler {
@@ -70,6 +74,8 @@ func NewHandler(h *Handler) *Handler {
 	}
 	h.grants = newGrantStore(grantTTL)
 	h.sessions = newSessionStore(sessionTTL)
+	// Generous for real sign-ins (rare), tight against a flood of device-flow starts.
+	h.deviceLimiter = newRateLimiter(deviceFlowsPerMinute, time.Minute)
 
 	m := http.NewServeMux()
 	m.HandleFunc("POST /login/device/code", h.deviceCode)
@@ -94,14 +100,31 @@ func NewHandler(h *Handler) *Handler {
 	return h
 }
 
-func (h *Handler) Stop()                                            { h.grants.stop(); h.sessions.stop() }
+func (h *Handler) Stop() { h.grants.stop(); h.sessions.stop(); h.deviceLimiter.stop() }
+
+// clientIP is the rate-limit key: the request's source address (host part of RemoteAddr). Behind
+// a TLS-terminating front this is the front's address, so the limit then bounds device-flow
+// starts globally rather than per real client — still an effective flood cap.
+func clientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.ServeHTTP(w, r) }
 
 // --- outer OAuth (gh <-> proxy) ---------------------------------------------------------
 
 func (h *Handler) deviceCode(w http.ResponseWriter, r *http.Request) {
+	if !h.deviceLimiter.allow(clientIP(r)) {
+		jsonResp(w, http.StatusTooManyRequests, map[string]string{"error": "slow_down"})
+		return
+	}
 	g := &grant{flow: "device", userCode: randUserCode(), deviceCode: randHex(32), status: statusPending}
-	h.grants.add(g)
+	if !h.grants.add(g) {
+		jsonResp(w, http.StatusServiceUnavailable, map[string]string{"error": "too many pending sign-ins; try again shortly"})
+		return
+	}
 	verURI := h.verificationBase(r) + "/login/device"
 	jsonResp(w, http.StatusOK, map[string]any{
 		"device_code":               g.deviceCode,
@@ -183,8 +206,15 @@ func (h *Handler) uiPageHandler(w http.ResponseWriter, r *http.Request) {
 // tied to a gh OAuth flow) and starts the GitHub device flow to sign the operator in. The
 // minted secret is returned to the browser by apiApprove rather than handed to gh.
 func (h *Handler) apiStartStandalone(w http.ResponseWriter, r *http.Request) {
+	if !h.deviceLimiter.allow(clientIP(r)) {
+		jsonResp(w, http.StatusTooManyRequests, map[string]string{"error": "too many sign-in attempts; try again shortly"})
+		return
+	}
 	g := &grant{flow: "standalone", status: statusPending, started: true}
-	h.grants.add(g)
+	if !h.grants.add(g) {
+		jsonResp(w, http.StatusServiceUnavailable, map[string]string{"error": "too many pending sign-ins; try again shortly"})
+		return
+	}
 	userCode, verification, err := h.runGitHubAuth(g.id)
 	if err != nil {
 		h.grants.remove(g.id)
@@ -209,6 +239,9 @@ func (h *Handler) runGitHubAuth(grantID string) (userCode, verification string, 
 	codeCh := make(chan codeInfo, 1)
 	errCh := make(chan error, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), grantTTL)
+	// Hand the cancel to the grant so removing/expiring it actually stops the github.com polling
+	// goroutine below (round-12 audit M1) — otherwise it would run for the full 15-min ctx.
+	h.grants.withGrant(byID(grantID), func(g *grant) { g.cancel = cancel })
 
 	go func() {
 		defer cancel()
@@ -275,8 +308,20 @@ func (h *Handler) authorizePageWeb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing state or redirect_uri", http.StatusBadRequest)
 		return
 	}
+	// `gh auth login`'s web flow always points redirect_uri at its OWN loopback callback
+	// (http://127.0.0.1:PORT/…). Reject anything else: an unvalidated redirect_uri let an
+	// attacker phish the owner with redirect_uri=https://evil/… and receive the minted bgh_
+	// token's auth code at apiApprove (round-12 audit H6). Loopback-only means the code can only
+	// reach a server on the owner's own machine, not an attacker's.
+	if !isLoopbackRedirect(redirectURI) {
+		http.Error(w, "redirect_uri must be a loopback (127.0.0.1/localhost) http(s) URL", http.StatusBadRequest)
+		return
+	}
 	g := &grant{flow: "web", state: state, redirectURI: redirectURI, userCode: randUserCode(), status: statusPending}
-	h.grants.add(g)
+	if !h.grants.add(g) {
+		http.Error(w, "too many pending sign-ins; try again shortly", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(authorizePage)
 }
@@ -291,6 +336,10 @@ type beginReq struct {
 // apiBegin looks up the grant the operator is authorizing and starts the inner GitHub device
 // flow, returning the GitHub code/URL for the page to display.
 func (h *Handler) apiBegin(w http.ResponseWriter, r *http.Request) {
+	if !h.deviceLimiter.allow(clientIP(r)) {
+		jsonResp(w, http.StatusTooManyRequests, map[string]string{"error": "too many sign-in attempts; try again shortly"})
+		return
+	}
 	var req beginReq
 	if !readJSON(w, r, &req) {
 		return
@@ -415,13 +464,14 @@ func (h *Handler) apiApprove(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if flow == "web" {
+		// redirectURI was validated loopback-only at authorize time; still escape the params.
 		sep := "?"
 		if strings.Contains(redirectURI, "?") {
 			sep = "&"
 		}
 		jsonResp(w, http.StatusOK, map[string]string{
 			"status":   "approved",
-			"redirect": redirectURI + sep + "code=" + authCode + "&state=" + state,
+			"redirect": redirectURI + sep + "code=" + url.QueryEscape(authCode) + "&state=" + url.QueryEscape(state),
 		})
 		return
 	}
@@ -477,6 +527,22 @@ func ensureLoginUsable(p *policy.Policy) {
 }
 
 // --- helpers ---------------------------------------------------------------------------
+
+// isLoopbackRedirect reports whether uri is an absolute http/https URL whose host is a loopback
+// address (127.0.0.0/8, ::1, or "localhost"). `gh`'s web login callback always is; rejecting
+// everything else stops a phished owner's minted-token auth code from being sent off-host.
+func isLoopbackRedirect(uri string) bool {
+	u, err := url.Parse(uri)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := u.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxBody)).Decode(v); err != nil {

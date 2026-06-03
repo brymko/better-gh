@@ -1,5 +1,10 @@
 # 01 — Project Scaffold
 
+> **Historical note:** these tickets describe the original *Rust* plan. The implementation
+> shipped in **Go** (`go.mod`, `cmd/bgh-proxy`, `internal/*`); the Cargo/axum/tokio steps below
+> map to the Go stdlib `net/http` server + `BurntSushi/toml` + `vektah/gqlparser` in the code.
+> See [README.md](../README.md) and [SPEC.md](../SPEC.md) for the as-built design.
+
 ## Summary
 
 Set up the Rust project for `bgh-proxy`.

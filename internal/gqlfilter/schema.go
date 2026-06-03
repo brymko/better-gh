@@ -20,12 +20,20 @@ import (
 //go:embed schema.graphql
 var schemaSDL string
 
+// pathStep is one hop in a type's path to its repository's nameWithOwner. field is the field to
+// select; onType, when set, narrows the field's subselection to `... on <onType>` — needed when
+// the link is a union/interface (e.g. RepositoryRuleset.source: RuleSource → `... on Repository`).
+type pathStep struct {
+	field  string
+	onType string
+}
+
 // Schema wraps GitHub's GraphQL schema plus the derived repo-scoped type paths.
 type Schema struct {
 	schema           *ast.Schema
-	repoScoped       map[string]bool     // type name -> belongs to a single repository
-	repoPath         map[string][]string // type name -> no-arg field path to its repo's nameWithOwner
-	nodeResolveQuery string              // nodes(ids:) query covering every repo-scoped Node type
+	repoScoped       map[string]bool       // type name -> has a marker/resolve path to a single repository
+	repoPath         map[string][]pathStep // type name -> no-arg field path to its repo's nameWithOwner
+	nodeResolveQuery string                // nodes(ids:) query covering every repo-scoped Node type
 }
 
 // crossRepoNavFields are singular fields that point to a DIFFERENT repository than the
@@ -69,10 +77,10 @@ func Load() (*Schema, error) {
 // follows no-arg SINGULAR membership fields to an already-pathed type (DiscussionComment.
 // discussion → Discussion's path), skipping list/argumented/cross-repo-nav fields so the
 // path always lands on the object's OWN repository.
-func deriveRepoPaths(schema *ast.Schema) map[string][]string {
-	paths := map[string][]string{}
+func deriveRepoPaths(schema *ast.Schema) map[string][]pathStep {
+	paths := map[string][]pathStep{}
 	if _, ok := schema.Types["Repository"]; ok {
-		paths["Repository"] = []string{"nameWithOwner"}
+		paths["Repository"] = []pathStep{{field: "nameWithOwner"}}
 	}
 	for name, def := range schema.Types {
 		if name == "Repository" || (def.Kind != ast.Object && def.Kind != ast.Interface) {
@@ -80,7 +88,7 @@ func deriveRepoPaths(schema *ast.Schema) map[string][]string {
 		}
 		for _, f := range def.Fields {
 			if f.Name == "repository" && f.Type.Name() == "Repository" && len(f.Arguments) == 0 {
-				paths[name] = []string{"repository", "nameWithOwner"}
+				paths[name] = []pathStep{{field: "repository"}, {field: "nameWithOwner"}}
 				break
 			}
 		}
@@ -95,14 +103,34 @@ func deriveRepoPaths(schema *ast.Schema) map[string][]string {
 			if def.Kind != ast.Object && def.Kind != ast.Interface {
 				continue
 			}
-			var best []string
-			for _, f := range def.Fields {
-				// no-arg, singular (Elem==nil → not a list), non-nav membership fields only
-				if len(f.Arguments) != 0 || f.Type.Elem != nil || crossRepoNavFields[f.Name] {
-					continue
+			var best []pathStep
+			consider := func(cand []pathStep) {
+				if best == nil || len(cand) < len(best) {
+					best = cand
 				}
-				if tp, ok := paths[f.Type.Name()]; ok && (best == nil || len(tp)+1 < len(best)) {
-					best = append([]string{f.Name}, tp...)
+			}
+			for _, f := range def.Fields {
+				if len(f.Arguments) != 0 || f.Type.Elem != nil {
+					continue // argumented or list → not a singular own-repo membership
+				}
+				ft := f.Type.Name()
+				if tp, ok := paths[ft]; ok {
+					// Singular membership to an already-pathed CONCRETE type. Skip the cross-repo-
+					// nav fields (Repository.parent/source/headRepository/… point to a DIFFERENT
+					// repo); this exclusion is keyed on the concrete Repository link below.
+					if crossRepoNavFields[f.Name] {
+						continue
+					}
+					consider(append([]pathStep{{field: f.Name}}, tp...))
+				} else if repoIsMemberOfAbstract(schema, ft) {
+					// Singular field to a union/interface that has Repository as a concrete member
+					// (e.g. RepositoryRuleset.source: RuleSource = Enterprise|Organization|Repository).
+					// This is the object's OWN repository — reached by narrowing to `... on
+					// Repository`. It cannot mis-attribute to a fork parent (that link is concrete
+					// Repository-typed and excluded above), and a non-Repository source yields no
+					// nameWithOwner → the node has no repo → redacted/denied (fail closed). This is
+					// what makes union-linked Node types (round-12 H5) taggable and resolvable.
+					consider(append([]pathStep{{field: f.Name, onType: "Repository"}}, paths["Repository"]...))
 				}
 			}
 			if best != nil {
@@ -117,11 +145,29 @@ func deriveRepoPaths(schema *ast.Schema) map[string][]string {
 	return paths
 }
 
+// repoIsMemberOfAbstract reports whether typeName is a union/interface that has Repository as a
+// concrete possible type, so a singular field of that type can be narrowed to the object's own
+// repository via `... on Repository { nameWithOwner }`.
+func repoIsMemberOfAbstract(schema *ast.Schema, typeName string) bool {
+	def := schema.Types[typeName]
+	if def == nil || (def.Kind != ast.Union && def.Kind != ast.Interface) {
+		return false
+	}
+	for _, pt := range schema.PossibleTypes[typeName] {
+		if pt.Name == "Repository" {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Schema) isRepoScoped(typeName string) bool { return s.repoScoped[typeName] }
 
-// IsRepoScopedType reports whether a GraphQL type belongs to a single repository (so a
-// node of that type must be authorized against that repo). The proxy's node resolver
-// uses it to fail closed if a repo-scoped node resolves without yielding its repository.
+// IsRepoScopedType reports whether a GraphQL type has a derivable marker/resolve path to its
+// single repository (so the response filter tags it and the node resolver can fetch its repo).
+// It now also covers types whose only repo link is a union/interface source (e.g.
+// RepositoryRuleset), which previously slipped through as non-repo nodes (round-12 audit H5).
+// The proxy's node resolver uses it to fail closed if such a node resolves without a repository.
 func (s *Schema) IsRepoScopedType(typeName string) bool { return s.repoScoped[typeName] }
 
 // NodeResolveQuery is a nodes(ids:) query that asks GitHub for each node's __typename and,
@@ -161,17 +207,26 @@ func (s *Schema) buildNodeResolveQuery() string {
 }
 
 // renderPathSelection renders a repo path as an aliased nested GraphQL selection, e.g.
-// path [discussion repository nameWithOwner] → "bghr0:discussion{repository{nameWithOwner}}".
-func renderPathSelection(alias string, path []string) string {
+// [discussion repository nameWithOwner] → "bghr0:discussion{repository{nameWithOwner}}", and a
+// union step [{source,Repository} {nameWithOwner}] → "bghr0:source{... on Repository{nameWithOwner}}".
+func renderPathSelection(alias string, path []pathStep) string {
 	var b strings.Builder
 	b.WriteString(alias)
 	b.WriteByte(':')
+	closers := 0
 	for i, p := range path {
-		b.WriteString(p)
+		b.WriteString(p.field)
 		if i < len(path)-1 {
 			b.WriteByte('{')
+			closers++
+			if p.onType != "" {
+				b.WriteString("... on ")
+				b.WriteString(p.onType)
+				b.WriteByte('{')
+				closers++
+			}
 		}
 	}
-	b.WriteString(strings.Repeat("}", len(path)-1))
+	b.WriteString(strings.Repeat("}", closers))
 	return b.String()
 }

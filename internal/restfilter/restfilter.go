@@ -34,16 +34,31 @@ func IsRepoEnumPath(normPath string) bool {
 	switch {
 	case len(s) == 2 && s[0] == "user" && (s[1] == "repos" || s[1] == "starred" || s[1] == "subscriptions" || s[1] == "issues"):
 		return true
-	case len(s) == 3 && s[0] == "orgs" && (s[2] == "repos" || s[2] == "issues"):
+	case len(s) == 3 && s[0] == "orgs" && (s[2] == "repos" || s[2] == "issues" || s[2] == "events"):
 		return true
-	case len(s) == 3 && s[0] == "users" && s[2] == "repos":
+	case len(s) == 3 && s[0] == "users" && (s[2] == "repos" || s[2] == "starred" || s[2] == "subscriptions" || s[2] == "events" || s[2] == "received_events"):
 		return true
 	case len(s) == 4 && s[0] == "repos" && s[3] == "forks":
 		// /repos/{owner}/{repo}/forks returns repository objects owned by OTHERS; the GraphQL
 		// filter already redacts `forks`, so redact here too (the parent repo is policy-checked
 		// by the classifier; denied forks are dropped by full_name).
 		return true
-	case len(s) == 1 && (s[0] == "repositories" || s[0] == "issues" || s[0] == "notifications"):
+	case len(s) == 4 && s[0] == "orgs" && s[3] == "alerts" && (s[2] == "secret-scanning" || s[2] == "dependabot" || s[2] == "code-scanning"):
+		// Org-wide alert feeds aggregate per-repo data across EVERY repo in the org (the custodian
+		// can read all of them) — and secret-scanning alerts carry the cleartext `secret`. The
+		// classifier scopes these to the org only, so a per-repo `none` carve-out never applies;
+		// without redaction they leak the carved-out repo's alerts/secrets (round-12 audit H4).
+		// Each entry carries repository.full_name, which repoAllowed handles.
+		return true
+	case len(s) == 5 && s[0] == "orgs" && s[2] == "teams" && s[4] == "repos":
+		return true // /orgs/{org}/teams/{team}/repos → repository objects (full_name)
+	case isMigrationsContainer(s):
+		return true // /{orgs/{org},user}/migrations[/{id}] → migration objects nesting repositories[]
+	case len(s) == 5 && s[0] == "orgs" && s[2] == "migrations" && s[4] == "repositories":
+		return true // /orgs/{org}/migrations/{id}/repositories → plain repo array
+	case len(s) == 4 && s[0] == "user" && s[1] == "migrations" && s[3] == "repositories":
+		return true // /user/migrations/{id}/repositories → plain repo array
+	case len(s) == 1 && (s[0] == "repositories" || s[0] == "issues" || s[0] == "notifications" || s[0] == "events"):
 		return true
 	case len(s) == 2 && s[0] == "search" && (s[1] == "repositories" || s[1] == "code" || s[1] == "issues" || s[1] == "commits"):
 		return true
@@ -51,16 +66,76 @@ func IsRepoEnumPath(normPath string) bool {
 	return false
 }
 
+// isMigrationsContainer reports whether normPath's segments are a migrations LIST or single
+// migration OBJECT (each of which nests a repositories[] of MANY repos), as opposed to the
+// .../migrations/{id}/repositories sub-path (a plain repo array handled by filterArray).
+func isMigrationsContainer(s []string) bool {
+	if len(s) > 0 && s[len(s)-1] == "repositories" {
+		return false
+	}
+	switch {
+	case len(s) == 3 && s[0] == "orgs" && s[2] == "migrations": // /orgs/{org}/migrations (list)
+		return true
+	case len(s) == 4 && s[0] == "orgs" && s[2] == "migrations": // /orgs/{org}/migrations/{id}
+		return true
+	case len(s) == 2 && s[0] == "user" && s[1] == "migrations": // /user/migrations (list)
+		return true
+	case len(s) == 3 && s[0] == "user" && s[1] == "migrations": // /user/migrations/{id}
+		return true
+	}
+	return false
+}
+
 // Filter redacts denied-repo entries from a recognized enumeration/search response.
 // authorized receives "owner/repo". Repo-list / issue-list endpoints return a JSON array;
-// search endpoints return {items:[...], total_count, ...}. An off-shape body (e.g. an error
-// object) is returned unchanged.
+// search endpoints return {items:[...], total_count, ...}; migration objects nest a
+// repositories[] array that is redacted in place. An off-shape body (e.g. an error object) is
+// returned unchanged.
 func Filter(normPath string, body []byte, authorized func(ownerRepo string) bool) []byte {
 	s := segments(normPath)
 	if len(s) >= 1 && s[0] == "search" {
 		return filterSearch(body, authorized)
 	}
+	if isMigrationsContainer(s) {
+		return filterMigrations(body, authorized)
+	}
 	return filterArray(body, authorized)
+}
+
+// filterMigrations redacts denied repos from the nested repositories[] of each migration. A
+// migration object mixes allowed and denied repos and carries non-repo metadata (id, state, …),
+// so — unlike the drop-whole-entry endpoints — the entry is kept and only its repositories[] is
+// filtered. Handles both the list ([{…,repositories:[…]}, …]) and single-object ({…}) shapes.
+func filterMigrations(body []byte, authorized func(string) bool) []byte {
+	var arr []json.RawMessage
+	if json.Unmarshal(body, &arr) == nil {
+		for i, raw := range arr {
+			arr[i] = redactMigrationRepos(raw, authorized)
+		}
+		if out, err := json.Marshal(arr); err == nil {
+			return out
+		}
+		return body
+	}
+	return redactMigrationRepos(body, authorized) // single migration object
+}
+
+// redactMigrationRepos rewrites one migration object's repositories[] to keep only allowed repos.
+// An object with no repositories field (or a non-object) is returned unchanged.
+func redactMigrationRepos(raw json.RawMessage, authorized func(string) bool) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return raw
+	}
+	reposRaw, ok := obj["repositories"]
+	if !ok {
+		return raw
+	}
+	obj["repositories"] = filterArray(reposRaw, authorized) // repo objects carry full_name
+	if out, err := json.Marshal(obj); err == nil {
+		return out
+	}
+	return raw
 }
 
 func filterArray(body []byte, authorized func(string) bool) []byte {
@@ -138,6 +213,13 @@ func repoAllowed(raw json.RawMessage, authorized func(string) bool) bool {
 		Repository struct {
 			FullName string `json:"full_name"`
 		} `json:"repository"`
+		// `repo` is the events shape ({repo:{name:"owner/repo"}}) and the starred/subscriptions
+		// star+json wrapper ({starred_at, repo:{full_name:"owner/repo"}}). Note events'
+		// repo.name is the FULL "owner/repo" (unlike a repository object's bare name).
+		Repo struct {
+			FullName string `json:"full_name"`
+			Name     string `json:"name"`
+		} `json:"repo"`
 		RepositoryURL string `json:"repository_url"`
 	}
 	if json.Unmarshal(raw, &o) != nil {
@@ -146,6 +228,12 @@ func repoAllowed(raw json.RawMessage, authorized func(string) bool) bool {
 	repo := o.FullName
 	if repo == "" {
 		repo = o.Repository.FullName
+	}
+	if repo == "" {
+		repo = o.Repo.FullName
+	}
+	if repo == "" && strings.Count(o.Repo.Name, "/") == 1 {
+		repo = o.Repo.Name // events: repo.name is "owner/repo"
 	}
 	if repo == "" && o.Owner.Login != "" && o.Name != "" {
 		repo = o.Owner.Login + "/" + o.Name

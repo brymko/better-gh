@@ -6,11 +6,18 @@
 package loginflow
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"sync"
 	"time"
 )
+
+// maxLiveGrants bounds the in-memory grant store. /login/device/code and /ui/api/start are
+// UNAUTHENTICATED (they are the token-acquisition surface), so without a cap an attacker who can
+// reach the listener could grow the map without bound (round-12 audit M1). At the cap, new grants
+// are refused (429) until the TTL sweep frees space; legitimate sign-in volume is far below it.
+const maxLiveGrants = 2048
 
 type grantStatus int
 
@@ -43,6 +50,7 @@ type grant struct {
 	denyReason string // human-readable reason shown to the page when status == statusDenied
 	secret     string // minted bgh_ token (once approved)
 	expiresAt  time.Time
+	cancel     context.CancelFunc // cancels the background device-flow goroutine, if one is running
 }
 
 type grantStore struct {
@@ -61,20 +69,29 @@ func newGrantStore(ttl time.Duration) *grantStore {
 func (s *grantStore) stop() { close(s.stopCh) }
 
 // remove deletes a grant by id (used for one-time issuance: once the minted secret is handed
-// to gh, the grant is consumed so a replayed token exchange can't fetch it again).
+// to gh, the grant is consumed so a replayed token exchange can't fetch it again). It cancels
+// the grant's background device-flow goroutine so cleanup actually stops the github.com polling.
 func (s *grantStore) remove(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if g, ok := s.grants[id]; ok && g.cancel != nil {
+		g.cancel()
+	}
 	delete(s.grants, id)
 }
 
-// add stamps the grant with an id + expiry and stores it.
-func (s *grantStore) add(g *grant) {
+// add stamps the grant with an id + expiry and stores it, unless the store is at capacity (in
+// which case it returns false and the caller responds 429 — see maxLiveGrants).
+func (s *grantStore) add(g *grant) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.grants) >= maxLiveGrants {
+		return false
+	}
 	g.id = randHex(16)
 	g.expiresAt = time.Now().Add(s.ttl)
 	s.grants[g.id] = g
+	return true
 }
 
 // withGrant runs fn under the store lock against the grant matching `match`, returning
@@ -120,6 +137,9 @@ func (s *grantStore) sweepLoop() {
 			s.mu.Lock()
 			for id, g := range s.grants {
 				if !g.expiresAt.After(now) {
+					if g.cancel != nil {
+						g.cancel() // stop the background device-flow goroutine for an expired grant
+					}
 					delete(s.grants, id)
 				}
 			}
@@ -128,9 +148,62 @@ func (s *grantStore) sweepLoop() {
 	}
 }
 
+// rateLimiter is a fixed-window per-source counter guarding the unauthenticated device-flow
+// endpoints (each /ui/api/start or /login/api/begin can launch a 15-min github.com-polling
+// goroutine). It resets every window, so its map stays bounded; at the per-window per-source
+// limit it denies (the caller responds 429). Behind a TLS-terminating front all requests share
+// the front's address, so this also acts as a global cap on device-flow starts.
+type rateLimiter struct {
+	mu     sync.Mutex
+	counts map[string]int
+	limit  int
+	stopCh chan struct{}
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	l := &rateLimiter{counts: make(map[string]int), limit: limit, stopCh: make(chan struct{})}
+	go func() {
+		t := time.NewTicker(window)
+		defer t.Stop()
+		for {
+			select {
+			case <-l.stopCh:
+				return
+			case <-t.C:
+				l.mu.Lock()
+				l.counts = make(map[string]int)
+				l.mu.Unlock()
+			}
+		}
+	}()
+	return l
+}
+
+func (l *rateLimiter) stop() { close(l.stopCh) }
+
+// allow records a hit for key and reports whether it is within the window limit. The map-size
+// guard keeps a flood of distinct keys (spoofed sources) from growing it without bound.
+func (l *rateLimiter) allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.counts[key] == 0 && len(l.counts) >= 100_000 {
+		return false
+	}
+	if l.counts[key] >= l.limit {
+		return false
+	}
+	l.counts[key]++
+	return true
+}
+
 func randHex(n int) string {
 	b := make([]byte, n)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// A process that cannot get randomness must NOT mint a predictable grant id / device
+		// code / auth code / session id. Fail loudly (recovered per-request by net/http) instead
+		// of returning zero-filled bytes.
+		panic("loginflow: crypto/rand unavailable: " + err.Error())
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -139,7 +212,9 @@ func randHex(n int) string {
 func randUserCode() string {
 	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic("loginflow: crypto/rand unavailable: " + err.Error())
+	}
 	out := make([]byte, 0, 9)
 	for i, v := range b {
 		if i == 4 {

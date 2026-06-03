@@ -234,6 +234,42 @@ func TestEmptyResourceFallsBackToRuleAccess(t *testing.T) {
 	}
 }
 
+// Round-12 audit H2: a WRITE whose resource is indeterminate ("") or unrecognized must NOT
+// inherit base access when a per-resource rule is in effect — else an unmapped GraphQL mutation
+// (addComment/addReaction/lockLockable → "") or REST endpoint dodges a per-resource 'none'.
+func TestIndeterminateWriteFailsClosedUnderPerResourceRule(t *testing.T) {
+	p := &Policy{
+		Repo: []RepoRule{{
+			Name:        "o/rw",
+			Access:      AccessReadWrite,
+			Permissions: map[string]Access{"pulls": AccessNone},
+		}},
+		Org: []OrgRule{{
+			Name:        "o",
+			Access:      AccessReadWrite,
+			Permissions: map[string]Access{"issues": AccessNone},
+		}},
+	}
+	// Writes with an indeterminate/unrecognized resource fail closed.
+	for _, res := range []string{"", classifier.ResourceUnknown} {
+		if r := p.Evaluate("o/rw", "o", classifier.Write, res, ""); r.Allowed {
+			t.Errorf("repo write with resource=%q should be denied under a per-resource rule", res)
+		}
+		if r := p.Evaluate("", "o", classifier.Write, res, ""); r.Allowed {
+			t.Errorf("org write with resource=%q should be denied under a per-resource rule", res)
+		}
+	}
+	// Reads with an empty resource still fall back to base access (unchanged behavior).
+	if r := p.Evaluate("o/rw", "o", classifier.Read, "", ""); !r.Allowed {
+		t.Errorf("empty-resource READ should still fall back to base access: %s", r.Reason)
+	}
+	// A rule WITHOUT per-resource permissions is unaffected (the per-resource gate never engages).
+	plain := &Policy{Repo: []RepoRule{{Name: "o/rw", Access: AccessReadWrite}}}
+	if r := plain.Evaluate("o/rw", "o", classifier.Write, "", ""); !r.Allowed {
+		t.Errorf("write with empty resource should be allowed when the rule has no per-resource permissions: %s", r.Reason)
+	}
+}
+
 func TestRepoPermTakesPriorityOverOrg(t *testing.T) {
 	p := &Policy{
 		Defaults: Defaults{Mode: ModeDeny},

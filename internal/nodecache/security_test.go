@@ -22,12 +22,12 @@ func TestSec_OnlyVerifiedMappingsServed(t *testing.T) {
 	c := New(30 * time.Minute)
 	defer c.Stop()
 
-	if _, _, ok := c.Get("PR_kwDONeverResolved"); ok {
+	if _, _, _, ok := c.Get("PR_kwDONeverResolved"); ok {
 		t.Fatal("a node never resolved from GitHub must not be in the cache")
 	}
 
-	c.Put("PR_kwDOResolved", "allowed-org", "rw-repo")
-	owner, repo, ok := c.Get("PR_kwDOResolved")
+	c.Put("PR_kwDOResolved", "allowed-org", "rw-repo", "PullRequest")
+	owner, repo, _, ok := c.Get("PR_kwDOResolved")
 	if !ok || owner != "allowed-org" || repo != "rw-repo" {
 		t.Fatalf("verified mapping should be served verbatim, got %s/%s ok=%v", owner, repo, ok)
 	}
