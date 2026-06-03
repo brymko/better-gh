@@ -61,7 +61,7 @@ func TestRepoList_ViewerAlias_FilterRedacts(t *testing.T) {
 	if err := json.Unmarshal([]byte(resp), &parsed); err != nil {
 		t.Fatal(err)
 	}
-	out := Filter(parsed, func(owner, repo, resource string) bool { return false }) // deny everything
+	out := Filter(parsed, func(owner, repo, resource string, _ bool) bool { return false }) // deny everything
 	b, _ := json.Marshal(out)
 	t.Logf("filtered response: %s", b)
 	if strings.Contains(string(b), "private-repo") {

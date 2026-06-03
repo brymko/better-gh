@@ -172,3 +172,15 @@ access = "none"
 
 (A fully denied repo is redacted to `null` in the GraphQL response, so `gh repo list` shows it
 as a blank row rather than dropping it — its name and data never leave the proxy.)
+
+To let a token read **any public repo** (e.g. so CI can read open-source dependencies) without
+listing each, set a public baseline:
+
+```toml
+[defaults]
+mode   = "deny"
+public = "read"     # read any PUBLIC repo; private repos still need an explicit [[repo]] rule
+```
+
+It is verified against GitHub's real visibility (a private repo is never exposed), an explicit
+rule still wins (`access = "none"` blocks even a public repo), and it never grants writes.

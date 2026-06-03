@@ -18,7 +18,7 @@ func TestForksPathIsEnum(t *testing.T) {
 func TestForksDropsDeniedForks(t *testing.T) {
 	// /repos/o/r/forks returns repository objects owned by others.
 	body := []byte(`[{"full_name":"o/r-fork-allowed"},{"full_name":"blocked/secret-fork"}]`)
-	out := Filter("/repos/o/r/forks", body, func(repo string) bool { return repo == "o/r-fork-allowed" })
+	out := Filter("/repos/o/r/forks", body, func(repo string, _ bool) bool { return repo == "o/r-fork-allowed" })
 	s := string(out)
 	if strings.Contains(s, "secret-fork") {
 		t.Fatalf("denied fork not dropped: %s", s)

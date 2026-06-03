@@ -73,6 +73,11 @@ type Policy struct {
 type Defaults struct {
 	Mode     DefaultMode       `toml:"mode" json:"mode"`
 	Unscoped map[string]Access `toml:"unscoped,omitempty" json:"unscoped,omitempty"`
+	// Public is the baseline READ access for PUBLIC repos not covered by an explicit repo/org
+	// rule. "read" lets a token read any public repo (verified against GitHub's real
+	// visibility by the response filter); "none" (default) keeps the old behavior. It never
+	// grants write — a public repo needs an explicit [[repo]] rule for write access.
+	Public Access `toml:"public,omitempty" json:"public,omitempty"`
 }
 
 type OrgRule struct {
@@ -297,6 +302,35 @@ func (p *Policy) CanReadAnything(repo, org string) bool {
 		}
 	}
 	return p.Defaults.Mode == ModeAllow
+}
+
+// ruleMatches reports whether an explicit repo or org rule covers (repo, org). When one does
+// it governs, and the public baseline (defaults.public) does NOT apply — an explicit rule,
+// allow or deny, always wins over the baseline.
+func (p *Policy) ruleMatches(repo, org string) bool {
+	for _, r := range p.Repo {
+		if repo != "" && strings.EqualFold(r.Name, repo) {
+			return true
+		}
+	}
+	for _, o := range p.Org {
+		if org != "" && strings.EqualFold(o.Name, org) {
+			return true
+		}
+	}
+	return false
+}
+
+// PublicReadEligible reports whether the public baseline (defaults.public) would grant READ to
+// repo under org: defaults.public is set, the access is a read, and no explicit rule covers
+// (repo, org). The CALLER must confirm the repo is actually public (GitHub's authoritative
+// visibility) before relying on this — the baseline never applies to private repos and never
+// grants write (a public repo needs an explicit [[repo]] rule for write access).
+func (p *Policy) PublicReadEligible(repo, org string, access classifier.AccessLevel) bool {
+	if access != classifier.Read || p.Defaults.Public == AccessNone {
+		return false
+	}
+	return !p.ruleMatches(repo, org)
 }
 
 func permits(rule Access, requested classifier.AccessLevel) bool {

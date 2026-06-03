@@ -34,6 +34,6 @@ func FuzzFilter(f *testing.F) {
 		if json.Unmarshal(data, &m) != nil || m == nil {
 			return
 		}
-		_ = Filter(m, func(owner, repo, _ string) bool { return owner == "o" && repo == "r" }) // must not panic
+		_ = Filter(m, func(owner, repo, _ string, _ bool) bool { return owner == "o" && repo == "r" }) // must not panic
 	})
 }

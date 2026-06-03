@@ -71,11 +71,11 @@ user = "read"       # let /user, viewer{} etc. through
 search = "read"     # allow search endpoints
 
 [[org]]
-name = "brymko"
+name = "octocat"
 access = "read"
 
 [[repo]]
-name = "brymko/better-gh"
+name = "octocat/Hello-World"
 access = "read-write"
 ```
 
@@ -121,6 +121,7 @@ Policy files use TOML. In socket mode, the policy is loaded from `~/.config/bgh/
 ```toml
 [defaults]
 mode = "deny"                    # "deny" or "allow"
+public = "read"                  # read ANY public repo (verified against GitHub); private repos still need a rule below
 
 [defaults.unscoped]
 user = "read"                    # allow /user, viewer{} reads
@@ -164,6 +165,9 @@ access = "read-write"
 | Field | Values | Description |
 |---|---|---|
 | `mode` | `"deny"` (default), `"allow"` | Fallback decision when no rule matches. |
+| `public` | `"none"` (default), `"read"` | Baseline read access to **public** repos not covered by a `[[repo]]`/`[[org]]` rule. |
+
+**`public` (public-repo baseline).** With `public = "read"`, a token may read any **public** repository, even one with no explicit rule — handy for letting CI read open-source dependencies without listing each. It is enforced against GitHub's **real** visibility (an authoritative lookup for direct repo reads; an injected visibility marker for GraphQL; each entry's `private` for REST listings), so it can **never** expose a private repo, and unknown visibility is treated as private. An explicit `[[repo]]`/`[[org]]` rule always wins (so `access = "none"` on a public repo still blocks it). The baseline is **read-only** — writing to a public repo still needs an explicit `[[repo]]` rule with write access.
 
 ### `[defaults.unscoped]` section
 
@@ -257,6 +261,11 @@ For each request, the classifier extracts `(repo, org, access_level, resource, u
    → "allow" → allow
    → "deny"  → deny
 ```
+
+When the result is **deny** for a repo **read** and `[defaults].public = "read"`, a final public-repo
+baseline applies: if no `[[repo]]`/`[[org]]` rule matched and the repo is actually **public**
+(verified against GitHub, never the client's claim), the read is allowed. This never overrides an
+explicit rule and never grants writes — see [`[defaults]` → `public`](#defaults-section).
 
 Evaluation stops at the first matching rule. A `[[repo]]` rule always takes priority over an `[[org]]` rule for the same org, and both take priority over the default. Within a rule, per-resource permissions take priority over the rule's base access level. Repo/org names match case-insensitively.
 
@@ -506,7 +515,7 @@ policy_file = "~/.config/bgh/policy.toml"
 Every request is logged to `~/.config/bgh/audit.jsonl`:
 
 ```json
-{"ts":"2026-05-26T14:30:00Z","method":"GET","path":"/repos/brymko/better-gh/pulls","repo":"brymko/better-gh","resource":"pulls","access":"read","policy_result":"allowed","github_status":200,"duration_ms":142,"mode":"socket","token_name":"(socket)"}
+{"ts":"2026-05-26T14:30:00Z","method":"GET","path":"/repos/octocat/Hello-World/pulls","repo":"octocat/Hello-World","resource":"pulls","access":"read","policy_result":"allowed","github_status":200,"duration_ms":142,"mode":"socket","token_name":"(socket)"}
 {"ts":"2026-05-26T14:30:01Z","method":"POST","path":"/repos/unknown/repo/pulls","repo":"unknown/repo","resource":"pulls","access":"write","policy_result":"denied: default policy is deny","github_status":null,"duration_ms":5,"mode":"ghe","token_name":"ci-bot"}
 {"ts":"2026-05-26T14:30:02Z","method":"GET","path":"/user","unscoped_category":"user","access":"read","policy_result":"allowed","github_status":200,"duration_ms":45,"mode":"socket","token_name":"(socket)"}
 ```

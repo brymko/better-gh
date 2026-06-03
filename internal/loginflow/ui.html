@@ -106,6 +106,13 @@
           <div id="orgs"></div>
           <button class="secondary" id="addOrg" type="button" style="margin-top:8px">+ add org</button>
           <label style="margin-top:16px"><input type="checkbox" id="allowSearch" style="width:auto;vertical-align:-1px"> allow search</label>
+          <label style="margin-top:16px">Public repos
+            <select id="publicAccess" style="width:auto;margin-left:8px;display:inline-block">
+              <option value="none">none (default)</option>
+              <option value="read">read any public repo</option>
+            </select>
+          </label>
+          <p class="hint">Read access to any <b>public</b> repo (verified against GitHub). Private repos still need an explicit entry above; writes to a public repo also need an entry.</p>
         </div>
 
         <div class="panel" id="panelToml">
@@ -216,6 +223,7 @@ function policySummary(p){
   (p.repo||[]).forEach(r=>parts.push(r.name+"="+r.access));
   (p.org||[]).forEach(o=>parts.push("org:"+o.name+"="+o.access));
   if(d.unscoped && d.unscoped.search) parts.push("search");
+  if(d.public && d.public !== "none") parts.push("public:"+d.public);
   return parts.join(" · ");
 }
 function renderTokens(list){
@@ -264,7 +272,10 @@ function collect(sel){ return [...document.querySelectorAll(sel+" .row")].map(r=
 function currentBuilderPolicy(){
   const unscoped = { user:"read", meta:"read" };
   if($("allowSearch").checked) unscoped.search = "read";
-  return { defaults:{ mode:"deny", unscoped }, org:collect("#orgs"), repo:collect("#repos") };
+  const defaults = { mode:"deny", unscoped };
+  const pub = $("publicAccess").value;
+  if(pub && pub !== "none") defaults.public = pub;
+  return { defaults, org:collect("#orgs"), repo:collect("#repos") };
 }
 function applyPolicyToBuilder(p){
   p = p || {};
@@ -274,10 +285,12 @@ function applyPolicyToBuilder(p){
   if(!document.querySelector("#repos .row")) addRepoRow();
   if(!document.querySelector("#orgs .row")) addOrgRow();
   $("allowSearch").checked = !!(p.defaults && p.defaults.unscoped && p.defaults.unscoped.search);
+  $("publicAccess").value = (p.defaults && p.defaults.public) || "none";
 }
 function builderToToml(){
   const p = currentBuilderPolicy();
   let s = '[defaults]\nmode = "deny"\n';
+  if(p.defaults.public && p.defaults.public !== "none") s += `public = "${p.defaults.public}"\n`;
   const u = p.defaults.unscoped || {}; const keys = Object.keys(u).filter(k=>u[k] && u[k] !== "none");
   if(keys.length){ s += "\n[defaults.unscoped]\n"; keys.forEach(k=> s += `${k} = "${u[k]}"\n`); }
   p.org.forEach(o=> s += `\n[[org]]\nname = "${o.name}"\naccess = "${o.access}"\n`);
@@ -321,7 +334,7 @@ function resetCreate(){
   $("createBtn").textContent = "Create token";
   $("cancelEdit").style.display = "none";
   $("tokName").value = "";
-  $("repos").innerHTML=""; $("orgs").innerHTML=""; $("tomlSpec").value=""; $("allowSearch").checked=false;
+  $("repos").innerHTML=""; $("orgs").innerHTML=""; $("tomlSpec").value=""; $("allowSearch").checked=false; $("publicAccess").value="none";
   addRepoRow(); addOrgRow(); setTab("builder");
 }
 $("cancelEdit").onclick = resetCreate;

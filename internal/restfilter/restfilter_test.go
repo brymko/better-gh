@@ -5,12 +5,12 @@ import (
 	"testing"
 )
 
-func allowOnly(allowed ...string) func(string) bool {
+func allowOnly(allowed ...string) func(string, bool) bool {
 	set := map[string]bool{}
 	for _, a := range allowed {
 		set[a] = true
 	}
-	return func(repo string) bool { return set[repo] }
+	return func(repo string, _ bool) bool { return set[repo] }
 }
 
 func TestIsRepoEnumPath(t *testing.T) {
