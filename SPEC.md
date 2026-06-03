@@ -39,7 +39,7 @@ The real GitHub token never reaches the client.
 | `internal/config`, `internal/tlsgen`, `internal/web` | Config loading, self-signed TLS, admin UI/API |
 | `internal/oauth` | GitHub OAuth device flow (`bgh-proxy login` and the sign-in IdP) |
 | `internal/owner` | Deployment owner: TOFU GitHub login + captured custodian token (`owner.json`) |
-| `internal/loginflow` | Sign-in IdP under `/login/*` + `/ui`: GitHub device flow → owner gate → mint scoped token |
+| `internal/loginflow` | Sign-in IdP: `/login/*` (gh auth login, device + web) and `/ui` **owner console** (GitHub-session-gated — list / revoke / edit-as-reissue / create tokens via builder or pasted TOML). GitHub device flow → TOFU owner gate → mint scoped token |
 | `internal/gqlfilter` | Schema-aware GraphQL response filter (redacts denied-repo data) |
 | `cmd/bgh-proxy` | CLI: `init`, `login`, `serve`, `token …` |
 
@@ -137,3 +137,5 @@ Explicitly **not** boundaries (see README → Security model): the response filt
 ## Non-goals (not implemented)
 
 mTLS team mode and per-identity client certs; multi-token upstream routing; encrypted token storage; glob patterns in rules; policy hot-reload; HA/clustering; an audit-query CLI. (Response-body filtering IS implemented for GraphQL and for the known REST enumeration/search endpoints; arbitrary REST bodies are not otherwise filtered, so a fine-grained upstream PAT remains the floor.)
+
+**API only, not git.** The proxy serves the GitHub REST + GraphQL APIs (`/api/v3`, `/api/graphql`) plus its own `/login`/`/ui`; it is not a git server. `gh repo clone` / `git push` through the proxy fail, and git transport is neither carried nor policy-filtered — policy governs API access only (file contents are reachable via the `contents` API, which IS filtered). Git access control to the underlying repos remains GitHub's job.

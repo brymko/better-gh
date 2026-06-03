@@ -59,7 +59,7 @@ Tailscale and the proxy on the same host); the cert clients see is the real Let'
 Sign in once (the first sign-in claims the deployment + captures the custodian; afterwards
 only that GitHub account may sign in):
 ```bash
-# Web: open https://vps.tailnet.ts.net/ui → Sign in with GitHub → pick a policy → copy the token
+# Web: open https://vps.tailnet.ts.net/ui → Sign in with GitHub → owner console (create/list/revoke tokens) → copy the token
 # CLI:
 gh auth login --hostname vps.tailnet.ts.net   # browser flow; mints a scoped token
 gh pr list -R allowed/repo
@@ -118,7 +118,7 @@ caddy run --config Caddyfile # auto-provisions the Let's Encrypt cert
 ```
 
 ### Client — zero trust setup
-Open `https://proxy.example.com/ui` to sign in + create a token, or:
+Open `https://proxy.example.com/ui` for the owner console (sign in with GitHub → create / list / revoke tokens), or:
 ```bash
 gh auth login --hostname proxy.example.com
 ```

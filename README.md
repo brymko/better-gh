@@ -38,7 +38,7 @@ gh config set http_unix_socket ~/.config/bgh/proxy.sock
 ```
 
 > [!NOTE]
-> Don't run `gh auth login` while `gh` is pointed at the proxy — that flow tries to put a *real* GitHub token on the client, which is exactly what the proxy exists to avoid, and the proxy will deny the OAuth endpoint (403). Clients authenticate to the **proxy** (GHE mode, below); the proxy holds the one real token.
+> This is **socket mode** — don't `gh auth login` here (socket mode doesn't serve the sign-in flow, and the local socket already trusts your user). In **GHE mode** (below), `gh auth login --hostname <proxy>` is the *supported* way a client gets a scoped token — the proxy serves that flow and holds the one real token.
 
 ## Upstream token
 
@@ -87,7 +87,7 @@ Listens on HTTPS. Each client gets a **proxy token** with its own scoped policy.
 
 **Sign in with GitHub — bootstrap + tokens, nothing to pre-configure.** Signing in with GitHub *is* the setup: the proxy captures your GitHub token as its custodian and hands you scoped tokens. The **first** sign-in claims the deployment (trust-on-first-use); after that, only that same GitHub account may sign in (web *and* CLI).
 
-- **Web — create a token in the browser.** Open `https://proxy.example.com/ui`, click **Sign in with GitHub**, authorize, pick a policy (deny-default + the repos/orgs you want), and copy the `bgh_` token it shows you.
+- **Web — the owner console.** Open `https://proxy.example.com/ui` and **Sign in with GitHub**; you get a small console (a session lasting ~30 min) to **list** your tokens, **revoke** them, **edit** (re-issue with new permissions), and **create** new ones — via the builder (repo/org fields autocompleted from your own account) or by pasting a full TOML policy. Copy the `bgh_` token it shows you.
 - **CLI — `gh auth login`, nothing to copy.**
   ```bash
   gh auth login --hostname proxy.example.com   # pick "Login with a web browser"
@@ -442,14 +442,16 @@ bgh-proxy token delete <name-or-id>
 
 `token create` prints the secret to stdout (shown once, not retrievable again). The CLI talks to the admin API, so changes take effect immediately on the running server.
 
-### Web UI
+### Web UIs
 
-Admin UI served on a separate plain HTTP port (default `127.0.0.1:7844`). Open it in a browser, paste the admin secret to authenticate.
+Two separate UIs, different auth:
 
-- List all tokens with status, creation date, last used
-- Create tokens with org/repo rules via form
-- View token details and policy
-- Revoke tokens
+- **Owner console** — `/ui` on the **GHE HTTPS** listener, authenticated by **GitHub sign-in** (the deployment owner). List / revoke / edit (re-issue) / create tokens, via a builder (repo/org fields autocompleted from your own account) or a pasted TOML policy. This is the one remote clients reach — see **GHE mode** above.
+- **Admin UI** — on `admin_bind` (default `127.0.0.1:7844`, plain HTTP, **loopback only**), authenticated by the pasted **admin secret**. A simpler form for local administration on the proxy host:
+  - List all tokens with status, creation date, last used
+  - Create tokens with org/repo rules via form
+  - View token details and policy
+  - Revoke tokens
 
 ### Admin API
 
@@ -469,10 +471,14 @@ All endpoints require `Authorization: token <admin-secret>`. Token changes go th
 
 ```toml
 bind = "127.0.0.1:7843"           # GHE HTTPS listener
-admin_bind = "127.0.0.1:7844"     # Admin UI (plain HTTP)
+admin_bind = "127.0.0.1:7844"     # Admin UI (plain HTTP, loopback)
 socket = "~/.config/bgh/proxy.sock"
 mode = "both"                     # "socket", "ghe", or "both"
-# github_token = "ghp_..."        # or set BGH_GITHUB_TOKEN
+# github_token = "ghp_..."        # optional fallback custodian (or BGH_GITHUB_TOKEN); the first sign-in captures one
+# external_url = "https://proxy.example.com"  # public URL when behind a TLS-terminating front (Tailscale/Caddy) — used in the device-flow verification URL
+# oauth_client_id = "..."         # OAuth app for sign-in / `bgh-proxy login` (default: gh's public app, no registration)
+# oauth_scopes = "repo read:org gist workflow"  # scopes captured as the custodian on sign-in
+# tls_dir = "~/.config/bgh"       # directory holding the self-signed CA + server cert/key
 audit_log = "~/.config/bgh/audit.jsonl"
 policy_file = "~/.config/bgh/policy.toml"
 ```
@@ -523,7 +529,7 @@ The proxy holds one **powerful upstream GitHub token** and hands out **narrow ac
 - Unparseable, over-deep, or cyclic GraphQL fails closed (denied), and never crashes the proxy.
 - **GraphQL read isolation is enforced by schema-aware response filtering.** The proxy types each read against GitHub's GraphQL schema, rewrites it to tag every repo-scoped object with its repository **and its type**, forwards it, and then **redacts from the response** every object the policy denies for that **(repository, resource)** — the resource derived from the tagged type (`PullRequest`→`pulls`, `Issue`→`issues`, …). This is sound no matter how the query reaches a repo — multi-root, `owner.repositories`, `owner.repository(name:)`, `forks`, `node(id:)`, search results, even `viewer { repositories }` — each repo-scoped datum is checked against its *real* repository, and a per-resource restriction like `pulls = "none"` is enforced even on objects reached by *navigation*, not just at the entry point. Denied data comes back as `null`; allowed data is untouched. (This also means enabling the `user`/`search` categories no longer leaks denied-repo *contents* via enumeration — those repos are redacted.) The **same filtering covers mutation response payloads** (a mutation's return selection is itself a read sub-graph), so a write grant on one repo cannot read a denied repo through the value a mutation returns.
 - **The filter sees plaintext and fails closed.** The proxy does **not** forward the client's `Accept-Encoding`, so upstream responses arrive decompressed and every body can be typed and redacted; a GraphQL response that cannot be parsed is **denied**, never passed through. A query that pre-declares the proxy's reserved marker alias (which could otherwise suppress a repository tag) is rejected (fail closed).
-- **REST enumeration/search responses are redacted too.** The REST endpoints that return repository-bearing entries from many repos — `/user/repos`, `/user/issues`, `/user/starred`, `/orgs/{org}/repos`, `/orgs/{org}/issues`, `/users/{u}/repos`, `/repos/{owner}/{repo}/forks`, `/issues`, `/notifications`, and `/search/{repositories,code,issues,commits}` — have denied-repo entries dropped from the response (by `full_name` / `repository.full_name` / `repository_url`). Without this, the `user`/`search`/`notifications` categories would let a client enumerate denied repos' metadata via REST, read their code via `/search/code`, or read issue/PR titles via `/notifications`, sidestepping the GraphQL filter. A search response that drops matches has its `total_count` rewritten to the kept count (and `incomplete_results` set) so the count can't be used as a denied-repo existence oracle. (Defense-in-depth: an off-shape body passes through unchanged.)
+- **REST enumeration/search responses are redacted too.** The REST endpoints that return repository-bearing entries from many repos — `/user/repos`, `/user/issues`, `/user/starred`, `/user/subscriptions`, `/orgs/{org}/repos`, `/orgs/{org}/issues`, `/users/{u}/repos`, `/repos/{owner}/{repo}/forks`, `/issues`, `/notifications`, and `/search/{repositories,code,issues,commits}` — have denied-repo entries dropped from the response (by `full_name` / `repository.full_name` / `repository_url`). Without this, the `user`/`search`/`notifications` categories would let a client enumerate denied repos' metadata via REST, read their code via `/search/code`, or read issue/PR titles via `/notifications`, sidestepping the GraphQL filter. A search response that drops matches has its `total_count` rewritten to the kept count (and `incomplete_results` set) so the count can't be used as a denied-repo existence oracle. (Defense-in-depth: an off-shape body passes through unchanged.)
 - **The upstream token's reach is not advertised.** The `X-OAuth-Scopes`, `X-Accepted-OAuth-Scopes`, and `X-OAuth-Client-Id` response headers (which reveal the custodian token's scopes and OAuth client) are stripped from forwarded responses, so a proxy-token holder cannot learn how powerful the real token is.
 
 **What is *not* a boundary** — read these before trusting it:
@@ -531,6 +537,7 @@ The proxy holds one **powerful upstream GitHub token** and hands out **narrow ac
 - **Per-resource redaction is as complete as the type→resource map.** The filter tags each object with its GraphQL type and enforces per-resource policy (e.g. `pulls = "none"`) on it wherever it appears — entry point *and* navigation. The map covers the resource-bearing types (pulls / issues / commits / releases / branches / checks / contents / deployments, plus commit statuses and branch-protection rules). A repo-scoped type **not** in the map falls back to the rule's base access (repo-level), so a per-resource restriction is not enforced on it — but those types are wrappers/connections (whose contained objects carry their own resource tag), timeline events (gated by their marked parent issue/PR), or types with no per-resource key (e.g. discussions). Keep the embedded schema fresh so the mapping stays current.
 - **Only response `data` is redacted, not GraphQL `errors`.** A denied/absent repo's *name* can still surface in an upstream error message (e.g. "Could not resolve to a Repository …"). This isolates repo *contents*, not the existence/names of repos a query already references.
 - **Counts and aggregates leak; only contents are redacted.** The filter removes denied-repo *objects* from a GraphQL response, but a connection's `totalCount` / `search`'s `issueCount`/`repositoryCount`/`discussionCount` are scalars computed by GitHub over the full (pre-redaction) set, so they reveal *how many* denied items matched — and `totalCount − len(nodes)` discloses the hidden count regardless of how elements are dropped. In particular `search(query:"<text>", type:ISSUE){ issueCount }` is an existence oracle for issue/PR/discussion *text* in denied repos, and `viewer { repositories { totalCount } }` leaks the custodian token's repo breadth. This is not soundly closable in the response filter (count fields can be aliased, `totalCount` is a cross-page total, and stripping counts would break legitimate counts on *allowed* repos), so the **fine-grained upstream PAT is the bound** — scoped to only the proxy's repos, GitHub never searches/counts the denied ones. (The REST `/search` `total_count` is opportunistically rewritten to the kept count; GraphQL counts are not.)
+- **Only the GitHub API is proxied, not git.** The proxy serves `/api/v3` + `/api/graphql` (plus `/login`/`/ui`), not git transport — so `gh repo clone` / `git push` *through the proxy* fail (it is not a git server), and git traffic is never carried or filtered by it. Policy governs **API** access (including reading file contents via the `contents` API); cloning or pushing a repo's code over git is out of scope. A client that also holds a direct `github.com` credential can run git (and API) straight to GitHub, bypassing the proxy entirely — see [docs/deployment.md](docs/deployment.md) "Client gotchas".
 - As **defense-in-depth**, a **fine-grained upstream PAT** scoped to only the repos the proxy should reach still bounds what any query — typed or not — can touch, so GitHub itself enforces the floor. Recommended for high-stakes setups.
 - It does not authenticate *which* local process uses the socket, only that it is your user.
 - mTLS / per-identity client certs are not implemented; GHE-mode identity is the bearer proxy token.
