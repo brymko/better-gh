@@ -52,12 +52,10 @@ func IsRepoEnumPath(normPath string) bool {
 }
 
 // Filter redacts denied-repo entries from a recognized enumeration/search response.
-// authorized receives "owner/repo" and the entry's visibility (isPrivate, with unknown
-// reported as private so the public-repo baseline never keeps an entry whose visibility could
-// not be determined). Repo-list / issue-list endpoints return a JSON array; search endpoints
-// return {items:[...], total_count, ...}. An off-shape body (e.g. an error object) is returned
-// unchanged.
-func Filter(normPath string, body []byte, authorized func(ownerRepo string, isPrivate bool) bool) []byte {
+// authorized receives "owner/repo". Repo-list / issue-list endpoints return a JSON array;
+// search endpoints return {items:[...], total_count, ...}. An off-shape body (e.g. an error
+// object) is returned unchanged.
+func Filter(normPath string, body []byte, authorized func(ownerRepo string) bool) []byte {
 	s := segments(normPath)
 	if len(s) >= 1 && s[0] == "search" {
 		return filterSearch(body, authorized)
@@ -65,7 +63,7 @@ func Filter(normPath string, body []byte, authorized func(ownerRepo string, isPr
 	return filterArray(body, authorized)
 }
 
-func filterArray(body []byte, authorized func(string, bool) bool) []byte {
+func filterArray(body []byte, authorized func(string) bool) []byte {
 	var arr []json.RawMessage
 	if json.Unmarshal(body, &arr) != nil {
 		return body // not an array (error object / unexpected shape) → unchanged
@@ -83,7 +81,7 @@ func filterArray(body []byte, authorized func(string, bool) bool) []byte {
 	return out
 }
 
-func filterSearch(body []byte, authorized func(string, bool) bool) []byte {
+func filterSearch(body []byte, authorized func(string) bool) []byte {
 	var obj map[string]json.RawMessage
 	if json.Unmarshal(body, &obj) != nil {
 		return body
@@ -130,17 +128,15 @@ func filterSearch(body []byte, authorized func(string, bool) bool) []byte {
 // (repository.full_name), or an issue (repository.full_name or repository_url) — and reports
 // whether the policy permits it. An entry whose repository cannot be determined is DROPPED
 // (fail closed), since it cannot be proven to belong to an allowed repository.
-func repoAllowed(raw json.RawMessage, authorized func(string, bool) bool) bool {
+func repoAllowed(raw json.RawMessage, authorized func(string) bool) bool {
 	var o struct {
 		FullName string `json:"full_name"`
 		Name     string `json:"name"`
-		Private  *bool  `json:"private"`
 		Owner    struct {
 			Login string `json:"login"`
 		} `json:"owner"`
 		Repository struct {
 			FullName string `json:"full_name"`
-			Private  *bool  `json:"private"`
 		} `json:"repository"`
 		RepositoryURL string `json:"repository_url"`
 	}
@@ -162,14 +158,5 @@ func repoAllowed(raw json.RawMessage, authorized func(string, bool) bool) bool {
 	if repo == "" || strings.Count(repo, "/") != 1 {
 		return false
 	}
-	// Visibility for the public-repo baseline: the entry's own `private` (a repo object) or
-	// its nested `repository.private` (an issue/search item). Unknown → private (fail closed),
-	// so an entry whose shape omits visibility is never kept by the baseline.
-	isPrivate := true
-	if o.Private != nil {
-		isPrivate = *o.Private
-	} else if o.Repository.Private != nil {
-		isPrivate = *o.Repository.Private
-	}
-	return authorized(repo, isPrivate)
+	return authorized(repo)
 }

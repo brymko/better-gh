@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"better-gh/internal/audit"
@@ -47,8 +46,6 @@ type Handler struct {
 	NodeCache    *nodecache.Cache
 	GQLFilter    *gqlfilter.Schema // schema-aware GraphQL response filter (read isolation)
 	UpstreamURL  string            // default "" → "https://api.github.com"
-	visibility   *visCache         // memoizes repo public/private for the defaults.public baseline
-	visOnce      sync.Once         // lazily creates visibility on first public-baseline lookup
 }
 
 // custodianToken is the GitHub token the proxy forwards with: the dynamic Custodian (the
@@ -226,15 +223,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	result := evaluateScopes(pol, &classified)
 
-	// Public-repo baseline (defaults.public): a denied READ of a PUBLIC repo not covered by an
-	// explicit rule is permitted. For filtered paths this lets the request proceed and the
-	// response filter keeps only public+eligible repos; for an unfiltered REST repo-scoped read
-	// it looks up the target's real visibility so a private repo is never fetched. The
-	// fail-closed checks below still apply (e.g. an untypeable GraphQL query is re-denied).
-	if !result.Allowed {
-		result = h.allowPublicRead(r.Context(), pol, &classified, norm, result)
-	}
-
 	// Sound GraphQL read isolation: rewrite the query to tag every repo-scoped object
 	// with its repository, then redact (from the response) any object whose repository
 	// the policy denies. This is the authoritative defense against cross-repo navigation
@@ -261,16 +249,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if respFilter == nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) && restfilter.IsRepoEnumPath(norm) {
 		p := pol
 		respFilter = func(resp []byte) ([]byte, bool) {
-			return restfilter.Filter(norm, resp, func(repo string, isPrivate bool) bool {
+			return restfilter.Filter(norm, resp, func(repo string) bool {
 				owner := repo
 				if i := strings.IndexByte(repo, '/'); i > 0 {
 					owner = repo[:i]
 				}
-				if p.CanReadAnything(repo, owner) {
-					return true
-				}
-				// Public-repo baseline: keep a public entry not covered by an explicit rule.
-				return !isPrivate && p.PublicReadEligible(repo, owner, classifier.Read)
+				return p.CanReadAnything(repo, owner)
 			}), true
 		}
 	}
@@ -372,21 +356,12 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 	// "read" grant (e.g. "read only this repo's issues"). Per-resource restrictions are
 	// enforced on the specific child objects (pulls/issues/…) below. A fully-denied repo is
 	// not readable in any way, so its container — and everything in it — is still redacted.
-	filtered := gqlfilter.Filter(parsed, func(owner, repo, resource string, isPrivate bool) bool {
+	filtered := gqlfilter.Filter(parsed, func(owner, repo, resource string) bool {
 		full := owner + "/" + repo
-		allowed := false
 		if resource == "metadata" {
-			allowed = pol.CanReadAnything(full, owner)
-		} else {
-			allowed = pol.Evaluate(full, owner, classifier.Read, resource, "").Allowed
+			return pol.CanReadAnything(full, owner)
 		}
-		if allowed {
-			return true
-		}
-		// Public-repo baseline: keep an object whose repo is public and not covered by an
-		// explicit rule. isPrivate is GitHub's real visibility (unknown→private), so a private
-		// repo is never kept by the baseline.
-		return !isPrivate && pol.PublicReadEligible(full, owner, classifier.Read)
+		return pol.Evaluate(full, owner, classifier.Read, resource, "").Allowed
 	})
 	out, err := json.Marshal(filtered)
 	if err != nil {

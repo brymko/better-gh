@@ -22,12 +22,6 @@ const markerAlias = "bghRepoTagZ9"
 // repo-only marker cannot do (it is repo-granular). Stripped from the response like markerAlias.
 const markerTypeAlias = "bghRepoTypeZ9"
 
-// markerVisAlias is injected alongside the others as the object's repository visibility
-// (isPrivate). The filter uses it to apply the public-repo baseline (defaults.public) against
-// GitHub's REAL visibility — so a private repo can never be exposed by the baseline even if a
-// crafted query claimed otherwise. An absent/null value is treated as private (fail closed).
-const markerVisAlias = "bghRepoVisZ9"
-
 // Augment validates a read query against the GitHub schema and injects, into every
 // repo-scoped selection set, a hidden field revealing that object's repository. It
 // returns the rewritten query. An invalid/untypable query yields an error so the
@@ -84,7 +78,7 @@ func usesReservedAlias(sels ast.SelectionSet, depth int) bool {
 			if key == "" {
 				key = f.Name
 			}
-			if key == markerAlias || key == markerTypeAlias || key == markerVisAlias {
+			if key == markerAlias || key == markerTypeAlias {
 				return true
 			}
 			if usesReservedAlias(f.SelectionSet, depth+1) {
@@ -134,10 +128,9 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string) {
 		}
 	}
 	if s.isRepoScoped(typeName) {
-		// Repo marker (which repository) + type marker (which resource) + visibility marker
-		// (public/private), so the filter can apply per-resource policy AND the public-repo
-		// baseline to this object regardless of how it was reached.
-		*sels = append(*sels, s.marker(typeName), typenameMarker(), s.visMarker(typeName))
+		// Repo marker (which repository) + type marker (which resource), so the filter can
+		// apply per-resource policy to this object regardless of how it was reached.
+		*sels = append(*sels, s.marker(typeName), typenameMarker())
 	}
 }
 
@@ -166,38 +159,13 @@ func (s *Schema) marker(typeName string) *ast.Field {
 	return field
 }
 
-// visMarker builds the hidden repository-visibility field for a repo-scoped type: the SAME
-// path as marker() but reading isPrivate instead of the leaf nameWithOwner on the object's
-// own Repository (Repository → isPrivate; PullRequest → repository{isPrivate}). isPrivate is
-// a non-null Boolean on every Repository, so the path is always valid. The filter reads it to
-// apply the public-repo baseline against GitHub's real visibility.
-func (s *Schema) visMarker(typeName string) *ast.Field {
-	path := s.repoPath[typeName]
-	var field *ast.Field
-	for i := len(path) - 1; i >= 0; i-- {
-		name := path[i]
-		if i == len(path)-1 {
-			name = "isPrivate" // the leaf nameWithOwner and isPrivate are siblings on Repository
-		}
-		f := &ast.Field{Name: name}
-		if field != nil {
-			f.SelectionSet = ast.SelectionSet{field}
-		}
-		field = f
-	}
-	field.Alias = markerVisAlias
-	return field
-}
-
 // Filter walks a GraphQL JSON response and redacts (replaces with null) any repo-scoped
 // object the authorized predicate rejects, then strips the injected markers. authorized
-// receives "owner", "repo", the per-resource key derived from the object's runtime __typename
-// (PullRequest→"pulls", Issue→"issues", …; "metadata" for the repository itself and unmapped
-// types), and isPrivate (the repository's real visibility, with unknown reported as private).
-// Passing the resource lets per-resource policy (e.g. pulls="none") be enforced on objects
-// reached by ANY path — navigation included; isPrivate lets the public-repo baseline keep a
-// public repo while never exposing a private one.
-func Filter(resp map[string]any, authorized func(owner, repo, resource string, isPrivate bool) bool) map[string]any {
+// receives "owner", "repo", and the per-resource key derived from the object's runtime
+// __typename (PullRequest→"pulls", Issue→"issues", …; "metadata" for the repository itself
+// and unmapped types). Passing the resource lets per-resource policy (e.g. pulls="none") be
+// enforced on objects reached by ANY path — navigation included — not just the entry point.
+func Filter(resp map[string]any, authorized func(owner, repo, resource string) bool) map[string]any {
 	v := filterValue(resp, authorized)
 	if m, ok := v.(map[string]any); ok {
 		return m
@@ -205,7 +173,7 @@ func Filter(resp map[string]any, authorized func(owner, repo, resource string, i
 	return map[string]any{}
 }
 
-func filterValue(v any, authorized func(owner, repo, resource string, isPrivate bool) bool) any {
+func filterValue(v any, authorized func(owner, repo, resource string) bool) any {
 	switch val := v.(type) {
 	case map[string]any:
 		if tag, ok := val[markerAlias]; ok {
@@ -214,17 +182,14 @@ func filterValue(v any, authorized func(owner, repo, resource string, isPrivate 
 			// OR if the marker is unparseable (anomalous null/malformed repository) — failing
 			// closed, since we cannot prove the object is authorized. The resource comes from
 			// the runtime type marker (markerTypeAlias); absent/unmapped → "metadata" (base).
-			// isPrivate comes from the visibility marker; unknown → private (fail closed).
 			owner, repo, parsed := repoFromMarker(tag)
 			resource := typeResource(markerTypename(val))
-			isPrivate := markerIsPrivate(val)
-			if !parsed || !authorized(owner, repo, resource, isPrivate) {
+			if !parsed || !authorized(owner, repo, resource) {
 				return nil
 			}
 			delete(val, markerAlias)
 		}
 		delete(val, markerTypeAlias) // strip the injected type marker (whether or not a repo marker rode with it)
-		delete(val, markerVisAlias)  // strip the injected visibility marker likewise
 		for k, child := range val {
 			val[k] = filterValue(child, authorized)
 		}
@@ -237,34 +202,6 @@ func filterValue(v any, authorized func(owner, repo, resource string, isPrivate 
 	default:
 		return v
 	}
-}
-
-// markerIsPrivate returns the repository visibility injected under markerVisAlias. An absent,
-// null, or non-boolean value is reported as PRIVATE (true) — the conservative default so the
-// public-repo baseline can never expose a repo whose visibility we could not confirm public.
-func markerIsPrivate(val map[string]any) bool {
-	priv, ok := findIsPrivate(val[markerVisAlias])
-	if !ok {
-		return true
-	}
-	return priv
-}
-
-// findIsPrivate returns the single Boolean within a visibility-marker value, recursing through
-// the nested objects the marker path produces (e.g. {repository:{isPrivate:false}}). Not found
-// → (false,false), so the caller treats the repo as private.
-func findIsPrivate(v any) (isPrivate bool, found bool) {
-	switch t := v.(type) {
-	case bool:
-		return t, true
-	case map[string]any:
-		for _, child := range t {
-			if p, ok := findIsPrivate(child); ok {
-				return p, true
-			}
-		}
-	}
-	return false, false
 }
 
 // markerTypename returns the runtime __typename injected under markerTypeAlias, or "" if

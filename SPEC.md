@@ -106,13 +106,6 @@ A node that resolves to a repo-scoped **type** but yields no repository (anomalo
 
 `Access` levels: `none` (nothing), `read` (read only), `read-write` (everything). For multi-scope requests the proxy ANDs the per-scope decisions.
 
-**Public-repo baseline (`[defaults].public`).** Set `public = "read"` to let a token read **any public repo** not covered by an explicit `[[repo]]`/`[[org]]` rule (default `"none"` keeps the old behavior). It is a separate layer on top of `Evaluate`, enforced against GitHub's **real** visibility — never the client's claim — so it can never expose a private repo:
-
-- A repo-scoped READ the rules deny is re-checked: an explicit rule (allow *or* deny) always wins, so the baseline only applies to **unlisted** repos.
-- **Unfiltered REST repo reads** (`GET /repos/{o}/{r}/…`) are gated by an authoritative visibility lookup (`GET /repos/{o}/{r}` via the custodian, cached): only a **public** repo is allowed, so a private repo's contents are never fetched for the client.
-- **Filtered paths** — GraphQL (`gqlfilter`) and REST enumeration/search (`restfilter`) — forward the read and the response filter keeps only objects/entries whose repository is public, using an injected `isPrivate` marker (GraphQL) / each entry's `private` (REST). Unknown visibility ⇒ treated as private (fail closed).
-- The baseline is **read-only**: it never grants write. Writing to a public repo still requires an explicit `[[repo]]` rule.
-
 ## Token & secret model
 
 - **Proxy tokens** (GHE mode): random 256-bit secrets, stored as SHA-256 hashes in `tokens.json` (`0600`), each carrying an embedded policy. Looked up in constant time; revocation and hard-deletion both go through the running server so they take effect immediately. `tokens.json` is written atomically (temp + rename).

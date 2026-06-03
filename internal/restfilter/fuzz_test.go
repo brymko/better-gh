@@ -23,8 +23,8 @@ func FuzzFilter(f *testing.F) {
 	for _, s := range seeds {
 		f.Add(s)
 	}
-	denyAll := func(string, bool) bool { return false }
-	allowAll := func(string, bool) bool { return true }
+	denyAll := func(string) bool { return false }
+	allowAll := func(string) bool { return true }
 	f.Fuzz(func(t *testing.T, body string) {
 		for _, p := range paths {
 			// must not panic on either predicate
