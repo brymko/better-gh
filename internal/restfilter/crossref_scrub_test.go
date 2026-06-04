@@ -18,7 +18,7 @@ func TestScrub_TimelineCrossRef(t *testing.T) {
 		`]`
 
 	allow := func(repo string) bool { return repo == "acme/public" }
-	out, ok := Scrub([]byte(body), []string{"$[].source.issue.repository.full_name"}, allow)
+	out, ok := Scrub([]byte(body), []string{"$[].*source.issue.repository.full_name"}, allow)
 	if !ok {
 		t.Fatal("Scrub returned not-ok on valid body")
 	}
@@ -48,7 +48,7 @@ func TestScrub_TimelineCrossRef(t *testing.T) {
 func TestScrub_TimelineLookupWiring(t *testing.T) {
 	const p = "/repos/acme/public/issues/1/timeline"
 	locs := ScrubLocations(p)
-	if len(locs) != 1 || locs[0] != "$[].source.issue.repository.full_name" {
+	if len(locs) != 1 || locs[0] != "$[].*source.issue.repository.full_name" {
 		t.Fatalf("timeline scrub location missing/wrong: %v", locs)
 	}
 	if d, _ := Lookup(p); d != Pass {
@@ -60,11 +60,11 @@ func TestScrub_TimelineLookupWiring(t *testing.T) {
 // must fail closed.
 func TestScrub_NoSourceAndFailClosed(t *testing.T) {
 	clean := `[{"event":"labeled"},{"event":"closed"}]`
-	out, ok := Scrub([]byte(clean), []string{"$[].source.issue.repository.full_name"}, func(string) bool { return false })
+	out, ok := Scrub([]byte(clean), []string{"$[].*source.issue.repository.full_name"}, func(string) bool { return false })
 	if !ok || strings.Contains(string(out), "null") {
 		t.Fatalf("no-source events should be untouched: ok=%v out=%s", ok, out)
 	}
-	if _, ok := Scrub([]byte("not json"), []string{"$[].source.issue.repository.full_name"}, func(string) bool { return true }); ok {
+	if _, ok := Scrub([]byte("not json"), []string{"$[].*source.issue.repository.full_name"}, func(string) bool { return true }); ok {
 		t.Fatal("unparseable body must fail closed (ok=false)")
 	}
 }

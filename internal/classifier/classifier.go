@@ -588,7 +588,10 @@ func resolveStringArg(args ast.ArgumentList, name string, vars map[string]interf
 	case ast.Variable:
 		v, _ := vars[arg.Value.Raw].(string)
 		return v
-	case ast.StringValue:
+	case ast.StringValue, ast.BlockValue:
+		// BlockValue is a triple-quoted GraphQL string ("""…"""). GitHub accepts it anywhere a
+		// String literal is valid, so a repository owner/name/login/search query supplied as a
+		// block string must be read here too — otherwise it reaches GitHub unscoped (round-15).
 		return arg.Value.Raw
 	}
 	return ""
@@ -774,7 +777,11 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 		return
 	}
 	switch v.Kind {
-	case ast.StringValue:
+	case ast.StringValue, ast.BlockValue:
+		// BlockValue ("""…""") is a valid String literal to GitHub, so a node ID or
+		// repositoryNameWithOwner target supplied as a block string MUST be collected here too;
+		// otherwise a multi-root mutation could hide a denied write target in a block string and
+		// ride a plain-string allowed sibling past policy (round-15 CRITICAL).
 		if isRepoSpecKey(name) {
 			if o, r, ok := splitOwnerRepo(v.Raw); ok {
 				addScope(o, r, resource)
@@ -857,7 +864,6 @@ var restResourceMap = map[string]string{
 	"tarball":      "contents",
 	"actions":      "actions",
 	"releases":     "releases",
-	"git":          "git",
 	"commits":      "commits",
 	"compare":      "commits",
 	"branches":     "branches",
@@ -892,6 +898,16 @@ func restResource(segments []string) string {
 		return "metadata"
 	}
 	seg := segments[3]
+	// The low-level Git Data API (/repos/{o}/{r}/git/*) is bucketed by the resource its operation
+	// actually touches, NOT a standalone "git" key — so a per-resource rule isn't silently narrower
+	// than the operator expects (round-15). Previously the whole namespace mapped to "git", which
+	// branches=none / contents=none / commits=none did not cover, so POST /git/refs (create/
+	// force-push/delete a branch) and GET /git/blobs|/git/trees (raw file bytes + tree listing)
+	// escaped those restrictions even though the high-level /branches and /contents paths — and the
+	// GraphQL createRef/blob/tree equivalents — were correctly gated.
+	if seg == "git" {
+		return gitDataResource(segments)
+	}
 	if r, ok := restResourceMap[seg]; ok {
 		return r
 	}
@@ -899,6 +915,26 @@ func restResource(segments []string) string {
 		return "metadata"
 	}
 	return ResourceUnknown
+}
+
+// gitDataResource maps a /repos/{o}/{r}/git/{sub}/… path to the same per-resource key as the
+// functionally-equivalent high-level surface: refs/tags → branches, blobs/trees → contents,
+// commits → commits. An unrecognized git sub-resource (or a bare /git) is ResourceUnknown so a
+// write fails closed under a per-resource rule rather than inheriting base access.
+func gitDataResource(segments []string) string {
+	if len(segments) <= 4 {
+		return ResourceUnknown
+	}
+	switch segments[4] {
+	case "refs", "ref", "matching-refs", "tags":
+		return "branches"
+	case "blobs", "trees":
+		return "contents"
+	case "commits":
+		return "commits"
+	default:
+		return ResourceUnknown
+	}
 }
 
 var restUnscopedMap = map[string]string{
@@ -952,6 +988,14 @@ var gqlFieldToResource = map[string]string{
 }
 
 func gqlMutationResource(name string) string {
+	// createCommitOnBranch writes AND deletes repository FILE CONTENT (its FileChanges input adds
+	// FileAddition{path,contents} and FileDeletion{path}) — the GraphQL equivalent of PUT/DELETE
+	// /repos/{o}/{r}/contents/{path}. Its name contains "Branch", but it must be governed by
+	// `contents`, not `branches`: otherwise a branches=write/contents=none token could write
+	// arbitrary files (e.g. inject a workflow, delete CODEOWNERS). round-15.
+	if name == "createCommitOnBranch" {
+		return "contents"
+	}
 	if strings.Contains(name, "PullRequest") ||
 		name == "enablePullRequestAutoMerge" ||
 		name == "disablePullRequestAutoMerge" {

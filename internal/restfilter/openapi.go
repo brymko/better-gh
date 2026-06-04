@@ -357,12 +357,40 @@ func ScrubLocations(normPath string) []string {
 	return nil
 }
 
+// scrubStep is one segment of a scrub location. A '*'-marked field is the cross-ref object NULLED
+// when the repo read at the end of the path is denied; the terminal segment names that full_name.
+type scrubStep struct {
+	field  string
+	array  bool
+	isNull bool
+}
+
+// parseScrubLoc turns "$[].payload.*forkee.full_name" into steps: array, field payload, NULL-target
+// field forkee, field full_name. A singleton "$.*parent.full_name" has no array step.
+func parseScrubLoc(loc string) []scrubStep {
+	var steps []scrubStep
+	for _, part := range strings.Split(strings.TrimPrefix(loc, "$"), ".") {
+		if part == "" {
+			continue
+		}
+		if strings.HasSuffix(part, "[]") {
+			if name := strings.TrimSuffix(part, "[]"); name != "" {
+				steps = append(steps, scrubStep{field: strings.TrimPrefix(name, "*"), isNull: strings.HasPrefix(name, "*")})
+			}
+			steps = append(steps, scrubStep{array: true})
+			continue
+		}
+		steps = append(steps, scrubStep{field: strings.TrimPrefix(part, "*"), isNull: strings.HasPrefix(part, "*")})
+	}
+	return steps
+}
+
 // Scrub nulls denied foreign-repo cross-reference content in a response, keeping the enclosing
-// array elements. It FAILS CLOSED (ok=false) on a non-empty body it cannot parse, like Redact;
-// an empty body passes through. authorized receives "owner/repo". For each scrub location
-// "$[].source.issue.repository.full_name", it walks to the array, and for each element whose
-// source.issue.repository is a denied repo, sets that element's `source` field to null (the
-// first field after the array) — the event row survives, the foreign content does not.
+// row/object. It FAILS CLOSED (ok=false) on a non-empty body it cannot parse, like Redact; an empty
+// body passes through. authorized receives "owner/repo". Each location marks (with '*') the field to
+// null and gives the path from that field to the foreign repo's full_name; when that repo is present
+// and denied the marked field is set to null. Handles both array-element scrubs (e.g. the issue
+// timeline's source, an event's payload.forkee) and singleton scrubs (GET /repos/{o}/{r} parent).
 func Scrub(body []byte, locs []string, authorized func(ownerRepo string) bool) ([]byte, bool) {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return body, true
@@ -374,20 +402,7 @@ func Scrub(body []byte, locs []string, authorized func(ownerRepo string) bool) (
 		return nil, false
 	}
 	for _, loc := range locs {
-		steps := parseLoc(loc)
-		ai := -1
-		for i, s := range steps {
-			if s.array {
-				ai = i
-				break
-			}
-		}
-		if ai < 0 || ai == len(steps)-1 {
-			continue // a scrub location must address content WITHIN an array element
-		}
-		prefix, elem := steps[:ai], steps[ai+1:]
-		nullField := elem[0].field // the cross-ref wrapper to null (e.g. "source")
-		root = scrubDescend(root, prefix, elem, nullField, authorized)
+		scrubApply(root, parseScrubLoc(loc), authorized)
 	}
 	out, err := json.Marshal(root)
 	if err != nil {
@@ -396,45 +411,52 @@ func Scrub(body []byte, locs []string, authorized func(ownerRepo string) bool) (
 	return out, true
 }
 
-// scrubDescend walks prefix to the target array (recursing through any arrays in the prefix),
-// then for each element nulls nullField when the repo at elem is denied. The element is always
-// kept; only the foreign cross-ref sub-object is removed.
-func scrubDescend(cur any, prefix []locStep, elem []locStep, nullField string, authorized func(string) bool) any {
-	if len(prefix) == 0 {
+// scrubApply dispatches an array-rooted scrub (recurse per element on the tail) or a singleton scrub
+// (walk fields from the root). Scrub locations always have the array (if any) at the front.
+func scrubApply(cur any, steps []scrubStep, authorized func(string) bool) {
+	if len(steps) == 0 {
+		return
+	}
+	if steps[0].array {
 		arr, ok := cur.([]any)
 		if !ok {
-			return cur
+			return
 		}
 		for _, el := range arr {
-			repo := readRepo(el, elem)
-			if repo == "" || authorized(repo) {
-				continue
-			}
-			if m, ok := el.(map[string]any); ok {
-				if _, present := m[nullField]; present {
-					m[nullField] = nil
-				}
-			}
+			scrubFields(el, steps[1:], authorized)
 		}
-		return cur
+		return
 	}
-	s := prefix[0]
-	if s.array {
-		arr, ok := cur.([]any)
+	scrubFields(cur, steps, authorized)
+}
+
+// scrubFields walks pure field steps from obj, tracking the '*'-marked null target's container+key
+// and reading the repo at the terminal field; it nulls the marked field when that repo is present
+// and denied. The surrounding object is otherwise untouched.
+func scrubFields(obj any, steps []scrubStep, authorized func(string) bool) {
+	var nullContainer map[string]any
+	var nullKey string
+	v := obj
+	for _, s := range steps {
+		if s.array {
+			return // nested arrays in a scrub path are unsupported (none in the table)
+		}
+		m, ok := v.(map[string]any)
 		if !ok {
-			return cur
+			return
 		}
-		for i := range arr {
-			arr[i] = scrubDescend(arr[i], prefix[1:], elem, nullField, authorized)
+		if s.isNull {
+			nullContainer, nullKey = m, s.field
 		}
-		return cur
+		v = m[s.field]
 	}
-	m, ok := cur.(map[string]any)
-	if !ok {
-		return cur
+	repo, _ := v.(string)
+	if strings.Count(repo, "/") != 1 {
+		return
 	}
-	if v, present := m[s.field]; present {
-		m[s.field] = scrubDescend(v, prefix[1:], elem, nullField, authorized)
+	if !authorized(repo) && nullContainer != nil {
+		if _, present := nullContainer[nullKey]; present {
+			nullContainer[nullKey] = nil
+		}
 	}
-	return cur
 }

@@ -8,6 +8,7 @@ package loginflow
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"sync"
 	"time"
@@ -117,20 +118,27 @@ func (s *grantStore) withGrant(match func(*grant) bool, fn func(*grant)) bool {
 	return false
 }
 
+// ctEq compares two grant secrets in constant time. The device_code/auth_code/state matchers run at
+// the unauthenticated (and, for /login/oauth/access_token, un-rate-limited) token-exchange endpoint
+// against attacker-supplied values, so they must not leak a prefix-timing oracle via `==`'s early
+// exit — matching grantCookieMatches (console.go) and the admin/store secret compares (round-15).
+func ctEq(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
 func byID(id string) func(*grant) bool {
-	return func(g *grant) bool { return id != "" && g.id == id }
+	return func(g *grant) bool { return id != "" && ctEq(g.id, id) }
 }
 func byUserCode(code string) func(*grant) bool {
-	return func(g *grant) bool { return code != "" && g.userCode == code }
+	return func(g *grant) bool { return code != "" && ctEq(g.userCode, code) }
 }
 func byDeviceCode(code string) func(*grant) bool {
-	return func(g *grant) bool { return code != "" && g.deviceCode == code }
+	return func(g *grant) bool { return code != "" && ctEq(g.deviceCode, code) }
 }
 func byState(state string) func(*grant) bool {
-	return func(g *grant) bool { return state != "" && g.flow == "web" && g.state == state }
+	return func(g *grant) bool { return state != "" && g.flow == "web" && ctEq(g.state, state) }
 }
 func byAuthCode(code string) func(*grant) bool {
-	return func(g *grant) bool { return code != "" && g.authCode == code }
+	return func(g *grant) bool { return code != "" && ctEq(g.authCode, code) }
 }
 
 func (s *grantStore) sweepLoop() {

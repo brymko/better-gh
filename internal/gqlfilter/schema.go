@@ -34,6 +34,77 @@ type Schema struct {
 	repoScoped       map[string]bool       // type name -> has a marker/resolve path to a single repository
 	repoPath         map[string][]pathStep // type name -> no-arg field path to its repo's nameWithOwner
 	nodeResolveQuery string                // nodes(ids:) query covering every repo-scoped Node type
+	typeRes          map[string]string     // object type -> per-resource policy key (derived from @docsCategory + overrides)
+	nodeTypes        map[string]bool       // object types implementing Node (recognized by this snapshot)
+}
+
+// docsCategoryResource maps GitHub's schema @docsCategory(name:) to the proxy's per-resource policy
+// key, for the categories that correspond to a real per-resource permission. Categories with no
+// dedicated key (repos/orgs/users/projects/discussions/reactions/packages/dependabot/security-
+// advisories/…) are absent, so such a type falls to "metadata" (base access) — the documented
+// residual for no-per-resource-key types. Deriving from the schema (instead of a hand-maintained
+// type list) is what closes the round-15 gap where repo-scoped types with a real category
+// (Environment→deployments, WorkflowRun→actions, Milestone/Label→issues, PullRequestThread→pulls,
+// branchProtectionRules→branches, …) silently mapped to "metadata" and dodged a per-resource rule.
+var docsCategoryResource = map[string]string{
+	"pulls":       "pulls",
+	"issues":      "issues",
+	"commits":     "commits",
+	"branches":    "branches",
+	"deployments": "deployments",
+	"actions":     "actions",
+	"checks":      "checks",
+	"releases":    "releases",
+	"git":         "contents", // git objects (blobs/trees/tags) expose file content; ref-like types overridden below
+}
+
+// typeResourceOverride pins types whose @docsCategory names a different axis than the policy
+// taxonomy: commit STATUSES are the proxy's "checks" resource (docsCategory "commits", matching the
+// REST `statuses`→checks mapping); a git Ref is "branches" (docsCategory "git", matching /git/refs→
+// branches and the REST `branches` surface). Overrides win over the docsCategory-derived value.
+var typeResourceOverride = map[string]string{
+	"Status":            "checks",
+	"StatusContext":     "checks",
+	"StatusCheckRollup": "checks",
+	"Ref":               "branches",
+}
+
+// deriveTypeResources builds the object-type → per-resource-key map from the embedded schema's
+// @docsCategory directives, applying typeResourceOverride first. A type with no mapped category is
+// omitted (→ "metadata" at lookup). See docsCategoryResource.
+func deriveTypeResources(schema *ast.Schema) map[string]string {
+	out := map[string]string{}
+	for name, def := range schema.Types {
+		if def.Kind != ast.Object {
+			continue
+		}
+		if r, ok := typeResourceOverride[name]; ok {
+			out[name] = r
+			continue
+		}
+		if d := def.Directives.ForName("docsCategory"); d != nil {
+			if arg := d.Arguments.ForName("name"); arg != nil && arg.Value != nil {
+				if r, ok := docsCategoryResource[arg.Value.Raw]; ok {
+					out[name] = r
+				}
+			}
+		}
+	}
+	return out
+}
+
+// deriveNodeObjectTypes is the set of OBJECT types that implement Node (the only types nodes(ids:)
+// can return). The node resolver uses it to fail closed on a node whose runtime __typename the
+// embedded snapshot does not recognize (live schema drift) rather than treating it as a
+// constraint-free non-repo node (round-15).
+func deriveNodeObjectTypes(schema *ast.Schema) map[string]bool {
+	out := map[string]bool{}
+	for _, d := range schema.PossibleTypes["Node"] {
+		if d.Kind == ast.Object {
+			out[d.Name] = true
+		}
+	}
+	return out
 }
 
 // crossRepoNavFields are singular fields that point to a DIFFERENT repository than the
@@ -71,6 +142,8 @@ func Load() (*Schema, error) {
 		rs[name] = true
 	}
 	sch := &Schema{schema: s, repoScoped: rs, repoPath: paths}
+	sch.typeRes = deriveTypeResources(s)
+	sch.nodeTypes = deriveNodeObjectTypes(s)
 	q := sch.buildNodeResolveQuery()
 	if _, gerr := gqlparser.LoadQuery(s, q); gerr != nil {
 		return nil, fmt.Errorf("building node-resolve query: %s", gerr.Error())

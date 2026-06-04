@@ -465,10 +465,29 @@ func typeResource(typename string) string {
 // GitHub-confirmed type rather than from the mutation field's NAME — so e.g. addComment on a
 // pull request is "pulls" and on an issue is "issues", instead of the name-substring guess
 // (gqlMutationResource) that returns "" for either and let the write dodge a per-resource rule.
-// It is a method (not a bare func) only so callers reach it through the loaded *Schema, like
-// the other type lookups; the mapping itself is schema-independent.
+// It is backed by the schema-derived @docsCategory map (deriveTypeResources), so coverage tracks
+// the embedded schema rather than a hand-maintained list (round-15).
 func (s *Schema) ResourceForType(typename string) string {
-	return gqlTypeToResource[typename] // "" when unmapped; caller falls back to the name guess
+	return s.typeRes[typename] // "" when the type maps to no specific resource; caller falls back to the name guess
+}
+
+// FilterResource is the per-resource key the RESPONSE FILTER enforces on a repo-scoped object of the
+// given runtime type — the same schema-derived mapping as ResourceForType, but defaulting to
+// "metadata" (base access) for types with no specific resource. The proxy's response-filter callback
+// uses this so per-resource policy (e.g. deployments="none") is enforced on every object whose
+// @docsCategory names a real resource, not just the ~30 types an older hand map happened to list.
+func (s *Schema) FilterResource(typename string) string {
+	if r := s.typeRes[typename]; r != "" {
+		return r
+	}
+	return "metadata"
+}
+
+// IsKnownNodeObjectType reports whether typename is an OBJECT type implementing Node that this
+// embedded schema recognizes. The node resolver fails closed on a resolved node whose __typename is
+// NOT recognized here (live schema drift), instead of treating it as a constraint-free non-repo node.
+func (s *Schema) IsKnownNodeObjectType(typename string) bool {
+	return s.nodeTypes[typename]
 }
 
 // repoFromMarker extracts owner/repo from a marker value. The marker subtree contains only

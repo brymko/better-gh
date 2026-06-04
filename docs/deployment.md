@@ -30,6 +30,14 @@ external_url = "https://<public-name>"  # so the `gh auth login` device-flow URL
 `external_url` matters because, behind a TLS-terminating front, the proxy can't infer the
 public address from the request — set it to exactly what clients type after `--hostname`.
 
+> **First, create the config.** `bgh-proxy serve` reads `~/.config/bgh/config.toml` but does **not**
+> create it (only `bgh-proxy init` does). Run **`bgh-proxy init`** once to write
+> `~/.config/bgh/{config.toml,policy.toml}` and generate the TLS certs, then edit `config.toml` as
+> above. If you skip this, the proxy starts with built-in defaults — crucially `external_url = ""`,
+> so behind a front the device-flow URL points at the loopback backend and `gh auth login` breaks —
+> and `mode = "both"`, which **also opens the unix socket**; set `mode = "ghe"` for a remote-only
+> listener.
+
 ---
 
 ## Option A — Tailscale Serve (private, real cert, no domain)
@@ -104,6 +112,11 @@ cannot mint a token). Two consequences for a public deployment:
   does not let a stranger mint tokens. But the device-flow start endpoints are an unauthenticated
   surface: they are rate-limited and capped (a flood is refused with `429`/`503`), yet you should
   still **prefer Option A or a network allowlist** so untrusted clients can't reach them at all.
+  Note the per-source rate limit keys on the *connecting* address, which **behind a TLS-terminating
+  front (Caddy/Tailscale Serve) is the front's loopback address for every client** — so it collapses
+  to a single **global** flood cap, not per-client isolation, and one abusive caller can temporarily
+  exhaust the device-flow budget for all legitimate sign-ins. This is another reason to prefer a
+  network allowlist (Option A) over relying on the rate limit.
 - **Device-code phishing** is inherent to the device flow: an attacker who tricks *you* (the owner)
   into completing a sign-in they initiated could obtain the resulting token. Only complete a sign-in
   you started yourself, and confirm the user code matches the one in your own terminal/browser.
@@ -217,6 +230,21 @@ as a blank row rather than dropping it — its name and data never leave the pro
 The proxy host concentrates one powerful credential **by design**, so operating it safely is
 mostly about protecting that host and knowing how to rotate/recover. Everything below lives under
 `~/.config/bgh/` (all `0600`).
+
+> **The custodian token is stored UNENCRYPTED at rest** — in cleartext JSON in `owner.json` (and, if
+> pre-seeded, in `github-token` / `config.toml`'s `github_token` / the `BGH_GITHUB_TOKEN` env). `0600`
+> only stops *other users*; anyone who gains file read as the proxy's own UID — a same-uid process, a
+> misconfigured backup agent, a container-volume snapshot, or root — gets full custodian access. This
+> at-rest secret **is** the host's blast radius, so treat host file-read as full compromise: use
+> full-disk encryption and tight host access. A fine-grained PAT custodian (see the README's
+> "optional GitHub-enforced floor") bounds that blast radius to the PAT's repos.
+
+> **Inspect / triage before responding.** Confirm who owns the deployment via the startup log line
+> (`deployment owner login=…`) or `owner.json`, and enumerate outstanding client tokens with
+> `bgh-proxy token list` / `bgh-proxy token show <id>` before revoking — you need the name/id to
+> revoke. The local `audit.jsonl` is **append-only by the writer, not tamper-resistant**: anyone with
+> host access can rewrite or delete it, so ship it off-host in near-real-time for trustworthy
+> forensics rather than relying on the on-host copy after a suspected compromise.
 
 ### Firewall the admin listener
 

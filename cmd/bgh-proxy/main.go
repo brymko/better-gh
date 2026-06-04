@@ -92,7 +92,8 @@ Token subcommands:
   token revoke <name-or-id>
   token delete <name-or-id>
 
-Resources: pulls, issues, contents, actions, releases, git, commits, branches, checks, comments, hooks, deployments, pages, keys, metadata
+Resources: pulls, issues, contents, actions, releases, commits, branches, checks, comments, hooks, deployments, pages, keys, metadata
+  (the Git Data API /repos/o/r/git/* is governed by branches [refs/tags], contents [blobs/trees], or commits)
 Unscoped categories: user, search, gists, notifications, events, meta
 
 `)

@@ -121,7 +121,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	norm := classifier.NormalizePath(path)
-	if h.Mode == GHEMode && (norm == "/user" || norm == "/user/") {
+	// Synthetic identity ONLY for GET (gh auth status). A non-GET /user (e.g. PATCH to update the
+	// authenticated user) must be classified + policy-checked, not short-circuited to a fake 200.
+	if h.Mode == GHEMode && r.Method == http.MethodGet && (norm == "/user" || norm == "/user/") {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"login":"bgh-proxy","id":0}`))
 		return
@@ -206,7 +208,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// scopes can be empty when every referenced node is non-repo (e.g. a user
 			// assignee); then the request carries no node-derived repo constraint.
 			if len(scopes) > 0 {
-				if !classified.HasRepo() && classified.Org == "" {
+				// Promote a resolved node to the PRIMARY scope only when the primary is TRULY empty.
+				// A read like `{viewer{login email} node(id:$id){...}}` has an unscoped primary
+				// (UnscopedCategory="user"); overwriting Owner/Repo from the node while leaving
+				// UnscopedCategory dangling made evaluateScopes match the repo rule and SKIP the
+				// `user` category check (policy.Evaluate only consults it when repo==""&&org==""),
+				// leaking the custodian's viewer{} identity under a policy that denies `user`. With
+				// UnscopedCategory!="" we fall to the else branch: node scopes are ANDed in Additional
+				// and the original unscoped primary is still enforced. Mutations never set
+				// UnscopedCategory, so the round-12 addComment/per-resource cases are unaffected. round-15.
+				if !classified.HasRepo() && classified.Org == "" && classified.UnscopedCategory == "" {
 					classified.Owner = scopes[0].Owner
 					classified.Repo = scopes[0].Repo
 					// Carry the resolved node's per-resource key into the PRIMARY scope too — not
@@ -262,12 +273,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Scrub nulls just the cross-ref sub-object per element when its repo is denied (audit F2).
 		scrubLocs := restfilter.ScrubLocations(norm)
 		p := pol
+		// Gate each repo-bearing entry by the repo's own `metadata` access, NOT the lenient
+		// CanReadAnything. A repo configured access="none" with a per-resource carve-out (e.g.
+		// permissions={issues="read"}) must NOT surface in an org/user enumeration: its metadata
+		// object, its dependabot/code-scanning/secret-scanning alerts, packages, codespaces, etc. are
+		// denied on the DIRECT path (GET /repos/{o}/{r}* → "metadata"/resource → deny) and stripped by
+		// the GraphQL KeepShell gate, so the REST enum/search/singleton path must drop them too.
+		// CanReadAnything returned true for any non-none per-resource grant, leaking exactly that data
+		// (round-15). A fully-denied repo (no matching rule under mode=deny) still evaluates to deny →
+		// dropped, as before; a base=read repo still passes.
 		canRead := func(repo string) bool {
 			owner := repo
 			if i := strings.IndexByte(repo, '/'); i > 0 {
 				owner = repo[:i]
 			}
-			return p.CanReadAnything(repo, owner)
+			return p.Evaluate(repo, owner, classifier.Read, "metadata", "").Allowed
 		}
 		switch {
 		case dec == restfilter.NeedsFilter || len(scrubLocs) > 0:
@@ -425,6 +445,13 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 			}
 			return gqlfilter.KeepShell
 		}
+		// Derive the per-resource key from the object's runtime type via the schema's @docsCategory
+		// (FilterResource), NOT the incomplete value the filter passes in: this enforces per-resource
+		// policy (deployments/actions/pulls/issues/branches="none") on EVERY object whose category is
+		// a real resource — Environment, WorkflowRun, Milestone, Label, PullRequestThread,
+		// branchProtectionRules, … — which an older ~30-entry hand map silently treated as "metadata"
+		// (base access) and leaked over GraphQL (round-15).
+		resource = s.FilterResource(typename)
 		if pol.Evaluate(full, owner, classifier.Read, resource, "").Allowed {
 			return gqlfilter.Keep
 		}
@@ -491,11 +518,18 @@ func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceB
 	repoOf := make(map[string]resolved, len(ids))
 	var missing []string
 	for _, id := range ids {
-		if owner, repo, typename, ok := h.NodeCache.Get(id); ok {
-			repoOf[id] = resolved{owner, repo, typename} // cache only ever holds verified repo nodes
-		} else {
-			missing = append(missing, id)
+		// WRITE path: never trust the cache — always re-resolve against GitHub. A cached
+		// node→repo mapping goes stale if the object's repository is TRANSFERRED within the 30-min
+		// TTL, which would otherwise authorize the write against the node's PRE-transfer repository
+		// (round-15). Reads keep using the cache: a stale read attribution is moot because the
+		// response is redacted against the object's actual repository marker, not the cache.
+		if access != classifier.Write {
+			if owner, repo, typename, ok := h.NodeCache.Get(id); ok {
+				repoOf[id] = resolved{owner, repo, typename} // cache only ever holds verified repo nodes
+				continue
+			}
 		}
+		missing = append(missing, id)
 	}
 
 	if len(missing) > 0 {
@@ -532,7 +566,15 @@ func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceB
 // resource (e.g. a Repository node targeted by mergeBranch/createRef), it falls back to the
 // name guess. Reads keep the name/primary-resource behavior (the response filter redacts).
 func (h *Handler) nodeResource(access classifier.AccessLevel, typename, nameGuess string) string {
-	if access == classifier.Write && h.GQLFilter != nil {
+	// The type-derived key only OVERRIDES when the mutation name yielded no resource (""): that is
+	// the case the override exists for (addComment/addReaction/addLabels on a PR → "" → "pulls" from
+	// the PullRequest node). When the name DID map to a concrete resource, keep it — it reflects
+	// what the OPERATION does, which can differ from the target object's type: createCommitOnBranch
+	// writes file CONTENT but targets a Ref (type→branches); honoring the type there would let it
+	// dodge contents="none" via the Ref-id addressing form (round-15). A wrongly-permissive concrete
+	// name is not a concern: every concrete gqlMutationResource result names the resource the
+	// mutation actually touches.
+	if access == classifier.Write && nameGuess == "" && h.GQLFilter != nil {
 		if tr := h.GQLFilter.ResourceForType(typename); tr != "" {
 			return tr
 		}
@@ -623,8 +665,16 @@ func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[stri
 			// ruleset whose source is a Repository resolves to that repo and is policy-checked,
 			// while an org-level one (no Repository source) yields no nameWithOwner and is denied.
 			out[id] = nodeRes{kind: nodeDeny}
+		} else if typename != "" && h.GQLFilter != nil && !h.GQLFilter.IsKnownNodeObjectType(typename) {
+			// A non-null node whose runtime __typename this embedded schema does NOT recognize as a
+			// Node object type → live schema drift (GitHub's schema is ahead of the snapshot). The
+			// resolve query is generated from the same snapshot, so it never asked for this type's
+			// repository — a repo-scoped drift type would arrive unmarked and otherwise slip through
+			// as "no constraint", letting a carrier multi-root mutation write into a denied repo.
+			// Fail closed, mirroring how the request path denies untypeable queries (round-15).
+			out[id] = nodeRes{kind: nodeDeny}
 		} else {
-			out[id] = nodeRes{kind: nodeSkip} // null node or non-repo node → no constraint
+			out[id] = nodeRes{kind: nodeSkip} // null node, or a recognized non-repo Node type → no constraint
 		}
 	}
 	return out, nil
