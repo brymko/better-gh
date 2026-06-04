@@ -148,6 +148,44 @@ func waitStatus(t *testing.T, srv *httptest.Server, path, grantID string) map[st
 
 // Full device-flow happy path: gh gets a device code, operator authenticates as the custodian
 // owner via GitHub, picks a policy, and gh's access_token poll returns a working bgh_ token.
+// Regression for round-17 (LOW): apiApprove flips a grant to statusApproved BEFORE Store.Create
+// (a synchronous disk flush) fills in g.secret. A device-flow poll landing in that window must
+// report authorization_pending and leave the grant intact — NOT hand gh an empty access_token and
+// remove the grant (which would fail the real login with expired_token on the next poll and orphan
+// the freshly-minted token).
+func TestDeviceFlow_PollDuringApproveMintWindow(t *testing.T) {
+	h, _, srv := newTestHandler(t, "innerTok", "owner") // registers h.Stop cleanup
+	t.Cleanup(srv.Close)
+
+	const dc = "DC_RACE_TOKEN_0001"
+	g := &grant{flow: "device", deviceCode: dc, status: statusApproved} // approved but secret == "" (mint in flight)
+	if !h.grants.add(g) {
+		t.Fatal("could not add grant")
+	}
+
+	// Poll inside the mint window: must be authorization_pending, no token, grant preserved.
+	_, resp := postForm(t, srv, "/login/oauth/access_token", url.Values{"device_code": {dc}})
+	if resp["error"] != "authorization_pending" {
+		t.Fatalf("poll during the mint window must be authorization_pending, got %v", resp)
+	}
+	if resp["access_token"] != nil && resp["access_token"] != "" {
+		t.Fatalf("must not hand out a token during the mint window, got %v", resp["access_token"])
+	}
+	if !h.grants.withGrant(byDeviceCode(dc), func(*grant) {}) {
+		t.Fatal("grant must survive a poll during the mint window (not consumed)")
+	}
+
+	// The secret lands → the next poll returns it and consumes the grant (one-time issuance).
+	h.grants.withGrant(byDeviceCode(dc), func(g *grant) { g.secret = "bgh_mintedsecret" })
+	_, resp2 := postForm(t, srv, "/login/oauth/access_token", url.Values{"device_code": {dc}})
+	if resp2["access_token"] != "bgh_mintedsecret" {
+		t.Fatalf("after the secret lands the poll must return it, got %v", resp2)
+	}
+	if h.grants.withGrant(byDeviceCode(dc), func(*grant) {}) {
+		t.Fatal("grant must be consumed after the secret is handed out")
+	}
+}
+
 func TestDeviceFlow_HappyPath(t *testing.T) {
 	srv, st := newServerOnly(t, "tok-alice", "")
 

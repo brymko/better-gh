@@ -140,15 +140,17 @@ func Classify(method, path string, body []byte) Result {
 
 	if len(segments) >= 2 && segments[0] == "orgs" {
 		return Result{
-			Org:    segments[1],
-			Access: access,
+			Org:      segments[1],
+			Access:   access,
+			Resource: orgResource(segments),
 		}
 	}
 
 	if len(segments) >= 2 && segments[0] == "users" {
 		return Result{
-			Org:    segments[1],
-			Access: access,
+			Org:      segments[1],
+			Access:   access,
+			Resource: orgResource(segments),
 		}
 	}
 
@@ -947,6 +949,24 @@ var restResourceMap = map[string]string{
 	"pages":        "pages",
 	"keys":         "keys",
 	"deploy-keys":  "keys",
+}
+
+// orgResource derives the per-resource key for an /orgs/{org}/... or /users/{user}/... path so an
+// [org.permissions] override is enforced on org-DIRECT subpaths too — not only on repo requests that
+// fall through to the org rule (e.g. /repos/{o}/{r}/pulls). Previously the org/user branches carried
+// Resource "", and policy.Evaluate's per-resource branch is skipped when resource=="", so on a READ
+// the override was silently bypassed and the request fell to the rule's base access — e.g.
+// `[org.permissions] members = "none"` did NOT block GET /orgs/{org}/members, and `hooks = "none"`
+// did NOT block GET /orgs/{org}/hooks (round-17). (The WRITE half was already fail-closed by the
+// indeterminate-resource deny.) The org/user ROOT maps to "metadata" (mirroring the repo root); a
+// subpath uses its first sub-segment as the resource key, so an operator can deny any org-direct
+// resource with [org.permissions] <segment> = "none". A segment with no matching permission still
+// falls back to the rule's base access, exactly as repo per-resource keys do.
+func orgResource(segments []string) string {
+	if len(segments) < 3 {
+		return "metadata"
+	}
+	return segments[2]
 }
 
 var restMetadataSegments = map[string]bool{

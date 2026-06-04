@@ -14,6 +14,7 @@ type Entry struct {
 	Method           string    `json:"method"`
 	Path             string    `json:"path"`
 	Repo             string    `json:"repo,omitempty"`
+	Org              string    `json:"org,omitempty"`
 	Resource         string    `json:"resource,omitempty"`
 	UnscopedCategory string    `json:"unscoped_category,omitempty"`
 	Access           string    `json:"access"`

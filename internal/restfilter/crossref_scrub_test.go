@@ -56,6 +56,64 @@ func TestScrub_TimelineLookupWiring(t *testing.T) {
 	}
 }
 
+// Regression for round-17 (HIGH): a pull request embeds head.repo / base.repo as FULL Repository
+// objects; a PR opened from a (private) fork carries the fork's full_name there. The /pulls
+// endpoints are repo-path-scoped Pass (the generator skips head/base), so without a scrub entry the
+// denied fork's metadata streamed unredacted. Scrub must null head.repo / base.repo when its repo is
+// denied, while keeping the PR row and any allowed base.repo, on both the list and singleton forms.
+func TestScrub_PullRequestHeadBaseFork(t *testing.T) {
+	allow := func(repo string) bool { return repo == "acme/app" } // the path repo; the fork is denied
+
+	// List form: GET /repos/acme/app/pulls
+	list := `[` +
+		`{"number":42,"title":"feat","head":{"ref":"f","repo":{"full_name":"secret-team/app","private":true,"description":"FORK_SECRET_DESC"}},"base":{"ref":"main","repo":{"full_name":"acme/app"}}},` +
+		`{"number":7,"title":"internal","head":{"ref":"g","repo":{"full_name":"acme/app"}},"base":{"ref":"main","repo":{"full_name":"acme/app"}}}` +
+		`]`
+	locs := ScrubLocations("/repos/acme/app/pulls")
+	if len(locs) == 0 {
+		t.Fatal("no scrub locations for GET /repos/{owner}/{repo}/pulls")
+	}
+	if d, _ := Lookup("/repos/acme/app/pulls"); d != Pass {
+		t.Fatalf("/pulls should be Pass (scrub handles head/base), got %v", d)
+	}
+	out, ok := Scrub([]byte(list), locs, allow)
+	if !ok {
+		t.Fatal("Scrub returned not-ok on valid /pulls body")
+	}
+	s := string(out)
+	if strings.Contains(s, "secret-team/app") || strings.Contains(s, "FORK_SECRET_DESC") {
+		t.Fatalf("denied fork head.repo not scrubbed: %s", s)
+	}
+	if !strings.Contains(s, `"acme/app"`) {
+		t.Fatalf("allowed base.repo wrongly removed: %s", s)
+	}
+	if c := strings.Count(s, `"number"`); c != 2 {
+		t.Fatalf("scrub must keep both PR rows, got %d: %s", c, s)
+	}
+	if !strings.Contains(s, `"repo":null`) {
+		t.Fatalf("denied head.repo should be nulled in place: %s", s)
+	}
+
+	// Singleton form: GET /repos/acme/app/pulls/{pull_number}
+	one := `{"number":42,"title":"feat","head":{"ref":"f","repo":{"full_name":"secret-team/app","description":"FORK_SECRET_DESC"}},"base":{"ref":"main","repo":{"full_name":"acme/app"}}}`
+	slocs := ScrubLocations("/repos/acme/app/pulls/42")
+	if len(slocs) == 0 {
+		t.Fatal("no scrub locations for GET /repos/{owner}/{repo}/pulls/{pull_number}")
+	}
+	sout, ok := Scrub([]byte(one), slocs, allow)
+	if !ok {
+		t.Fatal("Scrub returned not-ok on valid /pulls/{n} body")
+	}
+	if ss := string(sout); strings.Contains(ss, "secret-team/app") || strings.Contains(ss, "FORK_SECRET_DESC") {
+		t.Fatalf("denied fork head.repo not scrubbed on singleton: %s", ss)
+	}
+
+	// commits/{sha}/pulls is the third (list) form.
+	if len(ScrubLocations("/repos/acme/app/commits/deadbeef/pulls")) == 0 {
+		t.Fatal("no scrub locations for GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls")
+	}
+}
+
 // A non-cross-ref event array with no source must pass through untouched, and an unparseable body
 // must fail closed.
 func TestScrub_NoSourceAndFailClosed(t *testing.T) {

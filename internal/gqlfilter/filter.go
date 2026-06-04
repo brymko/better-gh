@@ -37,7 +37,11 @@ func (s *Schema) Augment(query string) (string, error) {
 	if _, perr := parser.ParseQueryWithTokenLimit(&ast.Source{Input: query}, maxAugmentTokens); perr != nil {
 		return "", fmt.Errorf("parsing query: %s", perr.Error())
 	}
-	doc, gerr := gqlparser.LoadQuery(s.schema, query)
+	// Validate with the default rules MINUS OverlappingFieldsCanBeMerged (an O(n^2)-per-response-name
+	// rule that is a CPU-DoS vector on the request path — see schema.go). The Walk still populates the
+	// field definitions augment relies on, and all other rules still run, so an otherwise-invalid query
+	// is still rejected and fails closed.
+	doc, gerr := gqlparser.LoadQueryWithRules(s.schema, query, s.validationRules)
 	if gerr != nil {
 		return "", fmt.Errorf("validating query: %s", gerr.Error())
 	}
@@ -203,6 +207,20 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 		budget.count(2)
 		return
 	}
+	if s.repoOwnedNoPath[typeName] {
+		// A repo-OWNED content type with NO derivable repository path (timeline events like
+		// ClosedEvent/CrossReferencedEvent → issues/pulls, DeploymentReview → deployments,
+		// IssueFieldSingleSelectOption → issues, …). We cannot tag its repository, but it is reached
+		// by navigation from a SAME-repo marked ancestor, so inject ONLY the type marker; the response
+		// filter attributes it to the nearest marked ancestor's repository and enforces its
+		// per-resource policy there, failing closed if there is no ancestor repo (round-17). Without
+		// this it carried NO marker at all and the filter forwarded it unredacted — bypassing e.g.
+		// deployments/issues="none" on objects reached by navigation (the navigation analogue of the
+		// round-16 node(id:) fail-closed, which only covered direct node-ID addressing).
+		*sels = append(*sels, typenameMarker())
+		budget.count(1)
+		return
+	}
 	// Abstract type (interface/union): the runtime object is one of its concrete members.
 	// Interfaces/unions are NEVER themselves repo-scoped (deriveRepoPaths only pathes concrete
 	// types), so a selection written against the abstract type — `... on Comment { body }`,
@@ -217,6 +235,44 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 		*sels = append(*sels, s.memberMarkerFragment(member))
 	}
 	budget.count(len(members))
+	// Repo-owned-no-path members of the abstract type get a TYPE-only marker fragment (round-17),
+	// so a selection that could resolve to one (e.g. an interface common field, or a union member
+	// reached without an explicit inline fragment) is still attributed by the filter to its nearest
+	// marked ancestor's repository — mirroring the repo-scoped member injection above.
+	noPathMembers := s.repoOwnedNoPathMembers(typeName)
+	for _, member := range noPathMembers {
+		*sels = append(*sels, s.memberTypeMarkerFragment(member))
+	}
+	budget.count(len(noPathMembers))
+}
+
+// repoOwnedNoPathMembers returns the repo-owned-but-unattributable concrete object members of an
+// interface/union (sorted), so an abstract selection that could resolve to one still gets a type
+// marker and is attributed to its nearest marked ancestor by the response filter. Empty for concrete
+// types and for abstract types with no such member.
+func (s *Schema) repoOwnedNoPathMembers(typeName string) []string {
+	def := s.schema.Types[typeName]
+	if def == nil || (def.Kind != ast.Interface && def.Kind != ast.Union) {
+		return nil
+	}
+	var out []string
+	for _, pt := range s.schema.PossibleTypes[typeName] {
+		if s.repoOwnedNoPath[pt.Name] {
+			out = append(out, pt.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// memberTypeMarkerFragment builds `... on T { bghRepoTypeZ9: __typename }` for a repo-owned-no-path
+// concrete type T reached through an enclosing abstract selection: T self-identifies its TYPE (so the
+// filter knows its per-resource key) while the filter supplies its repository from the ancestor.
+func (s *Schema) memberTypeMarkerFragment(typeName string) *ast.InlineFragment {
+	return &ast.InlineFragment{
+		TypeCondition: typeName,
+		SelectionSet:  ast.SelectionSet{typenameMarker()},
+	}
 }
 
 // repoScopedMembers returns the repo-scoped concrete object types of an interface/union, sorted
@@ -327,16 +383,20 @@ func Filter(resp map[string]any, authorized func(owner, repo, resource, typename
 // FilterWithDecision walks a GraphQL JSON response and applies authorize's per-object Decision to
 // every repo-scoped (marked) object, then strips the injected markers.
 func FilterWithDecision(resp map[string]any, authorize func(owner, repo, resource, typename string) Decision) map[string]any {
-	v := filterValue(resp, authorize)
+	v := filterValue(resp, authorize, "", "")
 	if m, ok := v.(map[string]any); ok {
 		return m
 	}
 	return map[string]any{}
 }
 
-func filterValue(v any, authorize func(owner, repo, resource, typename string) Decision) any {
+// filterValue walks the response. ambOwner/ambRepo carry the repository of the nearest enclosing
+// marked-and-kept object — the "ambient repository" used to attribute repo-owned objects that cannot
+// self-identify their repo (the type-marker-only repoOwnedNoPath objects; see augment).
+func filterValue(v any, authorize func(owner, repo, resource, typename string) Decision, ambOwner, ambRepo string) any {
 	switch val := v.(type) {
 	case map[string]any:
+		childOwner, childRepo := ambOwner, ambRepo
 		if tag, ok := repoMarker(val); ok {
 			// A repo marker is only injected onto repo-scoped objects, so its presence means this
 			// object belongs to a repository. An unparseable marker (anomalous null/malformed
@@ -344,27 +404,41 @@ func filterValue(v any, authorize func(owner, repo, resource, typename string) D
 			// unmapped → "metadata" (base).
 			owner, repo, parsed := repoFromMarker(tag)
 			typename := markerTypename(val)
-			resource := typeResource(typename)
 			if !parsed {
 				return nil
 			}
-			switch authorize(owner, repo, resource, typename) {
+			switch authorize(owner, repo, typeResource(typename), typename) {
 			case Deny:
 				return nil
 			case KeepShell:
 				stripMarkers(val)
-				return shellPrune(val, authorize)
+				return shellPrune(val, authorize, owner, repo)
 			default: // Keep
 			}
+			// A kept repo-scoped object establishes the repository context for its (possibly
+			// unmarkable) descendants.
+			childOwner, childRepo = owner, repo
+		} else if typename := markerTypename(val); typename != "" {
+			// A repo-OWNED content object with only a TYPE marker and NO repo marker (a
+			// repoOwnedNoPath type: timeline events, DeploymentReview, …). It cannot self-identify
+			// its repository, so attribute it to the nearest marked ancestor's repository — for these
+			// types that ancestor is always the same repo — and enforce its per-resource policy there.
+			// Fail closed if there is no ancestor repository to check against (round-17).
+			if ambRepo == "" {
+				return nil
+			}
+			if authorize(ambOwner, ambRepo, typeResource(typename), typename) == Deny {
+				return nil
+			}
 		}
-		stripMarkers(val) // strip injected repo + type markers (whether or not a repo marker rode along)
+		stripMarkers(val) // strip injected repo + type markers (whether or not a marker rode along)
 		for k, child := range val {
-			val[k] = filterValue(child, authorize)
+			val[k] = filterValue(child, authorize, childOwner, childRepo)
 		}
 		return val
 	case []any:
 		for i, child := range val {
-			val[i] = filterValue(child, authorize)
+			val[i] = filterValue(child, authorize, ambOwner, ambRepo)
 		}
 		return val
 	default:
@@ -377,14 +451,16 @@ func filterValue(v any, authorize func(owner, repo, resource, typename string) D
 // subtree contains no repo-scoped MARKED object (a non-repo-scoped leaf like contributingGuidelines),
 // while recursing — via the normal filterValue, which applies each child's own Decision — into
 // subtrees that DO contain marked objects (connection wrappers leading to granted issues/pulls).
-func shellPrune(container map[string]any, authorize func(owner, repo, resource, typename string) Decision) any {
+func shellPrune(container map[string]any, authorize func(owner, repo, resource, typename string) Decision, ambOwner, ambRepo string) any {
 	for k, child := range container {
 		switch child.(type) {
 		case map[string]any, []any:
-			if hasRepoMarkerDescendant(child) {
-				container[k] = filterValue(child, authorize)
+			if hasMarkerDescendant(child) {
+				// Granted children live here; recurse with the container's repo as the ambient
+				// context so any repoOwnedNoPath descendants are attributed to this repo.
+				container[k] = filterValue(child, authorize, ambOwner, ambRepo)
 			} else {
-				delete(container, k) // pure container-owned data (no repo-scoped object beneath)
+				delete(container, k) // pure container-owned data (no marked object beneath)
 			}
 		default:
 			delete(container, k) // scalar → the container's own metadata
@@ -393,22 +469,27 @@ func shellPrune(container map[string]any, authorize func(owner, repo, resource, 
 	return container
 }
 
-// hasRepoMarkerDescendant reports whether v contains, at any depth, an object carrying a repo
-// marker — i.e. a repo-scoped object that filterValue will authorize on its own.
-func hasRepoMarkerDescendant(v any) bool {
+// hasMarkerDescendant reports whether v contains, at any depth, an object carrying ANY injected
+// marker — a repo marker (a repo-scoped object filterValue authorizes on its own) OR a bare type
+// marker (a repoOwnedNoPath object filterValue authorizes against the ambient repo). A KeepShell
+// container keeps such subtrees and prunes only its own marker-free scalars/objects.
+func hasMarkerDescendant(v any) bool {
 	switch val := v.(type) {
 	case map[string]any:
 		if _, ok := repoMarker(val); ok {
 			return true
 		}
+		if markerTypename(val) != "" {
+			return true
+		}
 		for _, child := range val {
-			if hasRepoMarkerDescendant(child) {
+			if hasMarkerDescendant(child) {
 				return true
 			}
 		}
 	case []any:
 		for _, child := range val {
-			if hasRepoMarkerDescendant(child) {
+			if hasMarkerDescendant(child) {
 				return true
 			}
 		}

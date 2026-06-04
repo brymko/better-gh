@@ -15,6 +15,7 @@ import (
 
 	"github.com/vektah/gqlparser/v2"
 	"github.com/vektah/gqlparser/v2/ast"
+	"github.com/vektah/gqlparser/v2/validator/rules"
 )
 
 //go:embed schema.graphql
@@ -37,6 +38,7 @@ type Schema struct {
 	typeRes          map[string]string     // object type -> per-resource policy key (derived from @docsCategory + overrides)
 	nodeTypes        map[string]bool       // object types implementing Node (recognized by this snapshot)
 	repoOwnedNoPath  map[string]bool       // Node object types that belong to a repo (by @docsCategory) but have NO derivable repoPath
+	validationRules  *rules.Rules          // default validation rules MINUS the O(n^2) OverlappingFieldsCanBeMerged (see Augment)
 }
 
 // repoOwnedCategories are @docsCategory values whose objects belong to exactly ONE repository. A
@@ -191,6 +193,19 @@ func Load() (*Schema, error) {
 	sch.typeRes = deriveTypeResources(s)
 	sch.nodeTypes = deriveNodeObjectTypes(s)
 	sch.repoOwnedNoPath = deriveRepoOwnedNoPath(s, paths)
+	// Build the validation rule set Augment uses ONCE: the default rules minus
+	// OverlappingFieldsCanBeMerged. That rule is O(n^2) in the number of fields sharing a response
+	// name within a selection set (it compares every pair and recurses into their sub-selections with
+	// no field-pair memoization), so a ~100KB query of same-aliased siblings — well under the token
+	// cap — drove gqlparser.LoadQuery to multiple seconds of CPU on the request path BEFORE the policy
+	// deny, a single-token DoS (round-17). The proxy does not need merge-conflict diagnostics: it only
+	// augments + forwards, and GitHub re-validates the (un-augmented-semantics) document upstream and
+	// returns an error response the filter handles. Dropping the rule removes the quadratic at its
+	// source; the Walk still populates field.Definition (which augment needs) regardless of rules, and
+	// every other default rule (unknown field/argument/type, fragment cycles, …) still runs.
+	vr := rules.NewDefaultRules()
+	vr.RemoveRule("OverlappingFieldsCanBeMerged")
+	sch.validationRules = vr
 	q := sch.buildNodeResolveQuery()
 	if _, gerr := gqlparser.LoadQuery(s, q); gerr != nil {
 		return nil, fmt.Errorf("building node-resolve query: %s", gerr.Error())

@@ -44,6 +44,20 @@ var repoScrubOps = map[string][]string{
 	// fork/template upstream metadata embedded on the repo object itself (singleton scrub).
 	"GET /repos/{owner}/{repo}": {"$.*parent.full_name", "$.*source.full_name", "$.*template_repository.full_name"},
 
+	// A pull request embeds head.repo and base.repo as FULL Repository objects; for a PR opened
+	// from a fork (forks of a private repo are themselves private), head.repo is a DIFFERENT,
+	// possibly policy-denied repo than the path repo. These endpoints are repo-path-scoped Pass (the
+	// generator skips head/base — gen/main.go crossRefFields — so /pulls isn't element-dropped on a
+	// denied fork), so without a scrub entry the foreign fork's full_name/description/private flag/
+	// owner stream unredacted (a denied-repo metadata + existence leak; the GraphQL headRepository
+	// equivalent IS redacted — round-17). Null just head.repo / base.repo when its repo is denied,
+	// keeping the PR row. The {pull_number} singleton over-matches sibling 5-segment /pulls/* paths
+	// (e.g. /pulls/comments) by segment count, but those carry no head/base object so the scrub is a
+	// harmless no-op there.
+	"GET /repos/{owner}/{repo}/pulls":                      {"$[].head.*repo.full_name", "$[].base.*repo.full_name"},
+	"GET /repos/{owner}/{repo}/pulls/{pull_number}":        {"$.head.*repo.full_name", "$.base.*repo.full_name"},
+	"GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls": {"$[].head.*repo.full_name", "$[].base.*repo.full_name"},
+
 	// activity event feeds (forkee + PR head/base repo).
 	"GET /events":                                  eventForeignRepoLocs,
 	"GET /networks/{owner}/{repo}/events":          eventForeignRepoLocs,

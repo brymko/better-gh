@@ -158,7 +158,15 @@ func (h *Handler) accessToken(w http.ResponseWriter, r *http.Request) {
 	found := h.grants.withGrant(match, func(g *grant) {
 		switch g.status {
 		case statusApproved:
-			secret, grantID = g.secret, g.id
+			// apiApprove flips the status to statusApproved BEFORE Store.Create (a synchronous disk
+			// flush) fills in g.secret. A poll landing in that window must NOT consume the grant with
+			// an empty token — report authorization_pending so the next poll (after the secret lands)
+			// succeeds, instead of handing gh "" and removing the grant (round-17).
+			if g.secret == "" {
+				errCode = "authorization_pending"
+			} else {
+				secret, grantID = g.secret, g.id
+			}
 		case statusDenied:
 			errCode = "access_denied"
 		default:

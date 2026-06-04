@@ -165,6 +165,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Method:           r.Method,
 			Path:             path,
 			Repo:             classified.RepoFullName(),
+			Org:              classified.Org,
 			Resource:         classified.Resource,
 			UnscopedCategory: classified.UnscopedCategory,
 			Access:           classified.Access.String(),
@@ -365,6 +366,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Method:           r.Method,
 			Path:             path,
 			Repo:             repoName,
+			Org:              classified.Org,
 			Resource:         classified.Resource,
 			UnscopedCategory: classified.UnscopedCategory,
 			Access:           classified.Access.String(),
@@ -871,11 +873,13 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 		durationMs := time.Since(start).Milliseconds()
 		errAuditAccess := "read"
 		errAuditRepo := ""
+		errAuditOrg := ""
 		errAuditResource := ""
 		errAuditUnscopedCategory := ""
 		if classified != nil {
 			errAuditAccess = classified.Access.String()
 			errAuditRepo = classified.RepoFullName()
+			errAuditOrg = classified.Org
 			errAuditResource = classified.Resource
 			errAuditUnscopedCategory = classified.UnscopedCategory
 		}
@@ -884,6 +888,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 			Method:           r.Method,
 			Path:             r.URL.Path,
 			Repo:             errAuditRepo,
+			Org:              errAuditOrg,
 			Resource:         errAuditResource,
 			UnscopedCategory: errAuditUnscopedCategory,
 			Access:           errAuditAccess,
@@ -903,11 +908,13 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 
 	auditAccess := "read"
 	auditRepo := ""
+	auditOrg := ""
 	auditResource := ""
 	auditUnscopedCategory := ""
 	if classified != nil {
 		auditAccess = classified.Access.String()
 		auditRepo = classified.RepoFullName()
+		auditOrg = classified.Org
 		auditResource = classified.Resource
 		auditUnscopedCategory = classified.UnscopedCategory
 	}
@@ -917,6 +924,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 		Method:           r.Method,
 		Path:             r.URL.Path,
 		Repo:             auditRepo,
+		Org:              auditOrg,
 		Resource:         auditResource,
 		UnscopedCategory: auditUnscopedCategory,
 		Access:           auditAccess,

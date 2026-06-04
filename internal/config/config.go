@@ -23,7 +23,9 @@ type Config struct {
 	// ExternalURL is the public base URL clients reach the GHE listener at (e.g.
 	// "https://vps.tailnet.ts.net"). Set it when fronting the proxy with a TLS terminator
 	// (tailscale serve, Caddy) so the `gh auth login` device-flow verification URL points at
-	// the public address rather than the backend. Optional; empty for direct serving.
+	// the public address rather than the backend. Optional for DIRECT serving; REQUIRED behind a
+	// TLS-terminating front — otherwise the verification URL points at the loopback backend and
+	// `gh auth login` cannot complete (see docs/deployment.md).
 	ExternalURL string `toml:"external_url"`
 }
 

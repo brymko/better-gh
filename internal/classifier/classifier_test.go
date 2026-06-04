@@ -701,20 +701,26 @@ func TestGraphQLRepoResourceMixedResourcesBothEnforced(t *testing.T) {
 	}
 }
 
-func TestRESTOrgHasNoResourceOrCategory(t *testing.T) {
-	r := Classify(http.MethodGet, "/orgs/my-org/repos", nil)
-	if r.Resource != "" {
-		t.Errorf("org REST: Resource = %q, want empty", r.Resource)
+// round-17: org/user subpaths now carry a per-resource key (their first sub-segment) so an
+// [org.permissions] override is enforced on org-DIRECT paths, not just on repo fall-through. They
+// still carry no unscoped category (they ARE org-scoped). The org/user ROOT maps to "metadata".
+func TestRESTOrgSubpathHasResource(t *testing.T) {
+	r := Classify(http.MethodGet, "/orgs/my-org/members", nil)
+	if r.Resource != "members" {
+		t.Errorf("org REST subpath: Resource = %q, want \"members\"", r.Resource)
 	}
 	if r.UnscopedCategory != "" {
 		t.Errorf("org REST: UnscopedCategory = %q, want empty", r.UnscopedCategory)
 	}
+	if root := Classify(http.MethodGet, "/orgs/my-org", nil); root.Resource != "metadata" {
+		t.Errorf("org root: Resource = %q, want \"metadata\"", root.Resource)
+	}
 }
 
-func TestRESTUsersHasNoResourceOrCategory(t *testing.T) {
+func TestRESTUsersSubpathHasResource(t *testing.T) {
 	r := Classify(http.MethodGet, "/users/octocat/repos", nil)
-	if r.Resource != "" {
-		t.Errorf("users REST: Resource = %q, want empty", r.Resource)
+	if r.Resource != "repos" {
+		t.Errorf("users REST subpath: Resource = %q, want \"repos\"", r.Resource)
 	}
 	if r.UnscopedCategory != "" {
 		t.Errorf("users REST: UnscopedCategory = %q, want empty", r.UnscopedCategory)

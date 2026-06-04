@@ -76,6 +76,140 @@ func TestSec_GraphQLFilterRedactsDeniedRepoFromResponse(t *testing.T) {
 	}
 }
 
+// Regression for round-17 (HIGH): a repoOwnedNoPath content type reached by GraphQL NAVIGATION
+// (DeploymentReview, @docsCategory "deployments") must be redacted when its per-resource policy
+// denies it — attributed to its nearest marked ancestor's repository — even though the classifier
+// scopes the request to a DIFFERENT resource ("contents", via repository.object) and so allows it.
+// Before the fix DeploymentReview carried no marker and the response filter forwarded it unredacted,
+// leaking deployment-gate approval content under deployments="none". The same content under
+// deployments="read" must be kept (no over-redaction of allowed navigation, e.g. gh timelines).
+func TestSec_NavRepoOwnedNoPathRedacted(t *testing.T) {
+	sch, err := gqlfilter.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A response shaped as the augmented query yields: repo-scoped ancestors carry repo markers; the
+	// DeploymentReview carries only the TYPE marker (round-17 augment behavior).
+	const resp = `{"data":{"repository":{"bghRepoTagZ9":"acme/app","bghRepoTypeZ9":"Repository",` +
+		`"object":{"bghRepoTagZ9":"acme/app","bghRepoTypeZ9":"Commit","checkSuites":{"nodes":[` +
+		`{"bghRepoTagZ9":"acme/app","bghRepoTypeZ9":"CheckSuite","workflowRun":{"bghRepoTagZ9":"acme/app","bghRepoTypeZ9":"WorkflowRun",` +
+		`"deploymentReviews":{"nodes":[{"bghRepoTypeZ9":"DeploymentReview","comment":"DEPLOY_GATE_SECRET","databaseId":7}]}}}]}}}}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, resp)
+	}))
+	t.Cleanup(upstream.Close)
+
+	run := func(deployments policy.Access) (int, string) {
+		pol := &policy.Policy{
+			Defaults: policy.Defaults{Mode: policy.ModeDeny},
+			Repo: []policy.RepoRule{{
+				Name: "acme/app", Access: policy.AccessRead,
+				Permissions: map[string]policy.Access{"deployments": deployments},
+			}},
+		}
+		h := &Handler{
+			GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+			Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol, UpstreamURL: upstream.URL, GQLFilter: sch,
+		}
+		srv := httptest.NewServer(h)
+		t.Cleanup(srv.Close)
+		q := `{"query":"query{repository(owner:\"acme\",name:\"app\"){object(expression:\"HEAD\"){... on Commit{checkSuites(first:1){nodes{workflowRun{deploymentReviews(first:5){nodes{comment databaseId}}}}}}}}}"}`
+		r, err := http.Post(srv.URL+"/graphql", "application/json", strings.NewReader(q))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		return r.StatusCode, string(b)
+	}
+
+	// deployments="none": request allowed (scope is "contents"=read) but the navigated
+	// DeploymentReview must be redacted by the response filter; markers must be stripped.
+	code, denied := run(policy.AccessNone)
+	if code == http.StatusForbidden {
+		t.Fatalf("request scoped to contents=read must be allowed, got 403: %s", denied)
+	}
+	if strings.Contains(denied, "DEPLOY_GATE_SECRET") {
+		t.Fatalf("DeploymentReview content leaked under deployments=none: %s", denied)
+	}
+	if strings.Contains(denied, "bghRepoType") || strings.Contains(denied, "bghRepoTag") {
+		t.Fatalf("injected markers leaked to client: %s", denied)
+	}
+
+	// deployments="read": the same content must be kept (no over-redaction).
+	_, allowed := run(policy.AccessRead)
+	if !strings.Contains(allowed, "DEPLOY_GATE_SECRET") {
+		t.Fatalf("DeploymentReview content wrongly redacted under deployments=read: %s", allowed)
+	}
+}
+
+// Regression for round-17 (HIGH): an [org.permissions] per-resource override must be enforced on
+// org-DIRECT subpaths (GET /orgs/{org}/members, /hooks, …), not only on repo requests that fall
+// through to the org rule. The classifier previously emitted resource="" for org paths, so the
+// policy's per-resource branch was skipped on reads and the override silently fell back to base
+// access — leaking org membership / webhook config the operator restricted. Now org subpaths carry
+// their sub-segment as the resource, so members="none" denies GET /orgs/{org}/members while a
+// different (unrestricted) policy still forwards it.
+func TestSec_OrgDirectPerResourceReadEnforced(t *testing.T) {
+	var upstreamHit int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHit, 1)
+		w.Header().Set("Content-Type", "application/json")
+		// an org member list carries user objects, no repository identity
+		io.WriteString(w, `[{"login":"alice","id":1},{"login":"bob","id":2}]`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	newHandler := func(membersAccess policy.Access) *httptest.Server {
+		pol := &policy.Policy{
+			Defaults: policy.Defaults{Mode: policy.ModeDeny},
+			Org: []policy.OrgRule{{
+				Name:        "acme",
+				Access:      policy.AccessRead,
+				Permissions: map[string]policy.Access{"members": membersAccess},
+			}},
+		}
+		h := &Handler{
+			GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+			Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol, UpstreamURL: upstream.URL,
+		}
+		srv := httptest.NewServer(h)
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	// members="none": the org-direct members read must be DENIED and must not reach upstream.
+	denySrv := newHandler(policy.AccessNone)
+	resp, err := http.Get(denySrv.URL + "/orgs/acme/members")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET /orgs/acme/members under members=none must be 403, got %d", resp.StatusCode)
+	}
+	if n := atomic.LoadInt32(&upstreamHit); n != 0 {
+		t.Fatalf("denied org-direct read must not reach upstream, got %d hits", n)
+	}
+
+	// members="read" (same base): the same path must be allowed and forwarded — proving the new
+	// resource derivation does not over-block, only enforces the operator's explicit restriction.
+	okSrv := newHandler(policy.AccessRead)
+	resp2, err := http.Get(okSrv.URL + "/orgs/acme/members")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode == http.StatusForbidden {
+		t.Fatalf("GET /orgs/acme/members under members=read must be allowed, got 403")
+	}
+	if !strings.Contains(string(body), "alice") {
+		t.Fatalf("allowed org members read should forward the member list, got: %s", body)
+	}
+}
+
 func mustStore(t *testing.T) *store.Store {
 	t.Helper()
 	s, err := store.Open(t.TempDir() + "/tokens.json")
