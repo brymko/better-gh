@@ -1,5 +1,7 @@
 # 02 — Request Classifier
 
+> **Historical note:** these describe the original *Rust* plan; the code shipped in **Go** (see go.mod and internal/). See ../README.md and ../SPEC.md for the as-built design.
+
 **Depends on**: 01
 
 ## Summary

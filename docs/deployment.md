@@ -48,7 +48,10 @@ public address from the request — set it to exactly what clients type after `-
 #    captures the custodian and claims the deployment (TOFU). (Pre-seed BGH_GITHUB_TOKEN
 #    only if the proxy must forward before anyone signs in.)
 bgh-proxy serve
-# 3. front it with a real cert (helper: scripts/serve-behind-tailscale.sh):
+# 3. CLAIM IT FIRST (ownership is trust-on-first-use — the first sign-in wins). Before exposing
+#    it to the tailnet, sign in yourself over loopback (https://127.0.0.1:7843/ui) or pre-seed
+#    BGH_GITHUB_TOKEN, so another tailnet member can't claim the deployment first.
+# 4. front it with a real cert (helper: scripts/serve-behind-tailscale.sh):
 tailscale serve --bg https+insecure://127.0.0.1:7843
 #    serves https://vps.tailnet.ts.net/  → proxies to the loopback proxy
 ```
@@ -123,8 +126,19 @@ proxy.example.com {
 ### Run
 ```bash
 # config.toml: external_url = "https://proxy.example.com"
-bgh-proxy serve                      # loopback proxy; sign in (below) to bootstrap the custodian
-caddy run --config Caddyfile.example # auto-provisions the Let's Encrypt cert
+bgh-proxy serve                      # loopback proxy (127.0.0.1:7843) — NOT yet public
+```
+
+> [!IMPORTANT]
+> **Claim the deployment before you expose it.** Ownership is trust-on-first-use: the *first*
+> GitHub sign-in becomes the permanent owner. The moment Caddy is up, `/login/*` and `/ui` are
+> reachable by the whole internet, so a stranger who signs in first **takes over the deployment**.
+> Claim it yourself over loopback first (sign in at `https://127.0.0.1:7843/ui` on the proxy host,
+> accepting the self-signed cert — or pre-seed `BGH_GITHUB_TOKEN`), confirm `owner.json` exists,
+> and only then start Caddy:
+
+```bash
+caddy run --config Caddyfile.example # now safe to expose; auto-provisions the Let's Encrypt cert
 ```
 
 ### Client — zero trust setup
@@ -182,3 +196,71 @@ access = "none"
 
 (A fully denied repo is redacted to `null` in the GraphQL response, so `gh repo list` shows it
 as a blank row rather than dropping it — its name and data never leave the proxy.)
+
+## Operations & incident response
+
+The proxy host concentrates one powerful credential **by design**, so operating it safely is
+mostly about protecting that host and knowing how to rotate/recover. Everything below lives under
+`~/.config/bgh/` (all `0600`).
+
+### Firewall the admin listener
+
+`serve` **always** starts the admin API/UI on `admin_bind` (default `127.0.0.1:7844`, plain HTTP) —
+it is not gated by `mode`, and anyone who reaches it with the `admin-secret` can mint full-access
+tokens. Keep it on **loopback** and firewall port 7844 on any VPS / multi-tenant host. The Tailscale
+ACL example opens only `:443`, and Caddy must **not** reverse-proxy 7844 — both keep admin local.
+The proxy only logs a warning when `admin_bind` is non-loopback; that is not enough on its own.
+
+### Back up the state (and know what each file is)
+
+Back these up **off-host, encrypted** — losing them loses access, leaking them leaks the custodian:
+
+| File | Holds | If lost / leaked |
+|---|---|---|
+| `owner.json` | the captured **custodian GitHub token** + the TOFU owner claim | leak = full custodian access; delete = re-arms first-sign-in TOFU (see below) |
+| `tokens.json` | every client's scoped policy + SHA-256 secret hash | leak ≠ usable secrets (hashed), but reveals who has what |
+| `admin-secret` | the admin-API/UI secret (stable across restarts) | leak = token minting |
+| `ca-key.pem` / `server-key.pem` | the self-signed TLS keys | leak = MITM of clients that trust the CA |
+
+> Deleting `owner.json` **re-arms** the trust-on-first-use claim — a recovery lever *and* a footgun.
+> After deleting it, re-claim over **loopback** (sign in at `https://127.0.0.1:7843/ui`) **before**
+> re-exposing the listener, or a stranger wins the race.
+
+### Rotate the custodian / respond to compromise
+
+- **Rotate the custodian token** (e.g. on suspicion, or on a schedule): revoke the proxy's OAuth
+  authorization at <https://github.com/settings/connections/applications> (or the fine-grained PAT
+  at its settings page if you pre-seeded one), then sign in again — the new sign-in re-captures a
+  fresh token into `owner.json`. For a pre-seeded `BGH_GITHUB_TOKEN`/`github_token`, rotate at
+  GitHub and update the env/file.
+- **Owner GitHub account compromised:** the attacker can sign in as owner and mint full-access
+  proxy tokens. Response: stop the proxy, revoke the OAuth grant at GitHub, **delete `owner.json`
+  and `tokens.json`**, secure the GitHub account (rotate its credentials / 2FA), then re-claim from
+  loopback and re-issue client tokens.
+- **A client (proxy token) compromised:** `bgh-proxy token revoke <name-or-id>` (or the owner
+  console) — takes effect immediately on the running server.
+
+### Audit log retention
+
+`audit.jsonl` is append-only and **unbounded** — rotate it (`logrotate` with `copytruncate`) or
+ship it off-host. The logger is async with a 1024-entry buffer that **drops under sustained
+overload**; alert on the `SYSTEM … "WARNING: N audit entries dropped"` line in the log and the
+`audit log channel full` stderr warning, since dropped entries mean unaudited allow/deny decisions.
+
+### Upgrades & embedded-schema refresh
+
+There is **no policy hot-reload** — edit `policy.toml` (socket) or re-issue tokens (GHE) and restart.
+The read-isolation filters are typed against an **embedded** GraphQL schema and OpenAPI description;
+a stale snapshot costs **availability** (a brand-new GitHub field/endpoint is *denied* until
+refreshed), never isolation. Periodically refresh and rebuild:
+
+```bash
+# refresh internal/gqlfilter/schema.graphql from GitHub's published GraphQL SDL, then:
+go run ./internal/restfilter/gen --spec api.github.com.json --out internal/restfilter/openapi_table.go
+go build ./... && go test ./...   # the gqlfilter coverage-invariant test fails the build on a new untagged repo-bearing type
+```
+
+When refreshing the REST table, also re-audit `internal/restfilter/crossref_scrub.go`: a few
+endpoints embed a *full* foreign-repo issue/PR through a `cross-referenced`/`source` field (the
+issue timeline), which the generated element-drop table cannot redact and which the scrub table
+handles by hand — confirm no sibling event/activity feed grew the same shape.
