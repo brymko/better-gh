@@ -166,7 +166,13 @@ func classifyGraphQL(body []byte) Result {
 		return Result{Access: Write}
 	}
 
-	doc, gqlErr := parser.ParseQuery(&ast.Source{Input: req.Query})
+	// Token-bound the PARSE itself, not just the post-parse AST walk. parser.ParseQuery uses an
+	// UNLIMITED token limit and gqlparser's recursive-descent parser has no depth guard, so a
+	// deeply nested query (one '{' per recursion frame, well under the 10MB body cap) overflows
+	// the goroutine stack — a fatal, unrecoverable crash that fires here BEFORE any policy check.
+	// ParseQueryWithTokenLimit makes the parser fail closed (p.err set, recursion unwinds) at a
+	// bounded depth; the limit error is treated like any unparseable query → unscoped write → deny.
+	doc, gqlErr := parser.ParseQueryWithTokenLimit(&ast.Source{Input: req.Query}, maxGraphQLTokens)
 	if gqlErr != nil {
 		return Result{Access: Write}
 	}
@@ -401,6 +407,14 @@ func gqlUnscopedCategory(doc *ast.QueryDocument) string {
 // fragment chains, or deeply nested selections. Legitimate queries are far shallower
 // than this bound; exceeding it sets *tooComplex and the caller fails closed.
 const maxGraphQLDepth = 200
+
+// maxGraphQLTokens bounds the gqlparser token count so the recursive-descent PARSE cannot
+// stack-overflow before the AST exists (see classifyGraphQL). Each nesting level costs at least
+// two tokens (a field name + '{'), so this caps parse recursion near ~50k levels — orders of
+// magnitude below the ~500k-deep crash threshold, yet far above any real query (the largest
+// legitimate `gh`/`gh api graphql` documents are a few thousand tokens). A query exceeding it
+// fails closed (denied), the same as an unparseable one.
+const maxGraphQLTokens = 100_000
 
 // gqlCrossRepoNavFields are fields that navigate from one repository/object to a
 // DIFFERENT repository. GitHub executes them and the proxy streams the response

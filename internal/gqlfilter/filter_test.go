@@ -70,7 +70,7 @@ func TestFilterRedactsDeniedRepos(t *testing.T) {
 			},
 		},
 	}
-	allowed := func(owner, repo, _ string) bool { return owner == "o" && repo == "allowed" }
+	allowed := func(owner, repo, _, _ string) bool { return owner == "o" && repo == "allowed" }
 	out := Filter(resp, allowed)
 
 	js := mustJSON(out)
@@ -89,7 +89,7 @@ func TestFilterRedactsDeniedRepos(t *testing.T) {
 // unparseable (anomalous null/malformed repository) must be redacted (fail closed), since
 // the object cannot be proven to belong to an authorized repository.
 func TestFilterRedactsUnparseableMarker(t *testing.T) {
-	authorizeAll := func(owner, repo, _ string) bool { return true }
+	authorizeAll := func(owner, repo, _, _ string) bool { return true }
 	for name, tag := range map[string]any{
 		"null marker":        nil,
 		"empty string":       "",

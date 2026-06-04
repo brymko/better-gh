@@ -50,7 +50,7 @@ func TestFilter_RedactsAbstractMemberFromDeniedRepo(t *testing.T) {
 			},
 		},
 	}
-	out := Filter(resp, func(owner, repo, resource string) bool {
+	out := Filter(resp, func(owner, repo, resource, _ string) bool {
 		return owner+"/"+repo == "allowed/ok" // deny everything except allowed/ok
 	})
 	node := out["data"].(map[string]any)["node"]
@@ -68,7 +68,7 @@ func TestFilter_KeepsAbstractMemberFromAllowedRepoAndStripsMarkers(t *testing.T)
 			markerTypeAlias:               "IssueComment",
 		},
 	}
-	out := Filter(resp, func(owner, repo, resource string) bool { return owner+"/"+repo == "allowed/ok" })
+	out := Filter(resp, func(owner, repo, resource, _ string) bool { return owner+"/"+repo == "allowed/ok" })
 	node, ok := out["node"].(map[string]any)
 	if !ok {
 		t.Fatal("allowed-repo comment was wrongly redacted")

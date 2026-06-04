@@ -27,13 +27,17 @@ type opTemplate struct {
 }
 
 var (
-	enumTemplates  []opTemplate // repo-bearing GET ops (Redact)
+	enumTemplates  []opTemplate // repo-bearing GET ops (Redact: drop denied elements)
+	scrubTemplates []opTemplate // GET ops embedding foreign-repo cross-ref content (Scrub: null it in place)
 	knownTemplates []opTemplate // every GET op (to tell Pass from Unknown)
 )
 
 func init() {
 	for key, locs := range repoEnumOps {
 		enumTemplates = append(enumTemplates, parseTemplate(strings.TrimPrefix(key, "GET "), locs))
+	}
+	for key, locs := range repoScrubOps {
+		scrubTemplates = append(scrubTemplates, parseTemplate(strings.TrimPrefix(key, "GET "), locs))
 	}
 	for _, p := range knownGetOps {
 		knownTemplates = append(knownTemplates, parseTemplate(p, nil))
@@ -318,4 +322,102 @@ func walkPath(v any, steps []locStep) any {
 		v = m[s.field]
 	}
 	return v
+}
+
+// ScrubLocations returns the cross-reference content scrub locations for normPath, or nil. A
+// scrub location addresses a FOREIGN-repo CONTENT object embedded inside an array element via a
+// cross-reference field (e.g. an issue timeline's `cross-referenced` event whose `source.issue`
+// is a full issue — title/body — from another, possibly denied, repo). Unlike enum locations
+// (which DROP the whole element), a scrub nulls just the cross-ref sub-object when its repo is
+// denied and keeps the element, because the array is heterogeneous (most events expose no repo).
+func ScrubLocations(normPath string) []string {
+	ps := segments(normPath)
+	for _, t := range scrubTemplates {
+		if t.matches(ps) {
+			return t.locs
+		}
+	}
+	return nil
+}
+
+// Scrub nulls denied foreign-repo cross-reference content in a response, keeping the enclosing
+// array elements. It FAILS CLOSED (ok=false) on a non-empty body it cannot parse, like Redact;
+// an empty body passes through. authorized receives "owner/repo". For each scrub location
+// "$[].source.issue.repository.full_name", it walks to the array, and for each element whose
+// source.issue.repository is a denied repo, sets that element's `source` field to null (the
+// first field after the array) — the event row survives, the foreign content does not.
+func Scrub(body []byte, locs []string, authorized func(ownerRepo string) bool) ([]byte, bool) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return body, true
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var root any
+	if dec.Decode(&root) != nil {
+		return nil, false
+	}
+	for _, loc := range locs {
+		steps := parseLoc(loc)
+		ai := -1
+		for i, s := range steps {
+			if s.array {
+				ai = i
+				break
+			}
+		}
+		if ai < 0 || ai == len(steps)-1 {
+			continue // a scrub location must address content WITHIN an array element
+		}
+		prefix, elem := steps[:ai], steps[ai+1:]
+		nullField := elem[0].field // the cross-ref wrapper to null (e.g. "source")
+		root = scrubDescend(root, prefix, elem, nullField, authorized)
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// scrubDescend walks prefix to the target array (recursing through any arrays in the prefix),
+// then for each element nulls nullField when the repo at elem is denied. The element is always
+// kept; only the foreign cross-ref sub-object is removed.
+func scrubDescend(cur any, prefix []locStep, elem []locStep, nullField string, authorized func(string) bool) any {
+	if len(prefix) == 0 {
+		arr, ok := cur.([]any)
+		if !ok {
+			return cur
+		}
+		for _, el := range arr {
+			repo := readRepo(el, elem)
+			if repo == "" || authorized(repo) {
+				continue
+			}
+			if m, ok := el.(map[string]any); ok {
+				if _, present := m[nullField]; present {
+					m[nullField] = nil
+				}
+			}
+		}
+		return cur
+	}
+	s := prefix[0]
+	if s.array {
+		arr, ok := cur.([]any)
+		if !ok {
+			return cur
+		}
+		for i := range arr {
+			arr[i] = scrubDescend(arr[i], prefix[1:], elem, nullField, authorized)
+		}
+		return cur
+	}
+	m, ok := cur.(map[string]any)
+	if !ok {
+		return cur
+	}
+	if v, present := m[s.field]; present {
+		m[s.field] = scrubDescend(v, prefix[1:], elem, nullField, authorized)
+	}
+	return cur
 }

@@ -20,7 +20,7 @@ func TestFilter_RedactsContentNotCounts(t *testing.T) {
 			map[string]any{markerAlias: map[string]any{"nameWithOwner": "o/denied"}, "title": "DENIED_BODY"},
 		},
 	}}}
-	out := Filter(resp, func(owner, repo, _ string) bool { return repo == "allowed" })
+	out := Filter(resp, func(owner, repo, _, _ string) bool { return repo == "allowed" })
 	js := mustJSON(out)
 
 	// CONTENT of the denied repo is redacted (the guarantee that holds).

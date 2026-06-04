@@ -255,19 +255,41 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// requests fail closed instead of leaking.
 	if respFilter == nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		dec, locs := restfilter.Lookup(norm)
-		switch dec {
-		case restfilter.NeedsFilter:
-			p := pol
-			respFilter = func(resp []byte) ([]byte, bool) {
-				return restfilter.Redact(resp, locs, func(repo string) bool {
-					owner := repo
-					if i := strings.IndexByte(repo, '/'); i > 0 {
-						owner = repo[:i]
-					}
-					return p.CanReadAnything(repo, owner)
-				})
+		// Cross-reference content scrub: some responses embed a FULL foreign-repo issue/PR (title+
+		// body) inside an array element via a `source` cross-reference (the issue timeline's
+		// cross-referenced event). That foreign repo may be denied even though the path repo is
+		// allowed, and the enum redactor can't express it (it would drop every non-cross-ref event).
+		// Scrub nulls just the cross-ref sub-object per element when its repo is denied (audit F2).
+		scrubLocs := restfilter.ScrubLocations(norm)
+		p := pol
+		canRead := func(repo string) bool {
+			owner := repo
+			if i := strings.IndexByte(repo, '/'); i > 0 {
+				owner = repo[:i]
 			}
-		case restfilter.Unknown:
+			return p.CanReadAnything(repo, owner)
+		}
+		switch {
+		case dec == restfilter.NeedsFilter || len(scrubLocs) > 0:
+			// Redact denied enum entries (drop) and/or scrub embedded foreign cross-ref content
+			// (null in place); both fail closed on an unparseable body.
+			respFilter = func(resp []byte) ([]byte, bool) {
+				out := resp
+				if dec == restfilter.NeedsFilter {
+					var ok bool
+					if out, ok = restfilter.Redact(out, locs, canRead); !ok {
+						return nil, false
+					}
+				}
+				if len(scrubLocs) > 0 {
+					var ok bool
+					if out, ok = restfilter.Scrub(out, scrubLocs, canRead); !ok {
+						return nil, false
+					}
+				}
+				return out, true
+			}
+		case dec == restfilter.Unknown:
 			// Off-spec endpoint. If the classifier already scoped it to one repository, that
 			// path scope is the authorization (e.g. an unrecognized /repos/{o}/{r}/… subpath
 			// about an allowed repo) — forward. Otherwise it could enumerate across repos with
@@ -370,15 +392,23 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 	// restriction like pulls="none" is enforced wherever the object appears — including via
 	// navigation back to the same readable repo, which the repo-granular check could not catch.
 	//
-	// The repository container itself (and bare metadata / unmapped types → resource
-	// "metadata") is kept whenever the repo is readable in ANY way: redacting the container
-	// would null the allowed CHILD objects inside it, breaking a base="none" + per-resource
-	// "read" grant (e.g. "read only this repo's issues"). Per-resource restrictions are
-	// enforced on the specific child objects (pulls/issues/…) below. A fully-denied repo is
-	// not readable in any way, so its container — and everything in it — is still redacted.
-	filtered := gqlfilter.Filter(parsed, func(owner, repo, resource string) bool {
+	// The repository CONTAINER (and only it) is kept whenever the repo is readable in ANY way:
+	// redacting the container would null the allowed CHILD objects inside it, breaking a
+	// base="none" + per-resource "read" grant (e.g. "read only this repo's issues"). Per-resource
+	// restrictions are enforced on the specific child objects (pulls/issues/…) below.
+	//
+	// EVERY OTHER repo-scoped object — including content types that map to "metadata" because they
+	// have no dedicated resource key (Discussion/Milestone/Project/Tag/…) — must satisfy its
+	// (repo, resource) like the DIRECT path does. Applying the lenient CanReadAnything to those
+	// metadata-class CONTENT leaves let cross-repo navigation forward a base="none" repo's
+	// discussion/milestone/project bodies under any non-none per-resource carve-out (audit F1):
+	// the direct request repository(secret){discussions{body}} is denied (its "metadata" scope
+	// hits the strict Evaluate branch), so the navigated path must be denied identically. A
+	// fully-denied repo is not readable in any way, so its container — and everything in it — is
+	// still redacted.
+	filtered := gqlfilter.Filter(parsed, func(owner, repo, resource, typename string) bool {
 		full := owner + "/" + repo
-		if resource == "metadata" {
+		if typename == gqlfilter.RepositoryContainerType {
 			return pol.CanReadAnything(full, owner)
 		}
 		return pol.Evaluate(full, owner, classifier.Read, resource, "").Allowed

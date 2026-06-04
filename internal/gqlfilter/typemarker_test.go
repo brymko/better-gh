@@ -69,7 +69,7 @@ func TestFilter_RedactsByResource(t *testing.T) {
 		},
 	}}
 	// Authorize: metadata + issues allowed, pulls denied (the pulls="none" semantics).
-	authorized := func(owner, repo, resource string) bool {
+	authorized := func(owner, repo, resource, _ string) bool {
 		return resource == "metadata" || resource == "issues"
 	}
 	out := Filter(resp, authorized)

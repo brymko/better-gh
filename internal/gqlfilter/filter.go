@@ -9,6 +9,7 @@ import (
 	"github.com/vektah/gqlparser/v2"
 	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/formatter"
+	"github.com/vektah/gqlparser/v2/parser"
 )
 
 // markerAlias is the response field injected into every repo-scoped object so it
@@ -28,6 +29,14 @@ const markerTypeAlias = "bghRepoTypeZ9"
 // returns the rewritten query. An invalid/untypable query yields an error so the
 // caller can fail closed.
 func (s *Schema) Augment(query string) (string, error) {
+	// Bound the parse before gqlparser.LoadQuery: LoadQuery re-parses with an UNLIMITED token
+	// limit, which a deeply nested query drives into a fatal stack overflow before validation
+	// ever runs (the same crash the classifier guards — Augment is reached on the request path
+	// regardless of the classifier's verdict). A token-bounded pre-parse fails closed on such
+	// input, and any query that passes it is small enough that LoadQuery's re-parse is bounded too.
+	if _, perr := parser.ParseQueryWithTokenLimit(&ast.Source{Input: query}, maxAugmentTokens); perr != nil {
+		return "", fmt.Errorf("parsing query: %s", perr.Error())
+	}
 	doc, gerr := gqlparser.LoadQuery(s.schema, query)
 	if gerr != nil {
 		return "", fmt.Errorf("validating query: %s", gerr.Error())
@@ -63,6 +72,11 @@ func (s *Schema) Augment(query string) (string, error) {
 // maxAugmentDepth bounds the marker/alias walk; a query deeper than this fails closed.
 // Real queries are far shallower, and GitHub itself rejects very deep documents.
 const maxAugmentDepth = 256
+
+// maxAugmentTokens bounds Augment's pre-parse so gqlparser.LoadQuery's unlimited re-parse cannot
+// stack-overflow on a deeply nested query. Matches the classifier's maxGraphQLTokens — far above
+// any real query, far below the recursion depth that crashes the parser.
+const maxAugmentTokens = 100_000
 
 // usesReservedAlias reports whether any field in the selection tree uses markerAlias as
 // its response key (alias, or name when unaliased), or whether the tree exceeds
@@ -220,11 +234,14 @@ func (s *Schema) markerWithAlias(typeName, alias string) *ast.Field {
 
 // Filter walks a GraphQL JSON response and redacts (replaces with null) any repo-scoped
 // object the authorized predicate rejects, then strips the injected markers. authorized
-// receives "owner", "repo", and the per-resource key derived from the object's runtime
-// __typename (PullRequest→"pulls", Issue→"issues", …; "metadata" for the repository itself
-// and unmapped types). Passing the resource lets per-resource policy (e.g. pulls="none") be
-// enforced on objects reached by ANY path — navigation included — not just the entry point.
-func Filter(resp map[string]any, authorized func(owner, repo, resource string) bool) map[string]any {
+// receives "owner", "repo", the per-resource key derived from the object's runtime __typename
+// (PullRequest→"pulls", Issue→"issues", …; "metadata" for the repository container and unmapped
+// types), AND the raw __typename so the caller can apply the lenient "keep the repository
+// container" rule to the container ONLY, not to metadata-class CONTENT objects (Discussion/
+// Milestone/Project/Tag/…) that must satisfy base access like the direct path (audit F1).
+// Passing the resource lets per-resource policy (e.g. pulls="none") be enforced on objects
+// reached by ANY path — navigation included — not just the entry point.
+func Filter(resp map[string]any, authorized func(owner, repo, resource, typename string) bool) map[string]any {
 	v := filterValue(resp, authorized)
 	if m, ok := v.(map[string]any); ok {
 		return m
@@ -232,18 +249,19 @@ func Filter(resp map[string]any, authorized func(owner, repo, resource string) b
 	return map[string]any{}
 }
 
-func filterValue(v any, authorized func(owner, repo, resource string) bool) any {
+func filterValue(v any, authorized func(owner, repo, resource, typename string) bool) any {
 	switch val := v.(type) {
 	case map[string]any:
 		if tag, ok := repoMarker(val); ok {
 			// A repo marker is only injected onto repo-scoped objects, so its presence means
-			// this object belongs to a repository. Redact if that (repo, resource) is denied
+			// this object belongs to a repository. Redact if that (repo, resource, type) is denied
 			// OR if the marker is unparseable (anomalous null/malformed repository) — failing
 			// closed, since we cannot prove the object is authorized. The resource comes from
 			// the runtime type marker (markerTypeAlias); absent/unmapped → "metadata" (base).
 			owner, repo, parsed := repoFromMarker(tag)
-			resource := typeResource(markerTypename(val))
-			if !parsed || !authorized(owner, repo, resource) {
+			typename := markerTypename(val)
+			resource := typeResource(typename)
+			if !parsed || !authorized(owner, repo, resource, typename) {
 				return nil
 			}
 		}
@@ -261,6 +279,13 @@ func filterValue(v any, authorized func(owner, repo, resource string) bool) any 
 		return v
 	}
 }
+
+// RepositoryContainerType is the GraphQL __typename of the repository container object — the one
+// repo-scoped type the response filter keeps leniently (whenever the repo is readable in ANY way)
+// so a base=none + per-resource grant doesn't null the container and lose its granted children.
+// Every OTHER repo-scoped object, including metadata-class content, must satisfy base/per-resource
+// access on its own (see the filterGraphQLResponse callback in internal/proxy).
+const RepositoryContainerType = "Repository"
 
 // markerTypename returns the runtime __typename injected under markerTypeAlias, or "" if
 // absent (which maps to the "metadata" resource — base access).
