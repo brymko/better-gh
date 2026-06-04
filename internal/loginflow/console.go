@@ -2,6 +2,7 @@ package loginflow
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -107,14 +108,17 @@ func (h *Handler) apiSession(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
-	var login string
+	var login, bsec string
 	var ok bool
 	h.grants.withGrant(byID(req.GrantID), func(g *grant) {
 		if g.flow == "standalone" && (g.status == statusAuthenticated || g.status == statusApproved) {
-			login, ok = g.login, true
+			login, bsec, ok = g.login, g.browserSecret, true
 		}
 	})
-	if !ok {
+	// Require the browser-binding cookie: only the browser that started the standalone sign-in may
+	// upgrade it into an owner session, so a leaked grant_id cannot mint a session (audit F2). The
+	// error is identical to the not-complete case to avoid an existence oracle on grant_id.
+	if !ok || !grantCookieMatches(r, req.GrantID, bsec) {
 		jsonResp(w, http.StatusForbidden, map[string]string{"error": "sign-in not complete"})
 		return
 	}
@@ -131,6 +135,32 @@ func (h *Handler) apiSession(w http.ResponseWriter, r *http.Request) {
 // plain HTTP with no external_url, where Secure would stop the cookie being sent at all.
 func (h *Handler) cookieSecure(r *http.Request) bool {
 	return r.TLS != nil || strings.HasPrefix(h.ExternalURL, "https://")
+}
+
+// grantCookie binds an in-progress sign-in grant to the browser that started it (audit F2). Its
+// value is "<grantID>.<browserSecret>"; setting it on the start/begin response and requiring it on
+// apiSession/apiApprove means a leaked or guessed grant_id alone cannot mint a token or a session.
+const grantCookie = "bgh_grant"
+
+func (h *Handler) setGrantCookie(w http.ResponseWriter, r *http.Request, grantID, secret string) {
+	http.SetCookie(w, &http.Cookie{
+		Name: grantCookie, Value: grantID + "." + secret, Path: "/", HttpOnly: true,
+		SameSite: http.SameSiteStrictMode, Secure: h.cookieSecure(r), MaxAge: int(grantTTL.Seconds()),
+	})
+}
+
+// grantCookieMatches reports whether r carries the browser-binding cookie for grantID with the
+// matching secret (constant-time). A grant with no browserSecret never matches (fail closed).
+func grantCookieMatches(r *http.Request, grantID, secret string) bool {
+	if secret == "" {
+		return false
+	}
+	c, err := r.Cookie(grantCookie)
+	if err != nil {
+		return false
+	}
+	want := grantID + "." + secret
+	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(want)) == 1
 }
 
 type repoOption struct {
@@ -307,7 +337,13 @@ func (h *Handler) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.ReplaceID != "" {
-		h.Store.Revoke(req.ReplaceID) // edit: the old token's secret stops working now
+		// edit = revoke + re-issue: the old token's secret must stop working now. Surface a
+		// persist failure rather than swallow it (a silently-unrevoked old token would keep
+		// authenticating, and resurrect on restart — audit F8).
+		if _, err := h.Store.Revoke(req.ReplaceID); err != nil {
+			jsonResp(w, http.StatusInternalServerError, map[string]string{"error": "minted token but could not revoke the replaced one; revoke it manually"})
+			return
+		}
 	}
 	jsonResp(w, http.StatusOK, map[string]string{"id": tok.ID, "name": name, "secret": secret})
 }
@@ -353,7 +389,12 @@ func (h *Handler) apiRevokeToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if !h.Store.Revoke(id) {
+	ok, err := h.Store.Revoke(id)
+	if err != nil {
+		jsonResp(w, http.StatusInternalServerError, map[string]string{"error": "could not persist revocation"})
+		return
+	}
+	if !ok {
 		jsonResp(w, http.StatusNotFound, map[string]string{"error": "no such token"})
 		return
 	}

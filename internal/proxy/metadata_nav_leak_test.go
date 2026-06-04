@@ -77,8 +77,17 @@ func TestSec_E2E_MetadataContentNavRedacted_F1(t *testing.T) {
 	if !strings.Contains(s, "ALLOWED_ISSUE_BODY") {
 		t.Fatalf("issues=read content was wrongly redacted (over-redaction): %s", s)
 	}
-	if !strings.Contains(s, `"name":"secret"`) {
+	// The granted child (the issue) must survive — proving the container was kept STRUCTURALLY,
+	// not nulled wholesale — while the navigated base=none container's OWN metadata scalar
+	// (its name) is stripped, since the direct repository(secret){name} is denied (audit F3).
+	if !strings.Contains(s, `"title":"IT"`) {
 		t.Fatalf("repository container was wrongly redacted, losing its granted children: %s", s)
+	}
+	if strings.Contains(s, `"name":"secret"`) {
+		t.Fatalf("F3 leak: navigated base=none container's metadata scalar (name) forwarded: %s", s)
+	}
+	if !strings.Contains(s, `"name":"public"`) {
+		t.Fatalf("entry container's metadata (base=read) was wrongly stripped: %s", s)
 	}
 	if strings.Contains(s, "bghRepoTagZ9") || strings.Contains(s, "bghRepoTypeZ9") {
 		t.Fatalf("marker leaked to client: %s", s)

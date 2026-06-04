@@ -217,14 +217,26 @@ func (h *Handler) revokeToken(w http.ResponseWriter, r *http.Request) {
 	// through the running server's store so the change takes effect immediately and is
 	// not clobbered by the server's own writes.
 	if r.URL.Query().Get("hard") == "true" {
-		if !h.store.Delete(id) {
+		ok, err := h.store.Delete(id)
+		if err != nil {
+			slog.Error("persisting token deletion failed", "id", id, "err", err)
+			jsonResp(w, http.StatusInternalServerError, map[string]string{"error": "could not persist deletion"})
+			return
+		}
+		if !ok {
 			jsonResp(w, http.StatusNotFound, map[string]string{"error": "not found"})
 			return
 		}
 		jsonResp(w, http.StatusOK, map[string]string{"status": "deleted"})
 		return
 	}
-	if !h.store.Revoke(id) {
+	ok, err := h.store.Revoke(id)
+	if err != nil {
+		slog.Error("persisting token revocation failed", "id", id, "err", err)
+		jsonResp(w, http.StatusInternalServerError, map[string]string{"error": "could not persist revocation"})
+		return
+	}
+	if !ok {
 		jsonResp(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}

@@ -258,3 +258,43 @@ func TestFilterPassesThroughOffShape(t *testing.T) {
 		t.Fatalf("object without items on a search path should pass through unchanged")
 	}
 }
+
+// TestSingletonSubjectFailsClosed is the audit F4 regression: a single-object endpoint whose whole
+// body belongs to one repo (notifications thread, codespace) must FAIL CLOSED when that repo is
+// denied — nulling only the $.repository sub-object would leak same-repo siblings (issue/PR titles,
+// branch names). An allowed subject passes through; an absent repo identity does not fail.
+func TestSingletonSubjectFailsClosed(t *testing.T) {
+	deny := func(repo string) bool { return repo == "a/keep" }
+
+	// Denied notification thread: repository denied, subject.title is the leak.
+	d, locs := Lookup("/notifications/threads/123")
+	if d != NeedsFilter {
+		t.Fatalf("notifications thread should be NeedsFilter, got %v", d)
+	}
+	thread := []byte(`{"repository":{"full_name":"a/denied"},"subject":{"title":"SECRET_ISSUE_TITLE","url":"https://api.github.com/repos/a/denied/issues/7"}}`)
+	if out, ok := Redact(thread, locs, deny); ok {
+		t.Fatalf("denied-repo thread must fail closed, not return a body: %s", out)
+	}
+
+	// Allowed thread passes through unchanged.
+	ok2 := []byte(`{"repository":{"full_name":"a/keep"},"subject":{"title":"FINE"}}`)
+	if out, ok := Redact(ok2, locs, deny); !ok || !contains2(string(out), "FINE") {
+		t.Fatalf("allowed thread should pass through, got ok=%v out=%s", ok, out)
+	}
+
+	// Codespace singleton: denied repo must fail closed (git_status.ref / recent_folders leak).
+	_, clocs := Lookup("/user/codespaces/my-space")
+	cs := []byte(`{"name":"my-space","repository":{"full_name":"a/denied"},"git_status":{"ref":"secret-branch"}}`)
+	if _, ok := Redact(cs, clocs, deny); ok {
+		t.Fatal("denied-repo codespace must fail closed")
+	}
+}
+
+func contains2(h, n string) bool {
+	for i := 0; i+len(n) <= len(h); i++ {
+		if h[i:i+len(n)] == n {
+			return true
+		}
+	}
+	return false
+}

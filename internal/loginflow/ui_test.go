@@ -55,13 +55,18 @@ func signInClient(t *testing.T, innerToken, preOwner string) (*httptest.Server, 
 	srv, st := newServerOnly(t, innerToken, preOwner)
 	jar, _ := cookiejar.New(nil)
 	c := &http.Client{Jar: jar}
-	_, s := post(t, srv, "/ui/api/start", map[string]string{})
-	grantID, _ := s["grant_id"].(string)
+	// Start via the cookie-carrying client so the grant-binding cookie (audit F2) is captured and
+	// later presented at /ui/api/session — only the starting browser can mint the owner session.
+	code, raw := cdo(t, c, "POST", srv.URL+"/ui/api/start", map[string]string{})
+	if code != http.StatusOK {
+		t.Fatalf("start failed (%d): %s", code, raw)
+	}
+	grantID, _ := obj(raw)["grant_id"].(string)
 	if grantID == "" {
-		t.Fatalf("start gave no grant_id: %v", s)
+		t.Fatalf("start gave no grant_id: %s", raw)
 	}
 	waitStatus(t, srv, "/ui/api/poll", grantID)
-	code, raw := cdo(t, c, "POST", srv.URL+"/ui/api/session", map[string]string{"grant_id": grantID})
+	code, raw = cdo(t, c, "POST", srv.URL+"/ui/api/session", map[string]string{"grant_id": grantID})
 	if code != http.StatusOK {
 		t.Fatalf("session failed (%d): %s", code, raw)
 	}
@@ -246,5 +251,40 @@ func TestConsole_NonOwnerDenied(t *testing.T) {
 	}
 	if len(st.List()) != 0 {
 		t.Fatalf("a token was minted for a non-owner: %d", len(st.List()))
+	}
+}
+
+// TestConsole_GrantHijackRequiresBindingCookie is the audit F2 regression: a party who learns a
+// grant_id (or user_code) but lacks the browser-binding cookie cannot turn an authenticated grant
+// into an owner session or an arbitrary-policy token. Only the starting browser can.
+func TestConsole_GrantHijackRequiresBindingCookie(t *testing.T) {
+	srv, st := newServerOnly(t, "tok-alice", "")
+
+	// Browser A starts and authenticates (holds the binding cookie in its jar).
+	jarA, _ := cookiejar.New(nil)
+	a := &http.Client{Jar: jarA}
+	code, raw := cdo(t, a, "POST", srv.URL+"/ui/api/start", map[string]string{})
+	if code != http.StatusOK {
+		t.Fatalf("start: %d %s", code, raw)
+	}
+	grantID := obj(raw)["grant_id"].(string)
+	waitStatus(t, srv, "/ui/api/poll", grantID)
+
+	// Attacker B has the grant_id but no binding cookie.
+	b := &http.Client{}
+	if code, _ := cdo(t, b, "POST", srv.URL+"/ui/api/session", map[string]string{"grant_id": grantID}); code != http.StatusForbidden {
+		t.Fatalf("session without binding cookie must be 403, got %d", code)
+	}
+	if code, _ := cdo(t, b, "POST", srv.URL+"/login/api/approve",
+		map[string]any{"grant_id": grantID, "policy": map[string]any{"defaults": map[string]any{"mode": "allow"}}}); code != http.StatusForbidden {
+		t.Fatalf("approve without binding cookie must be 403, got %d", code)
+	}
+	if len(st.List()) != 0 {
+		t.Fatalf("attacker minted a token without the binding cookie: %d", len(st.List()))
+	}
+
+	// Browser A (with the cookie) can still complete the session.
+	if code, raw := cdo(t, a, "POST", srv.URL+"/ui/api/session", map[string]string{"grant_id": grantID}); code != http.StatusOK {
+		t.Fatalf("legit browser session failed (%d): %s", code, raw)
 	}
 }

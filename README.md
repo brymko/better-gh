@@ -255,6 +255,12 @@ For each request, the classifier extracts `(repo, org, access_level, resource, u
    → if repo="" AND org="" AND unscoped[category] exists → check category access
    → otherwise: continue
 
+3b. Unscoped write guard
+   → if access=write AND repo="" AND org="" → deny ("unscoped write")
+      (a write with no repo/org never falls through to `mode = "allow"`; the only
+       exception is step 3 already granting that category read-write, e.g.
+       `[defaults.unscoped] gists = "read-write"` permitting `POST /gists`)
+
 4. [defaults].mode
    → "allow" → allow
    → "deny"  → deny
@@ -465,7 +471,7 @@ DELETE /api/tokens/{id}            Revoke token (mark revoked)
 DELETE /api/tokens/{id}?hard=true  Hard-delete token (remove entry)
 ```
 
-All endpoints require `Authorization: token <admin-secret>`. Token changes go through the running server, so `revoke`/`delete` take effect immediately (do not edit `tokens.json` by hand while the server is running — it rewrites the file on every allowed request).
+All endpoints require `Authorization: token <admin-secret>`. Token changes go through the running server, so `revoke`/`delete` take effect immediately (do not edit `tokens.json` by hand while the server is running — it rewrites the file on create/revoke/delete and on last-used updates, at most once per minute per token, so a hand edit can be clobbered).
 
 ## Configuration
 

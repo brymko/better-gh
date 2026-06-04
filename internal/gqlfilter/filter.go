@@ -66,8 +66,21 @@ func (s *Schema) Augment(query string) (string, error) {
 
 	var buf bytes.Buffer
 	formatter.NewFormatter(&buf).FormatQueryDocument(doc)
+	// Bound the augmented OUTPUT, not just the input token count. Marker injection adds one inline
+	// fragment per repo-scoped concrete member of every abstract selection (Node alone has 100+),
+	// so a small query of repeated abstract selections (node(id:){__typename}, ×thousands) can
+	// expand ~600× — hundreds of MB / tens of seconds of CPU — before any authorization deny, a
+	// single-process DoS reachable by any token holder (audit F5). Over the cap, fail closed: the
+	// caller treats it like an untypable query and the proxy denies (respFilter==nil → deny).
+	if buf.Len() > maxAugmentOutputBytes {
+		return "", fmt.Errorf("augmented query too large (%d bytes > %d cap)", buf.Len(), maxAugmentOutputBytes)
+	}
 	return buf.String(), nil
 }
+
+// maxAugmentOutputBytes caps the rewritten query the proxy will forward. Real augmented queries
+// are a few KB; this is far above any legitimate document yet bounds the marker-injection blowup.
+const maxAugmentOutputBytes = 8 << 20 // 8 MB
 
 // maxAugmentDepth bounds the marker/alias walk; a query deeper than this fails closed.
 // Real queries are far shallower, and GitHub itself rejects very deep documents.
@@ -241,43 +254,125 @@ func (s *Schema) markerWithAlias(typeName, alias string) *ast.Field {
 // Milestone/Project/Tag/…) that must satisfy base access like the direct path (audit F1).
 // Passing the resource lets per-resource policy (e.g. pulls="none") be enforced on objects
 // reached by ANY path — navigation included — not just the entry point.
+// Decision is the per-object verdict the filter's predicate returns.
+type Decision int
+
+const (
+	// Deny redacts the whole object (replaced with null).
+	Deny Decision = iota
+	// Keep keeps the object and recurses into its children normally.
+	Keep
+	// KeepShell keeps a repository CONTAINER only structurally: it preserves subtrees that lead to
+	// repo-scoped (marked) descendants — the granted children — but strips the container's OWN
+	// data: scalar fields (description/sshUrl/diskUsage/isPrivate/…) and non-repo-scoped leaf
+	// objects (contributingGuidelines.body/planFeatures/…). Used when a repo is readable in SOME
+	// way (CanReadAnything) but its `metadata` resource is denied, so a `base=none` + per-resource
+	// grant reached by navigation cannot leak the repo's metadata/content the direct path forbids
+	// (audit F3). Only meaningful for the RepositoryContainerType; other types use Keep/Deny.
+	KeepShell
+)
+
+// Filter is the bool-predicate convenience wrapper (used by tests): allowed→Keep, denied→Deny. The
+// proxy uses FilterWithDecision so it can also request KeepShell for leniently-kept containers.
 func Filter(resp map[string]any, authorized func(owner, repo, resource, typename string) bool) map[string]any {
-	v := filterValue(resp, authorized)
+	return FilterWithDecision(resp, func(owner, repo, resource, typename string) Decision {
+		if authorized(owner, repo, resource, typename) {
+			return Keep
+		}
+		return Deny
+	})
+}
+
+// FilterWithDecision walks a GraphQL JSON response and applies authorize's per-object Decision to
+// every repo-scoped (marked) object, then strips the injected markers.
+func FilterWithDecision(resp map[string]any, authorize func(owner, repo, resource, typename string) Decision) map[string]any {
+	v := filterValue(resp, authorize)
 	if m, ok := v.(map[string]any); ok {
 		return m
 	}
 	return map[string]any{}
 }
 
-func filterValue(v any, authorized func(owner, repo, resource, typename string) bool) any {
+func filterValue(v any, authorize func(owner, repo, resource, typename string) Decision) any {
 	switch val := v.(type) {
 	case map[string]any:
 		if tag, ok := repoMarker(val); ok {
-			// A repo marker is only injected onto repo-scoped objects, so its presence means
-			// this object belongs to a repository. Redact if that (repo, resource, type) is denied
-			// OR if the marker is unparseable (anomalous null/malformed repository) — failing
-			// closed, since we cannot prove the object is authorized. The resource comes from
-			// the runtime type marker (markerTypeAlias); absent/unmapped → "metadata" (base).
+			// A repo marker is only injected onto repo-scoped objects, so its presence means this
+			// object belongs to a repository. An unparseable marker (anomalous null/malformed
+			// repository) fails closed. The resource comes from the runtime type marker; absent/
+			// unmapped → "metadata" (base).
 			owner, repo, parsed := repoFromMarker(tag)
 			typename := markerTypename(val)
 			resource := typeResource(typename)
-			if !parsed || !authorized(owner, repo, resource, typename) {
+			if !parsed {
 				return nil
+			}
+			switch authorize(owner, repo, resource, typename) {
+			case Deny:
+				return nil
+			case KeepShell:
+				stripMarkers(val)
+				return shellPrune(val, authorize)
+			default: // Keep
 			}
 		}
 		stripMarkers(val) // strip injected repo + type markers (whether or not a repo marker rode along)
 		for k, child := range val {
-			val[k] = filterValue(child, authorized)
+			val[k] = filterValue(child, authorize)
 		}
 		return val
 	case []any:
 		for i, child := range val {
-			val[i] = filterValue(child, authorized)
+			val[i] = filterValue(child, authorize)
 		}
 		return val
 	default:
 		return v
 	}
+}
+
+// shellPrune keeps a leniently-allowed repository container as a structural shell only (see
+// KeepShell). It strips every scalar field (the container's own metadata) and every child whose
+// subtree contains no repo-scoped MARKED object (a non-repo-scoped leaf like contributingGuidelines),
+// while recursing — via the normal filterValue, which applies each child's own Decision — into
+// subtrees that DO contain marked objects (connection wrappers leading to granted issues/pulls).
+func shellPrune(container map[string]any, authorize func(owner, repo, resource, typename string) Decision) any {
+	for k, child := range container {
+		switch child.(type) {
+		case map[string]any, []any:
+			if hasRepoMarkerDescendant(child) {
+				container[k] = filterValue(child, authorize)
+			} else {
+				delete(container, k) // pure container-owned data (no repo-scoped object beneath)
+			}
+		default:
+			delete(container, k) // scalar → the container's own metadata
+		}
+	}
+	return container
+}
+
+// hasRepoMarkerDescendant reports whether v contains, at any depth, an object carrying a repo
+// marker — i.e. a repo-scoped object that filterValue will authorize on its own.
+func hasRepoMarkerDescendant(v any) bool {
+	switch val := v.(type) {
+	case map[string]any:
+		if _, ok := repoMarker(val); ok {
+			return true
+		}
+		for _, child := range val {
+			if hasRepoMarkerDescendant(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range val {
+			if hasRepoMarkerDescendant(child) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RepositoryContainerType is the GraphQL __typename of the repository container object — the one

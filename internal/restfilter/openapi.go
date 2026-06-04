@@ -102,7 +102,36 @@ func Redact(body []byte, locs []string, authorized func(ownerRepo string) bool) 
 		return nil, false
 	}
 	origItems := itemsLen(root)
-	root = applyLocations(root, locs, authorized)
+	// Singleton (non-array) locations address the response's OWN subject repository (a
+	// notification thread, a codespace, a single package). If that repo is present and denied,
+	// the WHOLE body belongs to a denied repo and its same-repo siblings (issue/PR titles, branch
+	// names, source paths) would survive a mere sub-object null — so fail closed and let the proxy
+	// reject the body, matching the all-or-nothing semantics the array path gets by dropping the
+	// element (audit F4). An absent/undeterminable singleton repo (e.g. an org-scoped package with
+	// no repository) exposes no repo identity, so it is not failed. For repo-path-scoped endpoints
+	// the singleton repo is the path repo the classifier already authorized, so this never trips.
+	var arrayLocs []string
+	for _, loc := range locs {
+		steps := parseLoc(loc)
+		if len(steps) == 0 {
+			continue
+		}
+		hasArray := false
+		for _, s := range steps {
+			if s.array {
+				hasArray = true
+				break
+			}
+		}
+		if hasArray {
+			arrayLocs = append(arrayLocs, loc)
+			continue
+		}
+		if repo := readSingletonRepo(root, steps); repo != "" && !authorized(repo) {
+			return nil, false
+		}
+	}
+	root = applyLocations(root, arrayLocs, authorized)
 	// Close the search count oracle: if items were dropped from a {items,total_count} body,
 	// rewrite the count and flag it incomplete (same as the old filter did for /search).
 	if m, ok := root.(map[string]any); ok && origItems >= 0 {
@@ -182,8 +211,7 @@ func applyLocations(root any, locs []string, authorized func(string) bool) any {
 			}
 		}
 		if last < 0 {
-			root = nullSingleton(root, steps, authorized)
-			continue
+			continue // singleton locs are handled fail-closed in Redact, not here
 		}
 		prefix, elem := steps[:last], steps[last+1:]
 		key := prefixKey(prefix)
@@ -290,27 +318,16 @@ func readRepo(v any, elem []locStep) string {
 	return str
 }
 
-// nullSingleton handles a repo with no enclosing array (e.g. $.repository.full_name): null the
-// repo object in its parent when its repo is denied or undeterminable.
-func nullSingleton(root any, steps []locStep, authorized func(string) bool) any {
+// readSingletonRepo reads the "owner/repo" a non-array location points at (e.g.
+// $.repository.full_name or $.full_name → the response's own subject repo), or "" if the field
+// is absent/malformed. Redact fails the whole body closed when such a repo is present and denied.
+func readSingletonRepo(root any, steps []locStep) string {
 	repoPath := steps[:len(steps)-1] // drop the terminal full_name/name → the repo object
-	obj := walkPath(root, repoPath)
-	m, ok := obj.(map[string]any)
+	m, ok := walkPath(root, repoPath).(map[string]any)
 	if !ok {
-		return root
+		return ""
 	}
-	fn := readRepo(m, steps[len(steps)-1:]) // re-read the leaf with one-slash validation
-	if fn != "" && authorized(fn) {
-		return root
-	}
-	if len(repoPath) == 0 {
-		return nil // root itself is the repo object
-	}
-	parent := walkPath(root, repoPath[:len(repoPath)-1])
-	if pm, ok := parent.(map[string]any); ok {
-		pm[repoPath[len(repoPath)-1].field] = nil
-	}
-	return root
+	return readRepo(m, steps[len(steps)-1:]) // re-read the leaf with one-slash validation
 }
 
 func walkPath(v any, steps []locStep) any {

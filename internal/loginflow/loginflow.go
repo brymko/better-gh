@@ -210,7 +210,7 @@ func (h *Handler) apiStartStandalone(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, http.StatusTooManyRequests, map[string]string{"error": "too many sign-in attempts; try again shortly"})
 		return
 	}
-	g := &grant{flow: "standalone", status: statusPending, started: true}
+	g := &grant{flow: "standalone", status: statusPending, started: true, browserSecret: randHex(32)}
 	if !h.grants.add(g) {
 		jsonResp(w, http.StatusServiceUnavailable, map[string]string{"error": "too many pending sign-ins; try again shortly"})
 		return
@@ -221,6 +221,9 @@ func (h *Handler) apiStartStandalone(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, http.StatusBadGateway, map[string]string{"error": "could not start GitHub login: " + err.Error()})
 		return
 	}
+	// Bind the grant to this browser before returning grant_id, so only this browser can later
+	// turn the authenticated grant into an owner session (audit F2).
+	h.setGrantCookie(w, r, g.id, g.browserSecret)
 	jsonResp(w, http.StatusOK, map[string]any{
 		"grant_id":            g.id,
 		"github_user_code":    userCode,
@@ -301,6 +304,13 @@ func (h *Handler) denyGrant(grantID, reason string) {
 // authorizePageWeb handles gh's browser (web) flow: record the grant keyed by gh's state +
 // callback, then serve the same authorize page (it reads state from the URL).
 func (h *Handler) authorizePageWeb(w http.ResponseWriter, r *http.Request) {
+	// Rate-limit like the other grant-creating endpoints: this one also calls grants.add, and was
+	// the only such callsite missing the per-source limiter — an unauthenticated grant flood
+	// (audit F9). Each accepted page-load reserves a grant until its TTL sweep.
+	if !h.deviceLimiter.allow(clientIP(r)) {
+		http.Error(w, "too many sign-in attempts; try again shortly", http.StatusTooManyRequests)
+		return
+	}
 	q := r.URL.Query()
 	state := q.Get("state")
 	redirectURI := q.Get("redirect_uri")
@@ -317,11 +327,14 @@ func (h *Handler) authorizePageWeb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "redirect_uri must be a loopback (127.0.0.1/localhost) http(s) URL", http.StatusBadRequest)
 		return
 	}
-	g := &grant{flow: "web", state: state, redirectURI: redirectURI, userCode: randUserCode(), status: statusPending}
+	g := &grant{flow: "web", state: state, redirectURI: redirectURI, userCode: randUserCode(), status: statusPending, browserSecret: randHex(32)}
 	if !h.grants.add(g) {
 		http.Error(w, "too many pending sign-ins; try again shortly", http.StatusServiceUnavailable)
 		return
 	}
+	// Bind the grant to this browser (the one gh opened) before serving the page, so only it can
+	// later approve and reap the minted token (audit F2).
+	h.setGrantCookie(w, r, g.id, g.browserSecret)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(authorizePage)
 }
@@ -349,21 +362,36 @@ func (h *Handler) apiBegin(w http.ResponseWriter, r *http.Request) {
 		match = byState(req.State)
 	}
 
-	var id, userCode string
-	var alreadyStarted bool
+	var id, userCode, bsec string
+	var alreadyStarted, newlyBound bool
 	found := h.grants.withGrant(match, func(g *grant) {
 		id, userCode, alreadyStarted = g.id, g.userCode, g.started
 		if !g.started {
 			g.started = true // claim the start under the lock so concurrent begins don't double-launch
+			if g.browserSecret == "" {
+				// Device flow: the grant was created by gh (no browser), so this first browser
+				// claim binds it. (Web flow pre-binds in authorizePageWeb.) audit F2.
+				g.browserSecret = randHex(32)
+				newlyBound = true
+			}
 		}
+		bsec = g.browserSecret
 	})
 	if !found {
 		jsonResp(w, http.StatusNotFound, map[string]string{"error": "unknown or expired code"})
 		return
 	}
+	if newlyBound {
+		h.setGrantCookie(w, r, id, bsec)
+	}
 	if alreadyStarted {
-		// idempotent on page reload: we can't recover GitHub's user_code, so tell the page it's
-		// already in progress and to keep polling.
+		// idempotent on page reload — but ONLY for the browser that started it: recovering grant_id
+		// from just the (low-entropy, operator-visible) user_code would let another party drive
+		// apiApprove. Gate the grant_id on the binding cookie; otherwise report progress without it.
+		if !grantCookieMatches(r, id, bsec) {
+			jsonResp(w, http.StatusOK, map[string]any{"in_progress": true})
+			return
+		}
 		jsonResp(w, http.StatusOK, map[string]any{"grant_id": id, "user_code": userCode, "in_progress": true})
 		return
 	}
@@ -430,15 +458,27 @@ func (h *Handler) apiApprove(w http.ResponseWriter, r *http.Request) {
 	// Reserve the grant for minting (only from the authenticated state) so a double-submit
 	// can't mint twice.
 	var ok bool
-	var login, flow, redirectURI, state string
+	var login, flow, redirectURI, state, bsec string
 	h.grants.withGrant(byID(req.GrantID), func(g *grant) {
 		if g.status == statusAuthenticated {
 			g.status = statusApproved // provisional; secret filled in below
-			ok, login, flow, redirectURI, state = true, g.login, g.flow, g.redirectURI, g.state
+			ok, login, flow, redirectURI, state, bsec = true, g.login, g.flow, g.redirectURI, g.state, g.browserSecret
 		}
 	})
 	if !ok {
 		jsonResp(w, http.StatusConflict, map[string]string{"error": "grant is not authenticated (authorize with GitHub first)"})
+		return
+	}
+	// The minted token must be collected only by the browser that started the sign-in: otherwise a
+	// party who learned grant_id could approve under an attacker-chosen policy and reap the token
+	// (audit F2). Revert the provisional reservation if the binding cookie is absent/mismatched.
+	if !grantCookieMatches(r, req.GrantID, bsec) {
+		h.grants.withGrant(byID(req.GrantID), func(g *grant) {
+			if g.status == statusApproved {
+				g.status = statusAuthenticated
+			}
+		})
+		jsonResp(w, http.StatusForbidden, map[string]string{"error": "approval must come from the browser that started the sign-in"})
 		return
 	}
 

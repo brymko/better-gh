@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -133,7 +134,9 @@ func (s *Store) TouchLastUsed(id string) {
 				return // recorded recently; skip the rewrite to cap write amplification
 			}
 			s.tokens[i].LastUsed = now
-			_ = s.flush()
+			if err := s.flush(); err != nil {
+				slog.Warn("persisting last-used failed", "id", id, "err", err)
+			}
 			return
 		}
 	}
@@ -159,28 +162,45 @@ func (s *Store) Get(idOrName string) *ProxyToken {
 	return nil
 }
 
-func (s *Store) Revoke(idOrName string) bool {
+// Revoke marks EVERY token whose ID or Name matches as revoked, returning whether any matched
+// and any persistence error. Matching all (not just the first) closes a footgun: two tokens can
+// share a Name (e.g. `gh auth login` twice defaults to "ghlogin-<login>"), and revoking by name
+// must kill them all, not leave a same-named secret live (audit F6). The flush error is returned
+// (not swallowed) so a handler can surface a failed persist instead of falsely reporting success;
+// a swallowed flush failure followed by a restart would resurrect the revoked token (audit F8).
+func (s *Store) Revoke(idOrName string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	found := false
 	for i := range s.tokens {
 		if s.tokens[i].ID == idOrName || s.tokens[i].Name == idOrName {
 			s.tokens[i].Revoked = true
-			_ = s.flush()
-			return true
+			found = true
 		}
 	}
-	return false
+	if !found {
+		return false, nil
+	}
+	return true, s.flush()
 }
 
-func (s *Store) Delete(idOrName string) bool {
+// Delete removes EVERY token whose ID or Name matches (see Revoke for why all, not first), and
+// returns whether any matched plus any persistence error.
+func (s *Store) Delete(idOrName string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.tokens {
-		if s.tokens[i].ID == idOrName || s.tokens[i].Name == idOrName {
-			s.tokens = append(s.tokens[:i], s.tokens[i+1:]...)
-			_ = s.flush()
-			return true
+	kept := s.tokens[:0]
+	found := false
+	for _, t := range s.tokens {
+		if t.ID == idOrName || t.Name == idOrName {
+			found = true
+			continue
 		}
+		kept = append(kept, t)
 	}
-	return false
+	if !found {
+		return false, nil
+	}
+	s.tokens = kept
+	return true, s.flush()
 }

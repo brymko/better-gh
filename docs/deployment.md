@@ -180,19 +180,34 @@ the above is bypassing the proxy.
 
 ## Policy tips
 
-`gh repo list` / `gh org list` enumerate **an owner** (your account) via
-`repositoryOwner(login:)` / `user(login:)`, so they are classified as an **org** scope — they
-need an `org` rule for your username, not just per-repo rules:
+The enumeration commands classify **differently** depending on whether you name an owner — get this
+wrong and the command 403s:
+
+| Command | GraphQL it sends | Scope it needs |
+|---|---|---|
+| `gh repo list` (own account) | `viewer { repositories … }` | `[defaults.unscoped] user = "read"` |
+| `gh repo list <owner>` | `repositoryOwner(login: <owner>)` | `[[org]]` rule named `<owner>` |
+| `gh org list` | `user(login: <you>)` | `[[org]]` rule named `<your-login>` |
+
+So for the common case — listing *your own* repos — grant the unscoped `user` category; an `[[org]]`
+rule for your username does **not** match (the `viewer` form carries no owner argument):
 
 ```toml
+[defaults.unscoped]
+user = "read"                     # lets `gh repo list` (your own account) enumerate
+
 [[org]]
-name = "your-login"               # lets `gh repo list` / `gh org list` enumerate your account
+name = "your-login"               # lets `gh repo list your-login` / `gh org list` enumerate, too
 access = "read"
 
 [[repo]]
 name = "your-login/private-thing" # ...while still redacting a specific repo from the listing
 access = "none"
 ```
+
+> Note: tokens minted via the web console / `gh auth login` are auto-granted `user`/`meta` read
+> (`ensureLoginUsable`), so they already list your own repos. This `[defaults.unscoped] user` tip is
+> for **socket-mode** `policy.toml`, which gets no such floor.
 
 (A fully denied repo is redacted to `null` in the GraphQL response, so `gh repo list` shows it
 as a blank row rather than dropping it — its name and data never leave the proxy.)
@@ -235,8 +250,11 @@ Back these up **off-host, encrypted** — losing them loses access, leaking them
   GitHub and update the env/file.
 - **Owner GitHub account compromised:** the attacker can sign in as owner and mint full-access
   proxy tokens. Response: stop the proxy, revoke the OAuth grant at GitHub, **delete `owner.json`
-  and `tokens.json`**, secure the GitHub account (rotate its credentials / 2FA), then re-claim from
-  loopback and re-issue client tokens.
+  and `tokens.json`**, **also clear any pre-seeded fallback custodian** (`BGH_GITHUB_TOKEN` in the
+  environment, `github_token` in `config.toml`, and `~/.config/bgh/github-token`) — deleting
+  `owner.json` re-arms TOFU but does **not** disarm a fallback token, which would keep forwarding —
+  secure the GitHub account (rotate its credentials / 2FA), then re-claim from loopback and
+  re-issue client tokens.
 - **A client (proxy token) compromised:** `bgh-proxy token revoke <name-or-id>` (or the owner
   console) — takes effect immediately on the running server.
 

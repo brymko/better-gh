@@ -37,12 +37,21 @@ type Schema struct {
 }
 
 // crossRepoNavFields are singular fields that point to a DIFFERENT repository than the
-// object's own (a fork's parent/source, a PR's head/base repo, a template). The repo-path
+// object's own (a fork's parent/source, a PR's head repo, a template). The repo-path
 // derivation must not follow them, or a type could be attributed to — and redacted
 // against — the wrong repository.
+//
+// The Repository-typed links are joined by the head-side Ref/GitObject links: a PR/comparison's
+// head ref/target can live in a FORK. Following headRef mis-attributed HeadRefDeletedEvent to the
+// fork (audit round-14 hardening) — wrong-repo over-redaction today, a latent leak under schema
+// drift. The own-repo side (baseRef/baseTarget/mergeCommit — a PR's base/merge are in the repo
+// itself) is intentionally NOT excluded, so own-repo-only types (Comparison, MergeBranchPayload)
+// keep their correct path; types whose ONLY link is head-side become non-repo-scoped and are gated
+// by their already-tagged parent (the PR's Repository container), which is sound.
 var crossRepoNavFields = map[string]bool{
 	"parent": true, "source": true, "headRepository": true,
 	"baseRepository": true, "templateRepository": true,
+	"headRef": true, "headTarget": true,
 }
 
 // Load parses the embedded GitHub schema and derives, for every type that belongs to a

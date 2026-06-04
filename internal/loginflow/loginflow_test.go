@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -88,6 +89,34 @@ func post(t *testing.T, srv *httptest.Server, path string, body any) (int, map[s
 	return resp.StatusCode, out
 }
 
+// postc POSTs JSON with a cookie-carrying client, so the grant-binding cookie (audit F2) set on
+// begin/authorize persists through approve — modelling the single browser that drives the flow.
+func postc(t *testing.T, c *http.Client, srv *httptest.Server, path string, body any) (int, map[string]any) {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(string(b)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	raw, _ := io.ReadAll(resp.Body)
+	_ = json.Unmarshal(raw, &out)
+	return resp.StatusCode, out
+}
+
+// browserClient returns an http.Client with a cookie jar (one "browser") for driving a sign-in.
+func browserClient(t *testing.T) *http.Client {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &http.Client{Jar: jar}
+}
+
 func postForm(t *testing.T, srv *httptest.Server, path string, form url.Values) (int, map[string]any) {
 	t.Helper()
 	resp, err := http.Post(srv.URL+path, "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
@@ -135,8 +164,9 @@ func TestDeviceFlow_HappyPath(t *testing.T) {
 		t.Fatalf("expected authorization_pending, got %v", at)
 	}
 
-	// Operator begins GitHub auth.
-	_, b := post(t, srv, "/login/api/begin", map[string]string{"user_code": userCode})
+	// Operator begins GitHub auth (in their browser — the binding cookie is set here, audit F2).
+	browser := browserClient(t)
+	_, b := postc(t, browser, srv, "/login/api/begin", map[string]string{"user_code": userCode})
 	grantID, _ := b["grant_id"].(string)
 	if grantID == "" || b["github_user_code"] == nil {
 		t.Fatalf("begin missing grant_id/github_user_code: %v", b)
@@ -148,9 +178,9 @@ func TestDeviceFlow_HappyPath(t *testing.T) {
 		t.Fatalf("expected authenticated as alice, got %v", p)
 	}
 
-	// Approve with a scoped policy.
+	// Approve with a scoped policy — from the SAME browser (cookie carries the grant binding).
 	pol := map[string]any{"defaults": map[string]any{"mode": "deny"}, "repo": []map[string]string{{"name": "alice/app", "access": "read"}}}
-	code, ap := post(t, srv, "/login/api/approve", map[string]any{"grant_id": grantID, "name": "laptop", "policy": pol})
+	code, ap := postc(t, browser, srv, "/login/api/approve", map[string]any{"grant_id": grantID, "name": "laptop", "policy": pol})
 	if code != http.StatusOK || ap["status"] != "approved" {
 		t.Fatalf("approve failed (%d): %v", code, ap)
 	}
@@ -252,10 +282,12 @@ func TestWebFlow_RejectsNonLoopbackRedirect(t *testing.T) {
 func TestWebFlow_HappyPath(t *testing.T) {
 	srv, st := newServerOnly(t, "tok-alice", "")
 
-	// gh opens the authorize page with state + redirect_uri.
+	// gh opens the authorize page with state + redirect_uri (in the operator's browser — the
+	// binding cookie is set on this response, audit F2).
+	browser := browserClient(t)
 	state := "st123"
 	redirect := "http://127.0.0.1:9999/callback"
-	resp, err := http.Get(srv.URL + "/login/oauth/authorize?client_id=x&state=" + state + "&redirect_uri=" + url.QueryEscape(redirect))
+	resp, err := browser.Get(srv.URL + "/login/oauth/authorize?client_id=x&state=" + state + "&redirect_uri=" + url.QueryEscape(redirect))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,14 +296,14 @@ func TestWebFlow_HappyPath(t *testing.T) {
 		t.Fatalf("authorize page status %d", resp.StatusCode)
 	}
 
-	_, b := post(t, srv, "/login/api/begin", map[string]string{"state": state})
+	_, b := postc(t, browser, srv, "/login/api/begin", map[string]string{"state": state})
 	grantID := b["grant_id"].(string)
 	if p := waitStatus(t, srv, "/login/api/poll", grantID); p["status"] != "authenticated" {
 		t.Fatalf("expected authenticated, got %v", p)
 	}
 
 	pol := map[string]any{"defaults": map[string]any{"mode": "deny"}}
-	_, ap := post(t, srv, "/login/api/approve", map[string]any{"grant_id": grantID, "policy": pol})
+	_, ap := postc(t, browser, srv, "/login/api/approve", map[string]any{"grant_id": grantID, "policy": pol})
 	red, _ := ap["redirect"].(string)
 	if !strings.HasPrefix(red, redirect) || !strings.Contains(red, "state="+state) {
 		t.Fatalf("bad redirect: %q", red)

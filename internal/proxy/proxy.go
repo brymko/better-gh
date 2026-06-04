@@ -294,8 +294,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// path scope is the authorization (e.g. an unrecognized /repos/{o}/{r}/… subpath
 			// about an allowed repo) — forward. Otherwise it could enumerate across repos with
 			// a shape we cannot redact, and (in the default deployment) nothing behind us would
-			// catch it — so fail closed.
-			if r.Method == http.MethodGet && result.Allowed && !classified.HasRepo() {
+			// catch it — so fail closed. Applies to GET and HEAD alike (the enclosing block
+			// already restricts to those): HEAD must not slip past the GET fail-closed and serve
+			// a denied endpoint's headers as an existence/metadata oracle (audit F7).
+			if result.Allowed && !classified.HasRepo() {
 				result = policy.Result{Reason: "off-spec REST endpoint cannot be repo-filtered (fail closed)"}
 			}
 		}
@@ -406,12 +408,27 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 	// hits the strict Evaluate branch), so the navigated path must be denied identically. A
 	// fully-denied repo is not readable in any way, so its container — and everything in it — is
 	// still redacted.
-	filtered := gqlfilter.Filter(parsed, func(owner, repo, resource, typename string) bool {
+	filtered := gqlfilter.FilterWithDecision(parsed, func(owner, repo, resource, typename string) gqlfilter.Decision {
 		full := owner + "/" + repo
 		if typename == gqlfilter.RepositoryContainerType {
-			return pol.CanReadAnything(full, owner)
+			// The repository CONTAINER is kept whenever the repo is readable in ANY way, so a
+			// base="none" + per-resource grant doesn't lose its granted children. But if the repo's
+			// own "metadata" resource is denied, keep it only as a STRUCTURAL shell: strip its own
+			// scalars + non-repo-scoped leaf content (description/sshUrl/contributingGuidelines/…),
+			// which the direct request repository(secret){description} is denied — so navigating
+			// back to the container can't leak them either (audit F3).
+			if !pol.CanReadAnything(full, owner) {
+				return gqlfilter.Deny
+			}
+			if pol.Evaluate(full, owner, classifier.Read, "metadata", "").Allowed {
+				return gqlfilter.Keep
+			}
+			return gqlfilter.KeepShell
 		}
-		return pol.Evaluate(full, owner, classifier.Read, resource, "").Allowed
+		if pol.Evaluate(full, owner, classifier.Read, resource, "").Allowed {
+			return gqlfilter.Keep
+		}
+		return gqlfilter.Deny
 	})
 	out, err := json.Marshal(filtered)
 	if err != nil {
@@ -576,6 +593,12 @@ func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[stri
 		// No nodes array at all (e.g. a top-level error: rate limit, too complex). This is
 		// a resolution failure, not per-node nulls → fail closed.
 		return nil, fmt.Errorf("node resolution returned no nodes")
+	}
+	// GitHub's nodes(ids:) returns one entry per input ID, in order; the loop below maps by
+	// position (ids[i]). A length mismatch means that positional assumption is broken — bail out
+	// fail closed rather than risk attributing a node to the wrong ID (defense-in-depth).
+	if len(parsed.Data.Nodes) != len(ids) {
+		return nil, fmt.Errorf("node resolution returned %d nodes for %d ids", len(parsed.Data.Nodes), len(ids))
 	}
 
 	// GitHub returns nodes in input order; a null entry (invalid/unknown/no-access) decodes

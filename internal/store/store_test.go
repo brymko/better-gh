@@ -88,7 +88,7 @@ func TestLookupReturnsCopyNotSlicePointer(t *testing.T) {
 	}
 
 	for _, id := range before {
-		s.Delete(id) // shifts the slice in place, over the slot victim occupied
+		s.Delete(id) //nolint:errcheck // shifts the slice in place, over the slot victim occupied
 	}
 
 	if got.Name != "victim" || got.ID != victimID || got.Policy.Defaults.Mode != policy.ModeAllow {
@@ -127,8 +127,8 @@ func TestRevoke(t *testing.T) {
 	s := openTestStore(t)
 	_, secret, _ := s.Create("tok", testPolicy())
 
-	if !s.Revoke("tok") {
-		t.Fatal("Revoke returned false")
+	if ok, err := s.Revoke("tok"); !ok || err != nil {
+		t.Fatalf("Revoke returned ok=%v err=%v", ok, err)
 	}
 
 	if s.Lookup(secret) != nil {
@@ -145,8 +145,8 @@ func TestDelete(t *testing.T) {
 	s := openTestStore(t)
 	s.Create("tok", testPolicy())
 
-	if !s.Delete("tok") {
-		t.Fatal("Delete returned false")
+	if ok, err := s.Delete("tok"); !ok || err != nil {
+		t.Fatalf("Delete returned ok=%v err=%v", ok, err)
 	}
 
 	if s.Get("tok") != nil {
@@ -159,14 +159,14 @@ func TestDelete(t *testing.T) {
 
 func TestDeleteNonexistent(t *testing.T) {
 	s := openTestStore(t)
-	if s.Delete("nonexistent") {
+	if ok, _ := s.Delete("nonexistent"); ok {
 		t.Fatal("Delete should return false for nonexistent token")
 	}
 }
 
 func TestRevokeNonexistent(t *testing.T) {
 	s := openTestStore(t)
-	if s.Revoke("nonexistent") {
+	if ok, _ := s.Revoke("nonexistent"); ok {
 		t.Fatal("Revoke should return false for nonexistent token")
 	}
 }
@@ -351,5 +351,24 @@ func TestPersistence(t *testing.T) {
 	tokens := s2.List()
 	if len(tokens) != 1 || tokens[0].Name != "persist-test" {
 		t.Fatalf("persistence failed: got %d tokens", len(tokens))
+	}
+}
+
+// TestRevokeByNameKillsAllDuplicates is the audit F6 regression: two tokens can share a Name
+// (gh auth login twice → "ghlogin-<login>"); revoking by name must invalidate EVERY match,
+// not just the first, or a same-named secret stays live after the documented recovery step.
+func TestRevokeByNameKillsAllDuplicates(t *testing.T) {
+	s := openTestStore(t)
+	_, secretA, _ := s.Create("dup", testPolicy())
+	_, secretB, _ := s.Create("dup", testPolicy())
+
+	if ok, err := s.Revoke("dup"); !ok || err != nil {
+		t.Fatalf("Revoke(dup) ok=%v err=%v", ok, err)
+	}
+	if s.Lookup(secretA) != nil {
+		t.Fatal("first duplicate-named token still authenticates after revoke-by-name")
+	}
+	if s.Lookup(secretB) != nil {
+		t.Fatal("second duplicate-named token still authenticates after revoke-by-name (F6)")
 	}
 }

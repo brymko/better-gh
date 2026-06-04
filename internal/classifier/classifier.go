@@ -208,13 +208,29 @@ func classifyGraphQL(body []byte) Result {
 		if mutationFieldName != "" {
 			result.Resource = gqlMutationResource(mutationFieldName)
 		}
-		ids, resByID, ok := collectNodeIDArgs(ops, doc.Fragments, vars)
+		ids, resByID, repoScopes, ok := collectNodeIDArgs(ops, doc.Fragments, vars)
 		if !ok {
 			// Too complex to walk safely → no scope → unscoped write → denied.
 			return Result{Access: Write}
 		}
 		result.NodeIDs = ids
 		result.NodeIDResource = resByID
+		// String-named repo targets (createCommitOnBranch's repositoryNameWithOwner) are
+		// authoritative scopes the policy must allow — a carrier node must not satisfy policy while
+		// the real (string-named) target goes unchecked (audit F1). When the mutation carries node
+		// IDs, the proxy's resolver sets the primary scope and these are additional (all ANDed). When
+		// it carries NONE, the string target IS the primary scope — otherwise the request would be an
+		// empty (unscoped) write and a legitimate commit to an ALLOWED repo would be wrongly denied.
+		if len(repoScopes) > 0 {
+			if len(ids) == 0 {
+				result.Owner = repoScopes[0].Owner
+				result.Repo = repoScopes[0].Repo
+				result.Resource = repoScopes[0].Resource
+				result.Additional = append(result.Additional, repoScopes[1:]...)
+			} else {
+				result.Additional = append(result.Additional, repoScopes...)
+			}
+		}
 		// A mutation's RETURN selection is a normal read sub-graph and can navigate to
 		// other repositories (payload.pullRequest.repository.forks, ...). Scan it like a
 		// read so the proxy's response filter redacts denied navigated repos when
@@ -258,9 +274,14 @@ func classifyGraphQL(body []byte) Result {
 	// carry no repository() scope, so the proxy resolves each to its real repository
 	// before allowing the read — otherwise a node-ID read would bypass a repo block
 	// under default=allow.
-	nodeIDs, nodeRes, idsOk := collectNodeIDArgs(ops, doc.Fragments, vars)
+	nodeIDs, nodeRes, repoScopes, idsOk := collectNodeIDArgs(ops, doc.Fragments, vars)
 	if !idsOk {
 		return Result{Access: Write}
+	}
+	// Reads do not normally carry repositoryNameWithOwner, but include any for completeness so a
+	// string-named repo a read references is policy-checked like every other scope.
+	for _, s := range repoScopes {
+		add(s)
 	}
 
 	// escapes marks cross-repo field navigation. The proxy's response filter handles it
@@ -592,15 +613,39 @@ func looksLikeNodeID(s string) bool {
 	return newNodeIDPattern.MatchString(s) || legacyNodeIDPattern.MatchString(s)
 }
 
-// isNodeIDArgKey reports whether an argument/field name carries a node ID. It excludes
-// id-suffixed keys that hold non-node values: client strings (clientMutationId,
-// externalId) and git object SHAs (*Oid, e.g. headRefOid, expectedHeadOid).
-func isNodeIDArgKey(name string) bool {
+// isExcludedNodeIDKey reports whether an argument/object-field name holds a NON-node value that
+// must never be treated as a node ID: client strings (clientMutationId, externalId) and git
+// object SHAs (*Oid, e.g. headRefOid, expectedHeadOid — a 40-hex SHA matches the legacy node-ID
+// shape). Every OTHER key is eligible: a value is collected iff it matches looksLikeNodeID,
+// regardless of whether the key ends in "id"/"ids". The previous name heuristic let a repo-scoped
+// node ID ride in under a key like `inReplyTo` (AddPullRequestReviewCommentInput) — never
+// collected, never resolved, never policy-checked — so a mutation could write into a denied repo's
+// PR review thread (audit F1). Over-collection is safe by design: a non-node value resolves to
+// null and is ignored; the dangerous direction is missing one.
+func isExcludedNodeIDKey(name string) bool {
 	n := strings.ToLower(name)
-	if n == "clientmutationid" || n == "externalid" || strings.HasSuffix(n, "oid") {
-		return false
+	return n == "clientmutationid" || n == "externalid" || strings.HasSuffix(n, "oid")
+}
+
+// isRepoSpecKey reports whether an input field names a repository by STRING ("owner/repo")
+// rather than by node ID. GitHub's `CommittableBranch.repositoryNameWithOwner` (used by
+// createCommitOnBranch) is the canonical case: the write target is a plain string the node-ID
+// collector never sees, so without parsing it into an explicit scope a commit could be written
+// into a fully-denied repo while a benign "carrier" node satisfied policy (audit F1, CRITICAL).
+func isRepoSpecKey(name string) bool {
+	return strings.EqualFold(name, "repositoryNameWithOwner")
+}
+
+// splitOwnerRepo parses an "owner/repo" string (exactly one slash, non-empty halves).
+func splitOwnerRepo(s string) (owner, repo string, ok bool) {
+	if strings.Count(s, "/") != 1 {
+		return "", "", false
 	}
-	return strings.HasSuffix(n, "id") || strings.HasSuffix(n, "ids")
+	i := strings.IndexByte(s, '/')
+	if i <= 0 || i >= len(s)-1 {
+		return "", "", false
+	}
+	return s[:i], s[i+1:], true
 }
 
 // collectNodeIDArgs returns the node IDs a request references through arguments —
@@ -611,9 +656,10 @@ func isNodeIDArgKey(name string) bool {
 // safe — every collected ID is independently resolved and policy-checked; missing one
 // would be the dangerous case. ok is false if the input is too deep/cyclic to walk
 // safely; the caller fails closed.
-func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionList, vars map[string]interface{}) (ids []string, resourceByID map[string]string, ok bool) {
+func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionList, vars map[string]interface{}) (ids []string, resourceByID map[string]string, repoScopes []Scope, ok bool) {
 	seen := make(map[string]bool)
 	resourceByID = make(map[string]string)
+	scopeSeen := make(map[Scope]bool)
 	var out []string
 	add := func(id, resource string) {
 		if id == "" || !looksLikeNodeID(id) || seen[id] {
@@ -623,19 +669,33 @@ func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionLi
 		out = append(out, id)
 		resourceByID[id] = resource
 	}
+	// addScope records a STRING-named repo target (repositoryNameWithOwner) as an explicit scope
+	// the policy must allow, tagged with the enclosing root mutation field's resource. This is the
+	// authoritative scope for the target — no node resolution needed (the string IS the repo).
+	addScope := func(owner, repo, resource string) {
+		if owner == "" || repo == "" {
+			return
+		}
+		s := Scope{Owner: owner, Repo: repo, Resource: resource}
+		if scopeSeen[s] {
+			return
+		}
+		scopeSeen[s] = true
+		repoScopes = append(repoScopes, s)
+	}
 	tooComplex := false
 	for _, op := range ops {
 		// Only mutations carry per-resource writes; for a mutation the operation's direct
 		// (and top-level-fragment) fields are root mutation fields whose name maps to a
 		// resource. Reads pass atRoot=false so every node maps to "".
-		walkSelectionArgs(op.SelectionSet, fragments, vars, add, op.Operation == ast.Mutation, "", 0, &tooComplex)
+		walkSelectionArgs(op.SelectionSet, fragments, vars, add, addScope, op.Operation == ast.Mutation, "", 0, &tooComplex)
 	}
 	// Variables not bound to any walked argument: collected defensively with no resource.
-	walkVarsForIDs("", vars, func(id string) { add(id, "") }, 0, &tooComplex)
+	walkVarsForIDs("", vars, func(id string) { add(id, "") }, addScope, 0, &tooComplex)
 	if tooComplex {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
-	return out, resourceByID, true
+	return out, resourceByID, repoScopes, true
 }
 
 // walkSelectionArgs descends the selection set collecting node-ID arguments, tagging each
@@ -646,7 +706,7 @@ func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionLi
 // would otherwise never be resolved or policy-checked. atRoot is true while iterating root
 // mutation fields (preserved across top-level fragments); a root field's name fixes the
 // resource for its whole subtree. The depth bound doubles as the cyclic-fragment guard.
-func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(id, resource string), atRoot bool, resource string, depth int, tooComplex *bool) {
+func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(id, resource string), addScope func(owner, repo, resource string), atRoot bool, resource string, depth int, tooComplex *bool) {
 	if *tooComplex {
 		return
 	}
@@ -662,16 +722,16 @@ func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionLi
 				res = gqlMutationResource(s.Name)
 			}
 			for _, arg := range s.Arguments {
-				walkArgValue(arg.Name, arg.Value, vars, add, res, depth+1, tooComplex)
+				walkArgValue(arg.Name, arg.Value, vars, add, addScope, res, depth+1, tooComplex)
 			}
 			if len(s.SelectionSet) > 0 {
-				walkSelectionArgs(s.SelectionSet, fragments, vars, add, false, res, depth+1, tooComplex)
+				walkSelectionArgs(s.SelectionSet, fragments, vars, add, addScope, false, res, depth+1, tooComplex)
 			}
 		case *ast.InlineFragment:
-			walkSelectionArgs(s.SelectionSet, fragments, vars, add, atRoot, resource, depth+1, tooComplex)
+			walkSelectionArgs(s.SelectionSet, fragments, vars, add, addScope, atRoot, resource, depth+1, tooComplex)
 		case *ast.FragmentSpread:
 			if frag := fragments.ForName(s.Name); frag != nil {
-				walkSelectionArgs(frag.SelectionSet, fragments, vars, add, atRoot, resource, depth+1, tooComplex)
+				walkSelectionArgs(frag.SelectionSet, fragments, vars, add, addScope, atRoot, resource, depth+1, tooComplex)
 			}
 		}
 	}
@@ -702,7 +762,7 @@ func effectiveVariables(ops ast.OperationList, provided map[string]interface{}) 
 	return eff
 }
 
-func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add func(id, resource string), resource string, depth int, tooComplex *bool) {
+func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add func(id, resource string), addScope func(owner, repo, resource string), resource string, depth int, tooComplex *bool) {
 	if *tooComplex {
 		return
 	}
@@ -715,27 +775,34 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 	}
 	switch v.Kind {
 	case ast.StringValue:
-		if isNodeIDArgKey(name) {
-			add(v.Raw, resource)
+		if isRepoSpecKey(name) {
+			if o, r, ok := splitOwnerRepo(v.Raw); ok {
+				addScope(o, r, resource)
+			}
+		} else if !isExcludedNodeIDKey(name) {
+			add(v.Raw, resource) // add() re-filters by node-ID shape
 		}
 	case ast.Variable:
-		if isNodeIDArgKey(name) {
-			if s, ok := vars[v.Raw].(string); ok {
-				add(s, resource)
+		s, _ := vars[v.Raw].(string)
+		if isRepoSpecKey(name) {
+			if o, r, ok := splitOwnerRepo(s); ok {
+				addScope(o, r, resource)
 			}
+		} else if s != "" && !isExcludedNodeIDKey(name) {
+			add(s, resource)
 		}
 	case ast.ObjectValue:
 		for _, child := range v.Children {
-			walkArgValue(child.Name, child.Value, vars, add, resource, depth+1, tooComplex)
+			walkArgValue(child.Name, child.Value, vars, add, addScope, resource, depth+1, tooComplex)
 		}
 	case ast.ListValue:
 		for _, child := range v.Children {
-			walkArgValue(name, child.Value, vars, add, resource, depth+1, tooComplex)
+			walkArgValue(name, child.Value, vars, add, addScope, resource, depth+1, tooComplex)
 		}
 	}
 }
 
-func walkVarsForIDs(key string, v interface{}, add func(string), depth int, tooComplex *bool) {
+func walkVarsForIDs(key string, v interface{}, add func(string), addScope func(owner, repo, resource string), depth int, tooComplex *bool) {
 	if *tooComplex {
 		return
 	}
@@ -745,16 +812,20 @@ func walkVarsForIDs(key string, v interface{}, add func(string), depth int, tooC
 	}
 	switch val := v.(type) {
 	case string:
-		if isNodeIDArgKey(key) {
+		if isRepoSpecKey(key) {
+			if o, r, ok := splitOwnerRepo(val); ok {
+				addScope(o, r, "")
+			}
+		} else if !isExcludedNodeIDKey(key) {
 			add(val)
 		}
 	case map[string]interface{}:
 		for k, child := range val {
-			walkVarsForIDs(k, child, add, depth+1, tooComplex)
+			walkVarsForIDs(k, child, add, addScope, depth+1, tooComplex)
 		}
 	case []interface{}:
 		for _, child := range val {
-			walkVarsForIDs(key, child, add, depth+1, tooComplex)
+			walkVarsForIDs(key, child, add, addScope, depth+1, tooComplex)
 		}
 	}
 }

@@ -51,6 +51,13 @@ type grant struct {
 	secret     string // minted bgh_ token (once approved)
 	expiresAt  time.Time
 	cancel     context.CancelFunc // cancels the background device-flow goroutine, if one is running
+
+	// browserSecret binds this grant to the browser that started it (set in an HttpOnly cookie).
+	// Consuming the grant — minting a token (apiApprove) or an owner session (apiSession), and
+	// recovering grant_id for an already-started grant (apiBegin) — requires presenting it, so a
+	// leaked/guessed grant_id or user_code is not by itself enough to mint or hijack a session
+	// (audit F2). 256-bit, crypto/rand.
+	browserSecret string
 }
 
 type grantStore struct {
@@ -207,17 +214,20 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// randUserCode returns a human-friendly device code like "BCDF-GHJK" from an
-// ambiguity-free alphabet (no 0/O/1/I), matching the shape gh expects to display.
+// randUserCode returns a human-friendly device code like "BCDF-GHJK-MNPQ" from an ambiguity-free
+// alphabet (no 0/O/1/I), matching the shape gh expects to display. 12 symbols over a 32-char
+// alphabet ≈ 60 bits — widened from 8 (40 bits) so it is not feasibly guessable even though
+// grant_id recovery is now additionally cookie-gated (audit F2).
 func randUserCode() string {
 	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-	b := make([]byte, 8)
+	const groups = 3
+	b := make([]byte, groups*4)
 	if _, err := rand.Read(b); err != nil {
 		panic("loginflow: crypto/rand unavailable: " + err.Error())
 	}
-	out := make([]byte, 0, 9)
+	out := make([]byte, 0, len(b)+groups-1)
 	for i, v := range b {
-		if i == 4 {
+		if i > 0 && i%4 == 0 {
 			out = append(out, '-')
 		}
 		out = append(out, alphabet[int(v)%len(alphabet)])
