@@ -17,8 +17,11 @@ func TestIsRepoEnumPath(t *testing.T) {
 	yes := []string{"/user/repos", "/user/starred", "/user/issues", "/orgs/o/repos", "/orgs/o/issues",
 		"/users/u/repos", "/repositories", "/issues", "/notifications", "/search/repositories",
 		"/search/code", "/search/issues", "/search/commits"}
-	no := []string{"/repos/o/r/pulls", "/repos/o/r", "/user", "/search/users", "/search/topics",
-		"/orgs/o", "/orgs/o/members", "/graphql", "/repos/o/r/notifications"}
+	// Cross-ref-only and no-repo endpoints are not enum paths. (Single-repo endpoints like
+	// /repos/o/r that echo their own already-authorized repo ARE recognized now — filtering them
+	// is a safe no-op — so they're not asserted here.)
+	no := []string{"/repos/o/r/pulls", "/user", "/search/users", "/search/topics",
+		"/orgs/o", "/orgs/o/members", "/graphql"}
 	for _, p := range yes {
 		if !IsRepoEnumPath(p) {
 			t.Errorf("%s should be a repo-enum path", p)
@@ -29,6 +32,40 @@ func TestIsRepoEnumPath(t *testing.T) {
 			t.Errorf("%s should NOT be a repo-enum path", p)
 		}
 	}
+}
+
+// The spec-driven Lookup is the basis for fail-closed REST: a repo-bearing GET → NeedsFilter
+// (with locations), a known no-repo GET → Pass, an off-spec path → Unknown (the proxy denies it
+// unless the classifier already scoped it to one repo).
+func TestLookupDecisions(t *testing.T) {
+	if d, locs := Lookup("/orgs/o/secret-scanning/alerts"); d != NeedsFilter || len(locs) == 0 {
+		t.Errorf("alerts feed should be NeedsFilter with locations, got %v %v", d, locs)
+	}
+	if d, _ := Lookup("/orgs/o/members"); d != Pass { // known op, returns users not repos
+		t.Errorf("/orgs/o/members should be Pass, got %v", d)
+	}
+	if d, _ := Lookup("/rate_limit"); d != Pass {
+		t.Errorf("/rate_limit should be Pass, got %v", d)
+	}
+	if d, _ := Lookup("/orgs/o/totally-made-up-endpoint"); d != Unknown {
+		t.Errorf("off-spec path should be Unknown (→ proxy fails closed), got %v", d)
+	}
+	// events repo.name shape and migrations nested arrays are spec-derived, not hand-listed.
+	if d, locs := Lookup("/orgs/o/events"); d != NeedsFilter || !contains(locs, "$[].repo.name") {
+		t.Errorf("events should carry the repo.name location, got %v", locs)
+	}
+	if d, locs := Lookup("/orgs/o/migrations"); d != NeedsFilter || !contains(locs, "$[].repositories[].full_name") {
+		t.Errorf("migrations should carry the nested repositories[] location, got %v", locs)
+	}
+}
+
+func contains(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 // Round-12 audit H4/M2: org-wide alert feeds, events, starred/subscriptions, team repos are now
@@ -122,7 +159,7 @@ func TestFilterMigrationsRedactsNestedRepos(t *testing.T) {
 }
 
 func TestFilterRepoArray(t *testing.T) {
-	body := []byte(`[{"full_name":"a/keep"},{"full_name":"b/drop","description":"SECRET"},{"owner":{"login":"c"},"name":"keep2"}]`)
+	body := []byte(`[{"full_name":"a/keep"},{"full_name":"b/drop","description":"SECRET"},{"full_name":"c/keep2","owner":{"login":"c"},"name":"keep2"}]`)
 	out := Filter("/user/repos", body, allowOnly("a/keep", "c/keep2"))
 	s := string(out)
 	if strings.Contains(s, "SECRET") || strings.Contains(s, "b/drop") {

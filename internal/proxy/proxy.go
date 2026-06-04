@@ -247,21 +247,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// REST enumeration/search endpoints (/user/repos, /orgs/{org}/repos, /search/code, ...)
-	// return repository-bearing entries from many repos; unlike the GraphQL path they are not
-	// otherwise redacted, so a client with the user/search categories could enumerate denied
-	// repos' metadata or read their code/issues. Drop denied-repo entries (defense-in-depth:
-	// an off-shape body passes through, so this never fails an allowed list/search closed).
-	if respFilter == nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) && restfilter.IsRepoEnumPath(norm) {
-		p := pol
-		respFilter = func(resp []byte) ([]byte, bool) {
-			return restfilter.Filter(norm, resp, func(repo string) bool {
-				owner := repo
-				if i := strings.IndexByte(repo, '/'); i > 0 {
-					owner = repo[:i]
-				}
-				return p.CanReadAnything(repo, owner)
-			}), true
+	// REST read isolation, typed against GitHub's OpenAPI description (internal/restfilter):
+	// a GET is classified as NeedsFilter (response carries repositories → redact denied ones at
+	// the spec-derived locations, failing closed on an unparseable body), Pass (no repositories
+	// → forward), or Unknown (off-spec path). This replaces the old hand-maintained allowlist,
+	// so coverage is the whole REST surface and — like the GraphQL filter — unrecognized
+	// requests fail closed instead of leaking.
+	if respFilter == nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		dec, locs := restfilter.Lookup(norm)
+		switch dec {
+		case restfilter.NeedsFilter:
+			p := pol
+			respFilter = func(resp []byte) ([]byte, bool) {
+				return restfilter.Redact(resp, locs, func(repo string) bool {
+					owner := repo
+					if i := strings.IndexByte(repo, '/'); i > 0 {
+						owner = repo[:i]
+					}
+					return p.CanReadAnything(repo, owner)
+				})
+			}
+		case restfilter.Unknown:
+			// Off-spec endpoint. If the classifier already scoped it to one repository, that
+			// path scope is the authorization (e.g. an unrecognized /repos/{o}/{r}/… subpath
+			// about an allowed repo) — forward. Otherwise it could enumerate across repos with
+			// a shape we cannot redact, and (in the default deployment) nothing behind us would
+			// catch it — so fail closed.
+			if r.Method == http.MethodGet && result.Allowed && !classified.HasRepo() {
+				result = policy.Result{Reason: "off-spec REST endpoint cannot be repo-filtered (fail closed)"}
+			}
 		}
 	}
 	// Fallback when the filter is DISABLED entirely (GQLFilter == nil, e.g. tests): rely on
