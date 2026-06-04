@@ -56,12 +56,24 @@ func (s *Schema) Augment(query string) (string, error) {
 			return "", fmt.Errorf("query references reserved alias %q or is too deeply nested", markerAlias)
 		}
 	}
+	// Bound the marker injection DURING construction. augment expands every abstract selection to
+	// one inline fragment per repo-scoped concrete member (Node alone has ~130), so a query of
+	// thousands of repeated abstract selections (node(id:){__typename}, ×thousands) would build a
+	// ~200MB AST + tens of seconds of CPU BEFORE the post-serialization output cap below could
+	// reject it — a single-client memory+CPU DoS (round-16, a surviving variant of round-15 F5
+	// which bounded only the OUTPUT). The budget caps total injected fragments and short-circuits
+	// the walk once exceeded, so the transient stays small; over the cap we fail closed (the caller
+	// treats it like an untypeable query and the proxy denies).
+	budget := &injectionBudget{remaining: maxAugmentInjections}
 	for _, op := range doc.Operations {
 		root := s.rootTypeName(op.Operation)
-		s.augment(&op.SelectionSet, root)
+		s.augment(&op.SelectionSet, root, budget)
 	}
 	for _, frag := range doc.Fragments {
-		s.augment(&frag.SelectionSet, frag.TypeCondition)
+		s.augment(&frag.SelectionSet, frag.TypeCondition, budget)
+	}
+	if budget.exceeded {
+		return "", fmt.Errorf("augmented query exceeds the marker-injection budget (%d fragments)", maxAugmentInjections)
 	}
 
 	var buf bytes.Buffer
@@ -85,6 +97,26 @@ const maxAugmentOutputBytes = 8 << 20 // 8 MB
 // maxAugmentDepth bounds the marker/alias walk; a query deeper than this fails closed.
 // Real queries are far shallower, and GitHub itself rejects very deep documents.
 const maxAugmentDepth = 256
+
+// maxAugmentInjections caps the total number of marker fragments augment may inject across the
+// whole document, bounding the marker-injection blowup during construction (see Augment). Real
+// augmented queries inject far fewer (one marker per repo-scoped selection); 50k fragments serialize
+// to a few MB, well under maxAugmentOutputBytes, and build in milliseconds. Exceeding it fails closed.
+const maxAugmentInjections = 50_000
+
+// injectionBudget bounds how many marker fragments augment may inject. count() is called after each
+// append; once the budget is exhausted, exceeded is set and the recursive walk short-circuits.
+type injectionBudget struct {
+	remaining int
+	exceeded  bool
+}
+
+func (b *injectionBudget) count(n int) {
+	b.remaining -= n
+	if b.remaining < 0 {
+		b.exceeded = true
+	}
+}
 
 // maxAugmentTokens bounds Augment's pre-parse so gqlparser.LoadQuery's unlimited re-parse cannot
 // stack-overflow on a deeply nested query. Matches the classifier's maxGraphQLTokens — far above
@@ -143,25 +175,32 @@ func (s *Schema) rootTypeName(op ast.Operation) string {
 
 // augment recurses first (so injected markers are not themselves descended into), then
 // appends the marker if this selection set's type is repo-scoped.
-func (s *Schema) augment(sels *ast.SelectionSet, typeName string) {
+func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *injectionBudget) {
+	if budget.exceeded {
+		return
+	}
 	for _, sel := range *sels {
 		switch f := sel.(type) {
 		case *ast.Field:
 			if f.Definition != nil && len(f.SelectionSet) > 0 {
-				s.augment(&f.SelectionSet, f.Definition.Type.Name())
+				s.augment(&f.SelectionSet, f.Definition.Type.Name(), budget)
 			}
 		case *ast.InlineFragment:
 			tc := f.TypeCondition
 			if tc == "" {
 				tc = typeName
 			}
-			s.augment(&f.SelectionSet, tc)
+			s.augment(&f.SelectionSet, tc, budget)
+		}
+		if budget.exceeded {
+			return
 		}
 	}
 	if s.isRepoScoped(typeName) {
 		// Repo marker (which repository) + type marker (which resource), so the filter can
 		// apply per-resource policy to this object regardless of how it was reached.
 		*sels = append(*sels, s.marker(typeName), typenameMarker())
+		budget.count(2)
 		return
 	}
 	// Abstract type (interface/union): the runtime object is one of its concrete members.
@@ -173,9 +212,11 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string) {
 	// buildNodeResolveQuery covers all repo-scoped Node types for nodes(ids:): whichever
 	// concrete type comes back at runtime self-identifies its repository and gets redacted if
 	// denied. Members that are not repo-scoped add nothing.
-	for _, member := range s.repoScopedMembers(typeName) {
+	members := s.repoScopedMembers(typeName)
+	for _, member := range members {
 		*sels = append(*sels, s.memberMarkerFragment(member))
 	}
+	budget.count(len(members))
 }
 
 // repoScopedMembers returns the repo-scoped concrete object types of an interface/union, sorted

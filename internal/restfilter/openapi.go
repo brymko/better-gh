@@ -101,7 +101,6 @@ func Redact(body []byte, locs []string, authorized func(ownerRepo string) bool) 
 	if dec.Decode(&root) != nil {
 		return nil, false
 	}
-	origItems := itemsLen(root)
 	// Singleton (non-array) locations address the response's OWN subject repository (a
 	// notification thread, a codespace, a single package). If that repo is present and denied,
 	// the WHOLE body belongs to a denied repo and its same-repo siblings (issue/PR titles, branch
@@ -131,15 +130,18 @@ func Redact(body []byte, locs []string, authorized func(ownerRepo string) bool) 
 			return nil, false
 		}
 	}
-	root = applyLocations(root, arrayLocs, authorized)
-	// Close the search count oracle: if items were dropped from a {items,total_count} body,
-	// rewrite the count and flag it incomplete (same as the old filter did for /search).
-	if m, ok := root.(map[string]any); ok && origItems >= 0 {
-		if n := itemsLen(root); n < origItems {
-			if _, has := m["total_count"]; has {
-				m["total_count"] = json.Number(strconv.Itoa(n))
-				m["incomplete_results"] = true
-			}
+	dropped := 0
+	root = applyLocations(root, arrayLocs, authorized, &dropped)
+	// Close the count oracle: if denied-repo elements were dropped and the body reports a
+	// total_count, reduce it by the number dropped (and flag it incomplete) so the count can't
+	// reveal how many denied-repo entries existed. Generalized from the {items,total_count} search
+	// shape to EVERY enum body that carries a total_count alongside a repo array — {repositories[],
+	// total_count}, {codespaces[],total_count}, … — which the old items-only rewrite left as a
+	// denied-repo existence/count oracle (round-16 L).
+	if m, ok := root.(map[string]any); ok && dropped > 0 {
+		if tc, has := m["total_count"]; has {
+			m["total_count"] = json.Number(strconv.Itoa(maxInt(0, jsonNumberToInt(tc)-dropped)))
+			m["incomplete_results"] = true
 		}
 	}
 	out, err := json.Marshal(root)
@@ -149,16 +151,25 @@ func Redact(body []byte, locs []string, authorized func(ownerRepo string) bool) 
 	return out, true
 }
 
-func itemsLen(root any) int {
-	m, ok := root.(map[string]any)
-	if !ok {
-		return -1
+// jsonNumberToInt reads an integer from a decoded JSON number (json.Number after UseNumber, or a
+// float64); 0 on anything else. Used to adjust total_count when denied entries are dropped.
+func jsonNumberToInt(v any) int {
+	switch n := v.(type) {
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return int(i)
+		}
+	case float64:
+		return int(n)
 	}
-	items, ok := m["items"].([]any)
-	if !ok {
-		return -1
+	return 0
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
 	}
-	return len(items)
+	return b
 }
 
 type locStep struct {
@@ -192,7 +203,7 @@ func parseLoc(loc string) []locStep {
 // allowed) — so an element isn't dropped merely because one location's optional path is absent
 // (e.g. a PushEvent has repo.name but no payload.issue.repository). A singleton repo (no
 // enclosing array) is nulled when denied.
-func applyLocations(root any, locs []string, authorized func(string) bool) any {
+func applyLocations(root any, locs []string, authorized func(string) bool, dropped *int) any {
 	type group struct {
 		prefix []locStep
 		elems  [][]locStep
@@ -225,7 +236,7 @@ func applyLocations(root any, locs []string, authorized func(string) bool) any {
 	}
 	for _, key := range order {
 		g := groups[key]
-		root = descendGroup(root, g.prefix, g.elems, authorized)
+		root = descendGroup(root, g.prefix, g.elems, authorized, dropped)
 	}
 	return root
 }
@@ -245,7 +256,7 @@ func prefixKey(prefix []locStep) string {
 
 // descendGroup walks prefix steps to the target array, then keeps only elements elementAllowed
 // accepts. Recurses through any arrays in the prefix (e.g. migrations' $[].repositories[]).
-func descendGroup(cur any, prefix []locStep, elems [][]locStep, authorized func(string) bool) any {
+func descendGroup(cur any, prefix []locStep, elems [][]locStep, authorized func(string) bool, dropped *int) any {
 	if len(prefix) == 0 {
 		arr, ok := cur.([]any)
 		if !ok {
@@ -257,6 +268,7 @@ func descendGroup(cur any, prefix []locStep, elems [][]locStep, authorized func(
 				kept = append(kept, el)
 			}
 		}
+		*dropped += len(arr) - len(kept)
 		return kept
 	}
 	s := prefix[0]
@@ -266,7 +278,7 @@ func descendGroup(cur any, prefix []locStep, elems [][]locStep, authorized func(
 			return cur
 		}
 		for i := range arr {
-			arr[i] = descendGroup(arr[i], prefix[1:], elems, authorized)
+			arr[i] = descendGroup(arr[i], prefix[1:], elems, authorized, dropped)
 		}
 		return arr
 	}
@@ -275,7 +287,7 @@ func descendGroup(cur any, prefix []locStep, elems [][]locStep, authorized func(
 		return cur
 	}
 	if v, present := m[s.field]; present {
-		m[s.field] = descendGroup(v, prefix[1:], elems, authorized)
+		m[s.field] = descendGroup(v, prefix[1:], elems, authorized, dropped)
 	}
 	return cur
 }

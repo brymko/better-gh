@@ -36,6 +36,52 @@ type Schema struct {
 	nodeResolveQuery string                // nodes(ids:) query covering every repo-scoped Node type
 	typeRes          map[string]string     // object type -> per-resource policy key (derived from @docsCategory + overrides)
 	nodeTypes        map[string]bool       // object types implementing Node (recognized by this snapshot)
+	repoOwnedNoPath  map[string]bool       // Node object types that belong to a repo (by @docsCategory) but have NO derivable repoPath
+}
+
+// repoOwnedCategories are @docsCategory values whose objects belong to exactly ONE repository. A
+// Node OBJECT type in one of these categories that has no derivable repoPath (its only repo link
+// is an argumented connection, or a union/interface whose members are repo-scoped types other than
+// Repository itself) can neither be tagged by the response filter NOR attributed by the node
+// resolver — so a node(id:)/nodes(ids:) reference to it must fail CLOSED rather than be treated as a
+// constraint-free non-repo node (round-16: Workflow/DeployKey/ClosedEvent/DeploymentReview/
+// RepositoryTopic/RepositoryCustomProperty leaked a denied repo's data/identity/oracle). The set is
+// deliberately limited to categories that are unambiguously single-repo-owned; ambiguous categories
+// (orgs/users/projects/packages/security-advisories/…) are excluded so legitimate non-repo node
+// reads are not denied. Erring here costs availability (a denied node read), never a leak.
+var repoOwnedCategories = map[string]bool{
+	"issues": true, "pulls": true, "commits": true, "branches": true,
+	"deployments": true, "actions": true, "checks": true, "releases": true,
+	"git": true, "deploy-keys": true, "discussions": true,
+	"dependency-graph": true, "repos": true,
+}
+
+// deriveRepoOwnedNoPath returns the Node OBJECT types whose @docsCategory marks them as belonging to
+// a single repository but for which deriveRepoPaths found NO path to that repository. Deriving from
+// @docsCategory (not a hand-maintained list) means a schema refresh that introduces another such
+// type is covered automatically — the node resolver fails it closed.
+func deriveRepoOwnedNoPath(schema *ast.Schema, repoPath map[string][]pathStep) map[string]bool {
+	nodeImpl := map[string]bool{}
+	for _, d := range schema.PossibleTypes["Node"] {
+		if d.Kind == ast.Object {
+			nodeImpl[d.Name] = true
+		}
+	}
+	out := map[string]bool{}
+	for name, def := range schema.Types {
+		if def.Kind != ast.Object || !nodeImpl[name] {
+			continue
+		}
+		if _, pathed := repoPath[name]; pathed {
+			continue // resolvable/markable already
+		}
+		if d := def.Directives.ForName("docsCategory"); d != nil {
+			if arg := d.Arguments.ForName("name"); arg != nil && arg.Value != nil && repoOwnedCategories[arg.Value.Raw] {
+				out[name] = true
+			}
+		}
+	}
+	return out
 }
 
 // docsCategoryResource maps GitHub's schema @docsCategory(name:) to the proxy's per-resource policy
@@ -144,6 +190,7 @@ func Load() (*Schema, error) {
 	sch := &Schema{schema: s, repoScoped: rs, repoPath: paths}
 	sch.typeRes = deriveTypeResources(s)
 	sch.nodeTypes = deriveNodeObjectTypes(s)
+	sch.repoOwnedNoPath = deriveRepoOwnedNoPath(s, paths)
 	q := sch.buildNodeResolveQuery()
 	if _, gerr := gqlparser.LoadQuery(s, q); gerr != nil {
 		return nil, fmt.Errorf("building node-resolve query: %s", gerr.Error())
@@ -251,6 +298,15 @@ func (s *Schema) isRepoScoped(typeName string) bool { return s.repoScoped[typeNa
 // RepositoryRuleset), which previously slipped through as non-repo nodes (round-12 audit H5).
 // The proxy's node resolver uses it to fail closed if such a node resolves without a repository.
 func (s *Schema) IsRepoScopedType(typeName string) bool { return s.repoScoped[typeName] }
+
+// IsRepoOwnedUnattributableNodeType reports whether typename is a Node OBJECT type that belongs to a
+// single repository (by @docsCategory) but has NO derivable path to that repository, so the node
+// resolver cannot attribute it and the response filter cannot tag it. The proxy fails such a
+// node(id:)/nodes(ids:) reference CLOSED instead of treating it as a constraint-free non-repo node
+// (round-16). It is disjoint from IsRepoScopedType (those HAVE a path): a type satisfies at most one.
+func (s *Schema) IsRepoOwnedUnattributableNodeType(typeName string) bool {
+	return s.repoOwnedNoPath[typeName]
+}
 
 // NodeResolveQuery is a nodes(ids:) query that asks GitHub for each node's __typename and,
 // for EVERY repo-scoped Node type, its repository's nameWithOwner. The proxy uses it to

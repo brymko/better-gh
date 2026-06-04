@@ -124,12 +124,18 @@ func Classify(method, path string, body []byte) Result {
 	segments := splitPath(norm)
 
 	if len(segments) >= 3 && segments[0] == "repos" {
-		return Result{
+		res := Result{
 			Owner:    segments[1],
 			Repo:     segments[2],
 			Access:   access,
 			Resource: restResource(segments),
 		}
+		// A cross-fork compare (basehead `base...user:head`) returns the FOREIGN fork's commits/
+		// file patches, which the path-repo scope does not cover and the REST response filter cannot
+		// redact (the foreign content has no per-element repository identity). Add each foreign owner
+		// as a scope the policy must allow, so an un-permitted fork is denied (round-16).
+		res.Additional = append(res.Additional, compareForkScopes(segments)...)
+		return res
 	}
 
 	if len(segments) >= 2 && segments[0] == "orgs" {
@@ -853,6 +859,70 @@ func parseSearchRepoQualifiers(query string) []ownerRepo {
 		}
 	}
 	return out
+}
+
+// compareForkScopes returns a scope for every FOREIGN-owner repository referenced in a cross-fork
+// compare basehead — GET /repos/{o}/{r}/compare/{base}...{head} and the dependency-graph variant.
+// GitHub's compare API accepts a `user:ref` base/head that resolves to that user's fork in the SAME
+// network, returning that fork's commits[] (author identities) and files[].patch (raw source diff).
+// The path-repo scope does not cover the fork, and restfilter cannot redact it (the foreign content
+// carries no per-element repository identity), so without this a read of an allowed base repo leaked
+// a denied fork's private content (round-16). Each foreign owner becomes a scope on `owner/{repo}`
+// (the path repo name — forks share it), so the policy must allow that fork too. The path owner
+// referenced as `owner:ref` is the same repo and is skipped. Best-effort on the repo name: a renamed
+// fork is the rare exception and mis-naming only ever fails an ALLOWED compare closed, never opens one.
+func compareForkScopes(segments []string) []Scope {
+	if len(segments) < 4 {
+		return nil
+	}
+	owner, repo := segments[1], segments[2]
+	var basehead string
+	switch {
+	case segments[3] == "compare" && len(segments) >= 5:
+		basehead = strings.Join(segments[4:], "/")
+	case segments[3] == "dependency-graph" && len(segments) >= 6 && segments[4] == "compare":
+		basehead = strings.Join(segments[5:], "/")
+	default:
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []Scope
+	for _, side := range splitBasehead(basehead) {
+		fo := forkOwner(side)
+		if fo == "" || strings.EqualFold(fo, owner) {
+			continue
+		}
+		key := strings.ToLower(fo)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, Scope{Owner: fo, Repo: repo, Resource: "commits"})
+	}
+	return out
+}
+
+// splitBasehead splits a compare basehead into its base and head sides. GitHub uses three-dot
+// ("base...head"); two-dot ("base..head") is accepted as well. A basehead with neither separator
+// is treated as a single side.
+func splitBasehead(basehead string) []string {
+	if i := strings.Index(basehead, "..."); i >= 0 {
+		return []string{basehead[:i], basehead[i+3:]}
+	}
+	if i := strings.Index(basehead, ".."); i >= 0 {
+		return []string{basehead[:i], basehead[i+2:]}
+	}
+	return []string{basehead}
+}
+
+// forkOwner returns the fork owner of a compare side written as "owner:ref", or "" when the side is
+// a bare ref (which lives in the path repo). A git ref cannot contain ':', so the owner is the part
+// before the first ':'.
+func forkOwner(side string) string {
+	if i := strings.IndexByte(side, ':'); i > 0 {
+		return side[:i]
+	}
+	return ""
 }
 
 var restResourceMap = map[string]string{

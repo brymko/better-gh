@@ -79,7 +79,7 @@ name = "octocat/Hello-World"
 access = "read-write"
 ```
 
-`gh` sends its own GitHub token, but the proxy ignores it and uses `BGH_GITHUB_TOKEN` for upstream requests. The socket policy controls what gets through.
+`gh` sends its own GitHub token, but the proxy ignores it and uses the **custodian** for upstream requests — the token captured by the first GitHub sign-in (`owner.json`) if the deployment has been claimed, otherwise the pre-seeded fallback (`BGH_GITHUB_TOKEN` / `github_token` / `bgh-proxy login`). In the default `mode = "both"`, a `gh auth login` / `/ui` sign-in on the GHE listener claims the deployment, and that captured token then backs **socket** traffic too. Either way the socket policy controls what gets through.
 
 ### GHE mode (remote clients, CI bots)
 
@@ -209,7 +209,7 @@ When the classifier identifies a specific resource within a repo-scoped request,
 | `pulls` | `pulls` | `pullRequest`, `pullRequests`, mutations containing `PullRequest` |
 | `issues` | `issues` | `issue`, `issues`, `pinnedIssues`, mutations containing `Issue` |
 | `contents` | `contents`, `readme`, `zipball`, `tarball`, `git/blobs`, `git/trees` | `object`, `blob`, `tree`, `createCommitOnBranch` |
-| `actions` | `actions` | `WorkflowRun`/`Environment`-class runtime types |
+| `actions` | `actions` | `Workflow`/`WorkflowRun`-class runtime types (`Environment` is `deployments`, see below) |
 | `releases` | `releases` | `releases`, `release`, `latestRelease`, mutations containing `Release` |
 | `commits` | `commits`, `compare`, `git/commits` | `commit`, `commitComments` |
 | `branches` | `branches`, `git/refs`, `git/tags` | `refs`, `ref`, `defaultBranchRef`, mutations containing `Ref`/`Branch` (except `createCommitOnBranch`) |
@@ -350,6 +350,8 @@ Note: `/users/{user}` endpoints use the username as the org for policy matching.
 These requests have no identifiable repo or org. Under `mode = "deny"`, they are **denied by default** unless `[defaults.unscoped]` grants access for their category.
 
 This matters because `gh` needs several of these endpoints to function — `gh auth status` calls `/user`, `gh repo list` (without an owner) calls `/user/repos`, and many commands start with a `{ viewer { login } }` GraphQL query.
+
+> In **GHE mode** the proxy answers `GET /user` itself with a synthetic identity (`{"login":"bgh-proxy"}`) so `gh auth login`/`status` can complete before any policy applies — this short-circuits the `user` category for that one GET (it returns fake, not custodian, data; any other `/user/*` path and all of socket mode are classified normally). Setting `user = "none"` therefore does **not** block GHE `GET /user`; it blocks `viewer{}`, `/user/repos`, `/user/orgs`, etc.
 
 **REST endpoints by category:**
 

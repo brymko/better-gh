@@ -276,9 +276,19 @@ Back these up **off-host, encrypted** — losing them loses access, leaking them
   at its settings page if you pre-seeded one), then sign in again — the new sign-in re-captures a
   fresh token into `owner.json`. For a pre-seeded `BGH_GITHUB_TOKEN`/`github_token`, rotate at
   GitHub and update the env/file.
+- **Rotate the admin secret** (`~/.config/bgh/admin-secret`): this is a **second, independent**
+  full-token-minting credential — the admin API (`POST /api/tokens` on `admin_bind`) mints a token
+  with **any** policy on the admin secret alone, with **no** GitHub-owner check. It is auto-created
+  and **stable across restarts**, so deleting `owner.json` / rotating the custodian does **not**
+  invalidate it. To rotate: stop the proxy, `rm ~/.config/bgh/admin-secret`, restart — a fresh secret
+  is generated (any `bgh-proxy token …` CLI use re-reads it automatically). Do this on any suspected
+  host compromise (file-read as the proxy UID exposes the secret) **and** in the owner-compromise
+  response below.
 - **Owner GitHub account compromised:** the attacker can sign in as owner and mint full-access
   proxy tokens. Response: stop the proxy, revoke the OAuth grant at GitHub, **delete `owner.json`
-  and `tokens.json`**, **also clear any pre-seeded fallback custodian** (`BGH_GITHUB_TOKEN` in the
+  and `tokens.json`**, **rotate the admin secret** (`rm ~/.config/bgh/admin-secret` — otherwise a
+  leaked admin secret keeps minting full-access tokens after restart, independent of ownership),
+  **also clear any pre-seeded fallback custodian** (`BGH_GITHUB_TOKEN` in the
   environment, `github_token` in `config.toml`, and `~/.config/bgh/github-token`) — deleting
   `owner.json` re-arms TOFU but does **not** disarm a fallback token, which would keep forwarding —
   secure the GitHub account (rotate its credentials / 2FA), then re-claim from loopback and

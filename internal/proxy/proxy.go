@@ -665,6 +665,16 @@ func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[stri
 			// ruleset whose source is a Repository resolves to that repo and is policy-checked,
 			// while an org-level one (no Repository source) yields no nameWithOwner and is denied.
 			out[id] = nodeRes{kind: nodeDeny}
+		} else if typename != "" && h.GQLFilter != nil && h.GQLFilter.IsRepoOwnedUnattributableNodeType(typename) {
+			// A node whose runtime type BELONGS to a repository (by @docsCategory) but has NO field
+			// path to that repository in the schema — Workflow (only argumented `runs`), DeployKey,
+			// ClosedEvent (closable union with no Repository member), DeploymentReview, RepositoryTopic,
+			// RepositoryCustomProperty, … These resolve to no nameWithOwner AND get no response marker,
+			// so a node(id:)/nodes(ids:) reference to one would otherwise be treated as a constraint-
+			// free non-repo node and stream the denied repo's data/identity/oracle unfiltered (round-16,
+			// a surviving variant of the round-12 H1/H5 + round-15 drift-deny work — both coverage
+			// invariants passed with it present). We cannot prove the repository, so fail closed.
+			out[id] = nodeRes{kind: nodeDeny}
 		} else if typename != "" && h.GQLFilter != nil && !h.GQLFilter.IsKnownNodeObjectType(typename) {
 			// A non-null node whose runtime __typename this embedded schema does NOT recognize as a
 			// Node object type → live schema drift (GitHub's schema is ahead of the snapshot). The
