@@ -247,6 +247,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is ignored (the filter handles it); when it is NOT (schema drift / disabled), the
 	// flag falls back to denying the whole request.
 	var respFilter func([]byte) ([]byte, bool)
+	// passScan, when set (a non-path-scoped REST "Pass" response), makes forward() scan the actual
+	// JSON body for a denied-repo identity the static OpenAPI table did not locate, failing closed if
+	// one is present — so "Pass" is not a blind fail-open for an under-typed response schema (round-16).
+	var passScan func(string) bool
 	if h.GQLFilter != nil && (norm == "/graphql" || norm == "/graphql/") {
 		// Reads AND mutations: a mutation's payload is a read sub-graph that can navigate
 		// to other repos, so its response must be filtered too. Augmentation injects the
@@ -320,6 +324,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if result.Allowed && !classified.HasRepo() {
 				result = policy.Result{Reason: "off-spec REST endpoint cannot be repo-filtered (fail closed)"}
 			}
+		case dec == restfilter.Pass && !classified.HasRepo():
+			// "Pass" means the OpenAPI table located NO repository in this op's response — but a
+			// response schema the generator could not fully type (untyped/opaque/cyclic) may still
+			// carry a repo it never emitted a location for. For a non-path-scoped (enumeration-shaped)
+			// response we cannot bound which repos it touches, so rather than forward it blind, have
+			// forward() scan the ACTUAL body for a denied repo and fail closed if one is present
+			// (round-16). Only JSON bodies are scanned — binary downloads (archives, raw blobs) stream
+			// untouched — and path-scoped Pass responses keep streaming (authorized by their repo
+			// scope; cross-ref embeds handled by the scrub table), so the hot path (contents/blobs) is
+			// unaffected.
+			passScan = canRead
 		}
 	}
 	// Fallback when the filter is DISABLED entirely (GQLFilter == nil, e.g. tests): rely on
@@ -366,7 +381,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		go h.Store.TouchLastUsed(proxyToken.ID)
 	}
 
-	h.forward(w, r, start, norm, body, pol, proxyToken, &classified, respFilter)
+	h.forward(w, r, start, norm, body, pol, proxyToken, &classified, respFilter, passScan)
 }
 
 func (h *Handler) augmentGraphQL(body []byte) ([]byte, bool) {
@@ -787,7 +802,7 @@ func EnforceRedirectPolicy(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, pol *policy.Policy, tok *store.ProxyToken, classified *classifier.Result, respFilter func([]byte) ([]byte, bool)) {
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, pol *policy.Policy, tok *store.ProxyToken, classified *classifier.Result, respFilter func([]byte) ([]byte, bool), passScan func(string) bool) {
 	base := h.upstreamBase()
 	// Forward the path with the SAME percent-encoding the client sent (EscapedPath), not the
 	// decoded normPath. Reassembling the decoded path into a URL string lets an encoded '?'
@@ -912,6 +927,40 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 		TokenName:        tokenName,
 	})
 
+	// Defense-in-depth for "Pass" REST responses (round-16): the static OpenAPI table believed this
+	// non-path-scoped op is repo-free, but an under-typed response schema may hide a repo it never
+	// located. Scan the actual JSON body for a denied repo and fail closed if present. Only JSON is
+	// scanned — a binary download (Content-Type not JSON) streams untouched, so large archive/blob
+	// reads are unaffected — and it never runs alongside respFilter (the cases are exclusive).
+	if respFilter == nil && passScan != nil && isJSONContentType(resp.Header.Get("Content-Type")) {
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBodySize+1))
+		if rerr != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		if len(raw) > maxBodySize {
+			slog.Warn("pass-response too large to scan; failing closed", "status", resp.StatusCode)
+			jsonError(w, http.StatusBadGateway, "bgh: response too large to filter")
+			return
+		}
+		denied, ok := restfilter.ContainsDeniedRepo(raw, passScan)
+		if !ok {
+			// JSON content-type but unparseable → anomalous for a repo-free op; fail closed.
+			slog.Warn("pass-response JSON unparseable; failing closed", "status", resp.StatusCode)
+			jsonError(w, http.StatusBadGateway, "bgh: response could not be filtered")
+			return
+		}
+		if denied {
+			slog.Warn("pass-response carries a repo the policy denies but the OpenAPI table did not locate; failing closed", "status", resp.StatusCode)
+			jsonError(w, http.StatusForbidden, "bgh: denied")
+			return
+		}
+		copyResponseHeaders(w.Header(), resp.Header, true)
+		w.WriteHeader(resp.StatusCode)
+		w.Write(raw)
+		return
+	}
+
 	// When a response filter is set (GraphQL reads), buffer the body, redact denied
 	// repos, and send the filtered bytes; the Content-Length will be recomputed.
 	if respFilter != nil {
@@ -970,6 +1019,14 @@ func copyResponseHeaders(dst, src http.Header, stripContentLength bool) {
 			dst.Add(key, v)
 		}
 	}
+}
+
+// isJSONContentType reports whether a response Content-Type is JSON (application/json or a +json
+// vendor type), so the Pass-response defense-in-depth scan applies only to JSON bodies and leaves
+// binary downloads (archives, raw blobs, diffs) to stream untouched.
+func isJSONContentType(ct string) bool {
+	ct = strings.ToLower(ct)
+	return strings.Contains(ct, "application/json") || strings.Contains(ct, "+json")
 }
 
 func jsonError(w http.ResponseWriter, status int, msg string) {

@@ -180,3 +180,55 @@ func TestSec_E2E_CrossForkCompareDenied(t *testing.T) {
 		t.Fatalf("same-repo compare must be allowed, got 403")
 	}
 }
+
+// Round-16 hardening: a non-path-scoped REST "Pass" response (the static OpenAPI table believed it
+// repo-free) is scanned at runtime; if it carries a denied repo identity the table did not locate,
+// the proxy fails closed. Only JSON is scanned — binary downloads stream untouched.
+func TestSec_E2E_PassResponseScannedForDeniedRepo(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/orgs/leak-org":
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"login":"leak-org","undetected":[{"full_name":"blocked-org/secret"}]}`)
+		case "/orgs/clean-org":
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"login":"clean-org","repos":[{"full_name":"clean-org/ok"}]}`)
+		case "/orgs/binary-org":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			io.WriteString(w, "raw bytes mentioning blocked-org/secret should NOT be scanned")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Org: []policy.OrgRule{
+			{Name: "leak-org", Access: policy.AccessRead},
+			{Name: "clean-org", Access: policy.AccessRead},
+			{Name: "binary-org", Access: policy.AccessRead},
+		},
+		Repo: []policy.RepoRule{{Name: "blocked-org/secret", Access: policy.AccessNone}},
+	}
+	srv := round16Handler(t, pol, upstream.URL)
+
+	get := func(path string) int {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := get("/orgs/leak-org"); code != http.StatusForbidden {
+		t.Fatalf("Pass response embedding a denied repo must be failed closed, got %d", code)
+	}
+	if code := get("/orgs/clean-org"); code == http.StatusForbidden {
+		t.Fatalf("Pass response with only allowed repos must be forwarded, got 403")
+	}
+	if code := get("/orgs/binary-org"); code == http.StatusForbidden {
+		t.Fatalf("a non-JSON Pass download must stream untouched (not scanned), got 403")
+	}
+}
