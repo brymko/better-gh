@@ -92,6 +92,156 @@ func main() {
 
 	emit(*out, repoOps, known)
 	fmt.Fprintf(os.Stderr, "gen: %d GET ops, %d repo-bearing\n", len(known), len(repoOps))
+
+	// Coverage review report (round-21): the generated repoEnumOps drives the per-element repo DROP, but
+	// two sibling classes are hand-maintained because the spec can't be mechanically resolved to a policy
+	// resource / a write-response shape — and those tables kept drifting one sibling per audit round. This
+	// pass flags the ops a maintainer must keep classified after a refresh:
+	//   (1) GET enum ops whose element NESTS a repository → must be in content_resource.go
+	//       (contentEnumResourceOps) or its metadata allowlist. The runtime TestCoverage_NestedRepoEnumOps
+	//       ENFORCES this; the list here just tells the maintainer WHAT to classify.
+	//   (2) WRITE ops whose 2xx response embeds a foreign CROSS-REF repo (head/base/parent/source/
+	//       template_repository) → must be in write_scrub.go (writeScrubOps). Write responses are invisible
+	//       to the GET-only table, so there is no runtime invariant; this report is the only mechanical guard.
+	g.reportCoverage(d, repoOps)
+}
+
+// reportCoverage prints (to stderr) the ops a maintainer must keep covered in the hand-maintained
+// restfilter tables after a spec refresh (see the call site).
+func (g *generator) reportCoverage(d doc, repoOps map[string][]string) {
+	var content, writeScrub []string
+	for key, locs := range repoOps {
+		if nestsRepoLoc(locs) {
+			content = append(content, strings.TrimPrefix(key, "GET "))
+		}
+	}
+	for path, methods := range d.Paths {
+		for method, op := range methods {
+			if method == "get" || method == "head" {
+				continue
+			}
+			schema := resp200JSON(op)
+			if schema == nil {
+				continue
+			}
+			if g.findCrossRef(schema, "$", map[string]bool{}, 0) {
+				writeScrub = append(writeScrub, strings.ToUpper(method)+" "+path)
+			}
+		}
+	}
+	sort.Strings(content)
+	sort.Strings(writeScrub)
+	fmt.Fprintf(os.Stderr, "\ngen: COVERAGE REVIEW — keep these classified in the hand-maintained tables:\n")
+	fmt.Fprintf(os.Stderr, "  %d nests-a-repo GET enum ops -> content_resource.go (content key OR metadata allowlist):\n", len(content))
+	for _, p := range content {
+		fmt.Fprintf(os.Stderr, "    %s\n", p)
+	}
+	fmt.Fprintf(os.Stderr, "  %d WRITE ops embedding a cross-ref repo -> write_scrub.go (writeScrubOps):\n", len(writeScrub))
+	for _, p := range writeScrub {
+		fmt.Fprintf(os.Stderr, "    %s\n", p)
+	}
+}
+
+// nestsRepoLoc reports whether any of an op's repo locations nests the repository inside the array
+// element (an intermediate field before the terminal, after the last `[]`) rather than the element BEING
+// the repository. Mirrors restfilter.nestsRepoInElement (which the runtime invariant uses).
+func nestsRepoLoc(locs []string) bool {
+	for _, loc := range locs {
+		i := strings.LastIndex(loc, "[]")
+		if i < 0 {
+			continue
+		}
+		segs := 0
+		for _, s := range strings.Split(loc[i+2:], ".") {
+			if s != "" {
+				segs++
+			}
+		}
+		if segs >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+// findCrossRef reports whether a (possibly $ref'd) response schema embeds a repository identity UNDER a
+// cross-reference field (head/base/parent/source/forkee/template_repository/...) — i.e. a foreign repo
+// the write-response scrub must null. It is the complement of find(), which deliberately SKIPS those
+// fields; here we look only under them.
+func (g *generator) findCrossRef(s map[string]any, prefix string, seen map[string]bool, depth int) bool {
+	if s == nil || depth > 30 {
+		return false
+	}
+	r := g.deref(s, copySet(seen), depth)
+	if r == nil {
+		return false
+	}
+	for _, comp := range []string{"allOf", "oneOf", "anyOf"} {
+		if subs, ok := r[comp].([]any); ok {
+			for _, sub := range subs {
+				if sm, ok := sub.(map[string]any); ok && g.findCrossRef(sm, prefix, copySet(seen), depth+1) {
+					return true
+				}
+			}
+		}
+	}
+	if items, ok := r["items"].(map[string]any); ok && g.findCrossRef(items, prefix+"[]", copySet(seen), depth+1) {
+		return true
+	}
+	props, _ := r["properties"].(map[string]any)
+	for name, psch := range props {
+		pm, ok := psch.(map[string]any)
+		if !ok {
+			continue
+		}
+		if crossRefFields[name] && g.embedsRepo(pm, copySet(seen), depth+1) {
+			return true
+		}
+		// recurse into non-cross-ref properties to reach a nested cross-ref (e.g. data.pull_request.head).
+		if !crossRefFields[name] && g.findCrossRef(pm, prefix+"."+name, copySet(seen), depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// embedsRepo reports whether a (possibly $ref'd) schema IS or CONTAINS, at any depth, a repository
+// identity (a full_name property or a $ref to a repo component) — used to confirm a cross-ref field
+// (e.g. a PR's `head`, whose repo sits at head.repo) actually carries a repo.
+func (g *generator) embedsRepo(s map[string]any, seen map[string]bool, depth int) bool {
+	if s == nil || depth > 30 {
+		return false
+	}
+	if ref, ok := s["$ref"].(string); ok && g.repoComp[ref] {
+		return true
+	}
+	r := g.deref(s, copySet(seen), depth)
+	if r == nil {
+		return false
+	}
+	if props, ok := r["properties"].(map[string]any); ok {
+		if _, ok := props["full_name"]; ok {
+			return true
+		}
+		for _, p := range props {
+			if pm, ok := p.(map[string]any); ok && g.embedsRepo(pm, copySet(seen), depth+1) {
+				return true
+			}
+		}
+	}
+	if items, ok := r["items"].(map[string]any); ok && g.embedsRepo(items, copySet(seen), depth+1) {
+		return true
+	}
+	for _, comp := range []string{"allOf", "oneOf", "anyOf"} {
+		if subs, ok := r[comp].([]any); ok {
+			for _, sub := range subs {
+				if sm, ok := sub.(map[string]any); ok && g.embedsRepo(sm, copySet(seen), depth+1) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 type generator struct {

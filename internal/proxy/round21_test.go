@@ -168,3 +168,59 @@ func TestSec_R21_RepositoryMigrationAmbientRedacted(t *testing.T) {
 		t.Fatalf("RepositoryMigration leaked a denied repo's name/metadata under an allowed repo ancestor: %s", s)
 	}
 }
+
+// Round-21 (surfaced by the content-feed coverage invariant): two path-scoped content feeds whose
+// classifier resource degenerated. /repos/{o}/{r}/commits/{ref}/check-suites is under a /commits/ path
+// (classifier "commits") but exposes CHECK data → must gate on "checks"; /repos/{o}/{r}/notifications is
+// ResourceUnknown → degenerated to base → must gate on "issues".
+func TestSec_R21_PathScopedContentFeedGates(t *testing.T) {
+	checkPol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo: []policy.RepoRule{{
+			Name: "acme/app", Access: policy.AccessRead,
+			Permissions: map[string]policy.Access{"checks": policy.AccessNone},
+		}},
+	}
+	notifPol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo: []policy.RepoRule{{
+			Name: "acme/app", Access: policy.AccessRead,
+			Permissions: map[string]policy.Access{"issues": policy.AccessNone},
+		}},
+	}
+	cases := []struct {
+		name, path, body, secret string
+		pol                      *policy.Policy
+	}{
+		{"check-suites checks=none", "/repos/acme/app/commits/main/check-suites",
+			`{"total_count":1,"check_suites":[{"id":9,"conclusion":"SECRET_CHECK","repository":{"full_name":"acme/app"}}]}`,
+			"SECRET_CHECK", checkPol},
+		{"repo notifications issues=none", "/repos/acme/app/notifications",
+			`[{"id":"1","subject":{"title":"SECRET_NOTIF"},"repository":{"full_name":"acme/app"}}]`,
+			"SECRET_NOTIF", notifPol},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, c.body)
+			}))
+			defer upstream.Close()
+			h := r15Handler(t, c.pol, upstream.URL)
+			srv := httptest.NewServer(h)
+			defer srv.Close()
+			resp, err := http.Get(srv.URL + c.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%s expected 200, got %d: %s", c.name, resp.StatusCode, b)
+			}
+			if strings.Contains(string(b), c.secret) {
+				t.Fatalf("%s leaked content the per-resource carve-out denies: %s", c.name, b)
+			}
+		})
+	}
+}

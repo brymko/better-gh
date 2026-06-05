@@ -11,7 +11,9 @@ import (
 // A few org/user-scoped GET ops return a repository array whose elements name the repo only by a BARE
 // `name` (no owner, no full_name, no url) — the owner is the {org}/{username} PATH parameter. The
 // canonical case is GitHub artifact attestations:
-//   GET /orgs/{org}/attestations/repositories  →  [ { "id": <int>, "name": "<repo>" }, … ]
+//
+//	GET /orgs/{org}/attestations/repositories  →  [ { "id": <int>, "name": "<repo>" }, … ]
+//
 // The OpenAPI generator locates a repo only via a full_name property or the minimal {id,name,url}
 // object shape, so a bare {id,name} is invisible to it (the op is Pass), and the ContainsDeniedRepo
 // body-scan can't map it either — so a client holding the org at base=read but DENIED specific private
