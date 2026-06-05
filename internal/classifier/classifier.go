@@ -698,15 +698,21 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 				// Result nodes can navigate off to other repos just like repository().
 				scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex, budget)
 				continue
-			case "enterprise", "enterpriseAdministratorInvitation":
+			case "enterprise", "enterpriseAdministratorInvitation", "enterpriseMemberInvitation":
 				// Enterprise owner-private data (billingEmail/securityContactEmail/members/organizations/
-				// ownerInfo) is reached only via this root — it has no scoped classifier root, so before
-				// round-21 it emitted NO scope and fell to Defaults.Mode (a default=allow leak; the response
-				// filter is repo-centric and never redacts Enterprise data). Scope it to the enterprise slug
-				// as an org so an [[org]] rule matching the slug gates it and a default-deny denies it — the
-				// navigation analogue of the round-20 owner-owned node(id:) fail-closed. (EnterpriseRepositoryInfo
-				// is still redacted by its own repo marker.)
+				// ownerInfo + admin/member invitations) is reached only via these roots — they have no scoped
+				// classifier root, so before round-21 they emitted NO scope and fell to Defaults.Mode (a
+				// default=allow leak; the response filter is repo-centric and never redacts Enterprise data).
+				// Scope to the enterprise slug as an org so an [[org]] rule matching the slug gates it and a
+				// default-deny denies it — the navigation analogue of the round-20 owner-owned node(id:)
+				// fail-closed. (EnterpriseRepositoryInfo is still redacted by its own repo marker.) The slug
+				// lives under `slug` on enterprise(...) but `enterpriseSlug` on the invitation roots; the
+				// *ByToken invitation roots are secret-invitation-token-gated (the token IS the auth, no
+				// policy bypass) so they stay in the public allowlist (round-22).
 				slug := resolveStringArg(s.Arguments, "slug", vars)
+				if slug == "" {
+					slug = resolveStringArg(s.Arguments, "enterpriseSlug", vars)
+				}
 				if slug != "" {
 					add(Scope{Org: slug})
 					scanCrossRepoNav(s.SelectionSet, fragments, gqlForkNavFields, escapes, map[string]bool{}, depth+1, tooComplex, budget)

@@ -29,6 +29,24 @@ func TestR21_EnterpriseRootScoped(t *testing.T) {
 	}
 }
 
+// Round-22: the enterprise INVITATION roots carry the slug under `enterpriseSlug`, not `slug`, so the
+// round-21 enterprise case (which resolved only `slug`) left enterpriseAdministratorInvitation unscoped
+// and never handled enterpriseMemberInvitation → owner-private enterprise data leaked under
+// Defaults.Mode=allow. Both must now scope to the enterprise org. (The *ByToken variants are secret-
+// token-gated and intentionally left to the public allowlist — see gqlfilter TestQueryRootCoverage.)
+func TestR22_EnterpriseInvitationRootsScoped(t *testing.T) {
+	for _, root := range []string{
+		`enterpriseAdministratorInvitation(enterpriseSlug:\"acme-ent\",userLogin:\"u\",role:OWNER)`,
+		`enterpriseMemberInvitation(enterpriseSlug:\"acme-ent\",userName:\"u\")`,
+	} {
+		body := fmt.Sprintf(`{"query":"{ %s{ id } }"}`, root)
+		r := Classify("POST", "/graphql", []byte(body))
+		if !hasScope(r.AllScopes(), "", "", "acme-ent", "") {
+			t.Errorf("%s must scope to org=acme-ent, got %+v", root, r.AllScopes())
+		}
+	}
+}
+
 // Round-21 LOW: a pathological multi-root × shared-fragment document must be bounded by the
 // document-global visit budget and fail closed (unscoped → Write/denied), not walked quadratically.
 func TestR21_MultiRootSharedFragmentBudget(t *testing.T) {
