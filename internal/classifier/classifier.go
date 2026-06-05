@@ -266,8 +266,9 @@ func classifyGraphQL(body []byte) Result {
 		// this, a write grant on one repo could read any navigable repo via the payload.
 		escapes := false
 		navTooComplex := false
+		navBudget := maxGraphQLVisits
 		for _, op := range ops {
-			scanCrossRepoNav(op.SelectionSet, doc.Fragments, gqlCrossRepoNavFields, &escapes, map[string]bool{}, 0, &navTooComplex)
+			scanCrossRepoNav(op.SelectionSet, doc.Fragments, gqlCrossRepoNavFields, &escapes, map[string]bool{}, 0, &navTooComplex, &navBudget)
 		}
 		if navTooComplex {
 			return Result{Access: Write}
@@ -289,8 +290,9 @@ func classifyGraphQL(body []byte) Result {
 	}
 	tooComplex := false
 	escapes := false
+	budget := maxGraphQLVisits
 	for _, op := range ops {
-		collectGraphQLScopes(op.SelectionSet, doc.Fragments, vars, add, map[string]bool{}, 0, &tooComplex, &escapes)
+		collectGraphQLScopes(op.SelectionSet, doc.Fragments, vars, add, map[string]bool{}, 0, &tooComplex, &escapes, &budget)
 	}
 	if tooComplex {
 		// A query too deep/cyclic to fully walk could hide a denied scope past the
@@ -381,10 +383,10 @@ func isScopeField(name string) bool {
 // Fields that map to no resource (metadata, unmapped fields) add a "metadata" scope so
 // the rule's base access still governs them; __typename never contributes. A selection
 // with no resource fields yields just "metadata" (unchanged behaviour).
-func gqlRepoResources(repoField *ast.Field, fragments ast.FragmentDefinitionList) []string {
+func gqlRepoResources(repoField *ast.Field, fragments ast.FragmentDefinitionList, budget *int) []string {
 	set := map[string]struct{}{}
 	baseGoverned := false
-	collectRepoResources(repoField.SelectionSet, fragments, set, &baseGoverned, map[string]bool{}, 0)
+	collectRepoResources(repoField.SelectionSet, fragments, set, &baseGoverned, map[string]bool{}, 0, budget)
 	if len(set) == 0 {
 		return []string{"metadata"}
 	}
@@ -405,12 +407,16 @@ func gqlRepoResources(repoField *ast.Field, fragments ast.FragmentDefinitionList
 // nested under it). The depth bound is the cyclic-fragment guard; on exceed it sets
 // baseGoverned (require the rule's base access) and stops — fail closed, never silently
 // drop a resource.
-func collectRepoResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, seenFrags map[string]bool, depth int) {
+func collectRepoResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, seenFrags map[string]bool, depth int, budget *int) {
 	if depth > maxGraphQLDepth {
 		*baseGoverned = true
 		return
 	}
 	for _, sel := range sels {
+		if visit(budget) { // document-global visit budget (round-21)
+			*baseGoverned = true
+			return
+		}
 		switch s := sel.(type) {
 		case *ast.Field:
 			if r, ok := gqlFieldToResource[s.Name]; ok {
@@ -419,14 +425,14 @@ func collectRepoResources(sels ast.SelectionSet, fragments ast.FragmentDefinitio
 				*baseGoverned = true // metadata or any unmapped field → rule's base access
 			}
 		case *ast.InlineFragment:
-			collectRepoResources(s.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1)
+			collectRepoResources(s.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1, budget)
 		case *ast.FragmentSpread:
 			if seenFrags[s.Name] {
 				continue // already expanded this fragment in this walk; re-expansion is redundant
 			}
 			if frag := fragments.ForName(s.Name); frag != nil {
 				seenFrags[s.Name] = true
-				collectRepoResources(frag.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1)
+				collectRepoResources(frag.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1, budget)
 			} else {
 				*baseGoverned = true // unresolvable spread → can't see its fields → require base
 			}
@@ -447,6 +453,15 @@ var gqlOrgFieldToResource = map[string]string{
 	"pendingMembers":  "members",
 	"team":            "teams",
 	"teams":           "teams",
+	// Other Organization fields that enumerate MEMBER/OWNER identity (logins, and via mannequins also
+	// emails / via samlIdentityProvider SAML NameIDs) — the round-20 map omitted them, so a
+	// [org.permissions] members="none" carve-out the REST /orgs/{org}/members path enforces was bypassed
+	// over GraphQL, leaking the member roster (mannequins additionally leaks emails the REST surface
+	// never returns) — round-21. Gate them on "members" too.
+	"memberStatuses":       "members",
+	"mannequins":           "members",
+	"enterpriseOwners":     "members",
+	"samlIdentityProvider": "members",
 }
 
 // gqlOrgResources returns each distinct org per-resource key an owner-root (organization/
@@ -455,10 +470,10 @@ var gqlOrgFieldToResource = map[string]string{
 // only name/description is gated on base org access exactly as before. It walks fragment boundaries
 // (so `... on Organization{ membersWithRole }` under a repositoryOwner root is caught) but not into a
 // field's own sub-selection, mirroring gqlRepoResources.
-func gqlOrgResources(orgField *ast.Field, fragments ast.FragmentDefinitionList) []string {
+func gqlOrgResources(orgField *ast.Field, fragments ast.FragmentDefinitionList, budget *int) []string {
 	set := map[string]struct{}{}
 	baseGoverned := false
-	collectOrgResources(orgField.SelectionSet, fragments, set, &baseGoverned, map[string]bool{}, 0)
+	collectOrgResources(orgField.SelectionSet, fragments, set, &baseGoverned, map[string]bool{}, 0, budget)
 	out := make([]string, 0, len(set)+1)
 	for r := range set {
 		out = append(out, r)
@@ -470,12 +485,16 @@ func gqlOrgResources(orgField *ast.Field, fragments ast.FragmentDefinitionList) 
 	return out
 }
 
-func collectOrgResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, seenFrags map[string]bool, depth int) {
+func collectOrgResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, seenFrags map[string]bool, depth int, budget *int) {
 	if depth > maxGraphQLDepth {
 		*baseGoverned = true
 		return
 	}
 	for _, sel := range sels {
+		if visit(budget) { // document-global visit budget (round-21)
+			*baseGoverned = true
+			return
+		}
 		switch s := sel.(type) {
 		case *ast.Field:
 			if r, ok := gqlOrgFieldToResource[s.Name]; ok {
@@ -484,14 +503,14 @@ func collectOrgResources(sels ast.SelectionSet, fragments ast.FragmentDefinition
 				*baseGoverned = true // metadata or any unmapped field → base org access
 			}
 		case *ast.InlineFragment:
-			collectOrgResources(s.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1)
+			collectOrgResources(s.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1, budget)
 		case *ast.FragmentSpread:
 			if seenFrags[s.Name] {
 				continue
 			}
 			if frag := fragments.ForName(s.Name); frag != nil {
 				seenFrags[s.Name] = true
-				collectOrgResources(frag.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1)
+				collectOrgResources(frag.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1, budget)
 			} else {
 				*baseGoverned = true // unresolvable spread → require base
 			}
@@ -525,6 +544,22 @@ func gqlUnscopedCategory(doc *ast.QueryDocument) string {
 // fragment chains, or deeply nested selections. Legitimate queries are far shallower
 // than this bound; exceeding it sets *tooComplex and the caller fails closed.
 const maxGraphQLDepth = 200
+
+// maxGraphQLVisits bounds the TOTAL number of selections the read-scope walk visits across ALL root
+// fields of a document. The per-root walkers (gqlRepoResources/gqlOrgResources/scanCrossRepoNav) each
+// use a FRESH per-root fragment-dedup map (required for correctness — a fragment spread under
+// repository(A) and repository(B) contributes A's and B's scopes respectively and must be re-walked),
+// so K root fields each spreading one shared fragment F is O(K·|F|) — a quadratic pre-policy CPU
+// amplification under only the loose 100k-token parse cap (round-21). A document-global visit budget
+// (mirroring gqlfilter's injectionBudget) collapses the worst case: once exhausted the walk fails
+// closed (tooComplex → unscoped → denied). Real documents visit far fewer selections than this.
+const maxGraphQLVisits = 200_000
+
+// visit decrements the shared walk budget and reports whether it is exhausted (the caller must stop).
+func visit(budget *int) bool {
+	*budget--
+	return *budget < 0
+}
 
 // maxGraphQLTokens bounds the gqlparser token count so the recursive-descent PARSE cannot
 // stack-overflow before the AST exists (see classifyGraphQL). Each nesting level costs at least
@@ -564,7 +599,7 @@ var gqlForkNavFields = map[string]bool{
 // scanCrossRepoNav reports (via *escapes) whether a selection subtree navigates to a
 // repository outside the entry scope, using the given field denylist. It is run on the
 // children of a resolved scope, which are otherwise not policy-checked.
-func scanCrossRepoNav(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, fields map[string]bool, escapes *bool, seenFrags map[string]bool, depth int, tooComplex *bool) {
+func scanCrossRepoNav(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, fields map[string]bool, escapes *bool, seenFrags map[string]bool, depth int, tooComplex *bool, budget *int) {
 	if *escapes {
 		return
 	}
@@ -573,22 +608,26 @@ func scanCrossRepoNav(sels ast.SelectionSet, fragments ast.FragmentDefinitionLis
 		return
 	}
 	for _, sel := range sels {
+		if visit(budget) { // document-global visit budget (round-21)
+			*tooComplex = true
+			return
+		}
 		switch s := sel.(type) {
 		case *ast.Field:
 			if fields[s.Name] {
 				*escapes = true
 				return
 			}
-			scanCrossRepoNav(s.SelectionSet, fragments, fields, escapes, seenFrags, depth+1, tooComplex)
+			scanCrossRepoNav(s.SelectionSet, fragments, fields, escapes, seenFrags, depth+1, tooComplex, budget)
 		case *ast.InlineFragment:
-			scanCrossRepoNav(s.SelectionSet, fragments, fields, escapes, seenFrags, depth+1, tooComplex)
+			scanCrossRepoNav(s.SelectionSet, fragments, fields, escapes, seenFrags, depth+1, tooComplex, budget)
 		case *ast.FragmentSpread:
 			if seenFrags[s.Name] {
 				continue // each fragment scanned once per walk: re-scan is redundant (escapes is monotonic)
 			}
 			if frag := fragments.ForName(s.Name); frag != nil {
 				seenFrags[s.Name] = true
-				scanCrossRepoNav(frag.SelectionSet, fragments, fields, escapes, seenFrags, depth+1, tooComplex)
+				scanCrossRepoNav(frag.SelectionSet, fragments, fields, escapes, seenFrags, depth+1, tooComplex, budget)
 			}
 		}
 	}
@@ -599,7 +638,7 @@ func scanCrossRepoNav(sels ast.SelectionSet, fragments ast.FragmentDefinitionLis
 // resolved repository/search field is not descended into for scope collection (its
 // resource is captured by gqlRepoResource), but its subtree IS scanned for cross-repo
 // navigation, which would otherwise reach repos the entry scope doesn't cover.
-func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(Scope), seenFrags map[string]bool, depth int, tooComplex *bool, escapes *bool) {
+func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(Scope), seenFrags map[string]bool, depth int, tooComplex *bool, escapes *bool, budget *int) {
 	if *tooComplex || *escapes {
 		return
 	}
@@ -608,6 +647,10 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 		return
 	}
 	for _, sel := range selections {
+		if visit(budget) { // document-global visit budget bounds cross-root fragment re-walks (round-21)
+			*tooComplex = true
+			return
+		}
 		switch s := sel.(type) {
 		case *ast.Field:
 			switch s.Name {
@@ -617,10 +660,10 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 				if owner != "" && name != "" {
 					// Emit a scope per distinct resource the selection touches so a query
 					// mixing a restricted resource with a sibling can't dodge its policy.
-					for _, res := range gqlRepoResources(s, fragments) {
+					for _, res := range gqlRepoResources(s, fragments, budget) {
 						add(Scope{Owner: owner, Repo: name, Resource: res})
 					}
-					scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex)
+					scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex, budget)
 					continue
 				}
 			case "organization", "repositoryOwner", "user":
@@ -634,12 +677,12 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					// "members", teams → "teams"), so a [org.permissions] carve-out is enforced over
 					// GraphQL too — not just the base org access (round-20). A pure-metadata selection
 					// yields a single "" (base) scope, unchanged.
-					for _, res := range gqlOrgResources(s, fragments) {
+					for _, res := range gqlOrgResources(s, fragments, budget) {
 						add(Scope{Org: login, Resource: res})
 					}
 					// Enumerating this owner's own repos/orgs is allowed; reaching forks/
 					// parents in other owners is not.
-					scanCrossRepoNav(s.SelectionSet, fragments, gqlForkNavFields, escapes, map[string]bool{}, depth+1, tooComplex)
+					scanCrossRepoNav(s.SelectionSet, fragments, gqlForkNavFields, escapes, map[string]bool{}, depth+1, tooComplex, budget)
 					continue
 				}
 			case "search":
@@ -653,7 +696,23 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					add(Scope{UnscopedCategory: "search"})
 				}
 				// Result nodes can navigate off to other repos just like repository().
-				scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex)
+				scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex, budget)
+				continue
+			case "enterprise", "enterpriseAdministratorInvitation":
+				// Enterprise owner-private data (billingEmail/securityContactEmail/members/organizations/
+				// ownerInfo) is reached only via this root — it has no scoped classifier root, so before
+				// round-21 it emitted NO scope and fell to Defaults.Mode (a default=allow leak; the response
+				// filter is repo-centric and never redacts Enterprise data). Scope it to the enterprise slug
+				// as an org so an [[org]] rule matching the slug gates it and a default-deny denies it — the
+				// navigation analogue of the round-20 owner-owned node(id:) fail-closed. (EnterpriseRepositoryInfo
+				// is still redacted by its own repo marker.)
+				slug := resolveStringArg(s.Arguments, "slug", vars)
+				if slug != "" {
+					add(Scope{Org: slug})
+					scanCrossRepoNav(s.SelectionSet, fragments, gqlForkNavFields, escapes, map[string]bool{}, depth+1, tooComplex, budget)
+				} else {
+					add(Scope{UnscopedCategory: "meta"}) // no resolvable slug → deny via an unscoped category under default-deny
+				}
 				continue
 			case "viewer":
 				add(Scope{UnscopedCategory: "user"})
@@ -670,21 +729,21 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 			case "node", "nodes":
 				// Addressed by node ID (resolved + policy-checked by the proxy); scan
 				// the selection so navigation off the node also fails closed.
-				scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex)
+				scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex, budget)
 				continue
 			}
 			if len(s.SelectionSet) > 0 {
-				collectGraphQLScopes(s.SelectionSet, fragments, vars, add, seenFrags, depth+1, tooComplex, escapes)
+				collectGraphQLScopes(s.SelectionSet, fragments, vars, add, seenFrags, depth+1, tooComplex, escapes, budget)
 			}
 		case *ast.InlineFragment:
-			collectGraphQLScopes(s.SelectionSet, fragments, vars, add, seenFrags, depth+1, tooComplex, escapes)
+			collectGraphQLScopes(s.SelectionSet, fragments, vars, add, seenFrags, depth+1, tooComplex, escapes, budget)
 		case *ast.FragmentSpread:
 			if seenFrags[s.Name] {
 				continue // expand each fragment once per walk: scopes are deduped, escapes monotonic
 			}
 			if frag := fragments.ForName(s.Name); frag != nil {
 				seenFrags[s.Name] = true
-				collectGraphQLScopes(frag.SelectionSet, fragments, vars, add, seenFrags, depth+1, tooComplex, escapes)
+				collectGraphQLScopes(frag.SelectionSet, fragments, vars, add, seenFrags, depth+1, tooComplex, escapes, budget)
 			}
 		}
 	}

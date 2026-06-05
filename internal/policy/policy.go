@@ -349,12 +349,21 @@ func lookupResource(perms map[string]Access, resource string) (Access, bool) {
 	if a, ok := perms[resource]; ok {
 		return a, true
 	}
+	// Case-fold fallback (for an unvalidated mixed-case ORG key). If two keys fold to the same resource
+	// with different access (a self-contradictory config, e.g. Members="none" and MEMBERS="read"), pick
+	// the MOST RESTRICTIVE — Go map iteration order is randomized, so returning the first match was
+	// nondeterministic and could intermittently grant access the operator believed denied (round-21).
+	found := false
+	best := AccessReadWrite
 	for k, a := range perms {
 		if strings.EqualFold(k, resource) {
-			return a, true
+			if !found || a < best {
+				best = a
+			}
+			found = true
 		}
 	}
-	return AccessNone, false
+	return best, found
 }
 
 func permits(rule Access, requested classifier.AccessLevel) bool {

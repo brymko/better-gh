@@ -106,6 +106,12 @@ func deriveRepoOwnedNoPath(schema *ast.Schema, repoPath map[string][]pathStep) m
 var ownerOwnedNodeCategories = map[string]bool{
 	"orgs": true, "teams": true, "projects": true, "projects-classic": true,
 	"enterprise-admin": true, "migrations": true, "sponsors": true, "users": true,
+	// gists: a Gist/GistComment is user/owner-PRIVATE (a secret gist's files), not repo-attributable,
+	// and separately policy-gated (REST /gists → the `gists` unscoped category). Without this a
+	// node(id:Gist) read bypassed a gists carve-out under default=allow — the round-20 owner-owned
+	// fix's missed sibling category (round-21). Read a gist via the policy-checked viewer{gists} /
+	// user(login:){gists} roots instead.
+	"gists": true,
 }
 
 // deriveOwnerOwnedNodes returns Node OBJECT types whose @docsCategory marks them as owner-private

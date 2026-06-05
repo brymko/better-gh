@@ -287,7 +287,18 @@ func descendGroup(cur any, prefix []locStep, elems [][]locStep, authorized func(
 		return cur
 	}
 	if v, present := m[s.field]; present {
+		before := *dropped
 		m[s.field] = descendGroup(v, prefix[1:], elems, authorized, dropped)
+		// If this field's array had denied entries dropped, decrement a sibling per-bucket
+		// repository_count (the CodeQL variant-analysis skip buckets carry one per object) so it can't
+		// serve as a denied-repo existence/count oracle — the per-bucket analogue of the root total_count
+		// rewrite, which the round-16 root-only adjustment missed (round-21). total_count is handled once
+		// at the root in Redact; only repository_count is touched here to avoid double-counting.
+		if d := *dropped - before; d > 0 {
+			if c, ok := m["repository_count"]; ok {
+				m["repository_count"] = json.Number(strconv.Itoa(maxInt(0, jsonNumberToInt(c)-d)))
+			}
+		}
 	}
 	return cur
 }
@@ -445,9 +456,21 @@ func scrubApply(cur any, steps []scrubStep, authorized func(string) bool) {
 // scrubFields walks pure field steps from obj, tracking the '*'-marked null target's container+key
 // and reading the repo at the terminal field; it nulls the marked field when that repo is present
 // and denied. The surrounding object is otherwise untouched.
+//
+// It FAILS CLOSED when the primary `.repository.full_name` path is unresolvable: GitHub's `issue`
+// schema makes the nested `repository` object OPTIONAL while `repository_url` is REQUIRED, so a
+// cross-referenced source issue returned with only `repository_url` left the path unresolved and the
+// foreign content streamed verbatim (round-21, a residual of the round-13 timeline scrub). When the
+// primary path does not resolve but the marked cross-ref object is present, it scans the marked
+// sub-object for any repo identity (full_name / repository_url / minimal-repo) and nulls the cross-ref
+// if that repo is denied OR if no repo can be determined at all — never forwarding an unverifiable
+// foreign cross-ref. (The other scrub locs — forkee/head.repo/base.repo — are full Repository objects
+// that always carry full_name, so they resolve on the primary path and this fallback never fires.)
 func scrubFields(obj any, steps []scrubStep, authorized func(string) bool) {
 	var nullContainer map[string]any
 	var nullKey string
+	var marked any // the '*'-marked field's value (the cross-ref sub-object), for the fallback scan
+	reachedTerminal := true
 	v := obj
 	for _, s := range steps {
 		if s.array {
@@ -455,20 +478,72 @@ func scrubFields(obj any, steps []scrubStep, authorized func(string) bool) {
 		}
 		m, ok := v.(map[string]any)
 		if !ok {
-			return
+			reachedTerminal = false
+			break
 		}
 		if s.isNull {
-			nullContainer, nullKey = m, s.field
+			nullContainer, nullKey, marked = m, s.field, m[s.field]
 		}
 		v = m[s.field]
 	}
-	repo, _ := v.(string)
-	if strings.Count(repo, "/") != 1 {
-		return
+	if nullContainer == nil {
+		return // the marked cross-ref field was never reached → nothing to scrub
 	}
-	if !authorized(repo) && nullContainer != nil {
-		if _, present := nullContainer[nullKey]; present {
-			nullContainer[nullKey] = nil
+	if _, present := nullContainer[nullKey]; !present || marked == nil {
+		return // marked cross-ref absent/null → no foreign content to leak
+	}
+	if reachedTerminal {
+		if repo, ok := v.(string); ok && strings.Count(repo, "/") == 1 {
+			if !authorized(repo) {
+				nullContainer[nullKey] = nil
+			}
+			return
 		}
 	}
+	// Primary path unresolvable but the cross-ref is present: scan it for any repo identity and FAIL
+	// CLOSED (null the cross-ref) on a denied repo OR an undeterminable one.
+	denied, found := scanMarkedRepos(marked, authorized)
+	if denied || !found {
+		nullContainer[nullKey] = nil
+	}
+}
+
+// scanMarkedRepos walks a marked cross-ref sub-object for repository identities (a full_name property,
+// a repository_url API link, or the minimal {id,name,url} event-repo shape — mirroring the Pass-body
+// ContainsDeniedRepo scan), reporting whether any is DENIED and whether any was FOUND at all. Used by
+// scrubFields to fail closed when the primary `.repository.full_name` path is unresolvable.
+func scanMarkedRepos(v any, authorized func(string) bool) (denied, found bool) {
+	switch t := v.(type) {
+	case map[string]any:
+		if s, ok := t["full_name"].(string); ok && strings.Count(s, "/") == 1 {
+			found = true
+			if !authorized(s) {
+				return true, true
+			}
+		}
+		if u, ok := t["repository_url"].(string); ok {
+			if r := repoFromAPIURL(u); r != "" {
+				found = true
+				if !authorized(r) {
+					return true, true
+				}
+			}
+		}
+		for _, child := range t {
+			d, f := scanMarkedRepos(child, authorized)
+			if d {
+				return true, true
+			}
+			found = found || f
+		}
+	case []any:
+		for _, child := range t {
+			d, f := scanMarkedRepos(child, authorized)
+			if d {
+				return true, true
+			}
+			found = found || f
+		}
+	}
+	return false, found
 }

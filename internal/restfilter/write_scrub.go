@@ -24,6 +24,12 @@ var writeScrubOps = map[string][]string{
 	// Repository objects; head.repo of a fork-originated PR is a different, possibly-denied private repo.
 	"/repos/{owner}/{repo}/pulls":               {"$.head.*repo.full_name", "$.base.*repo.full_name"},
 	"/repos/{owner}/{repo}/pulls/{pull_number}": {"$.head.*repo.full_name", "$.base.*repo.full_name"},
+	// POST/DELETE .../requested_reviewers ('Request reviewers' / 'Remove requested reviewers') return the
+	// SAME full pull-request object (head.repo/base.repo). The round-20 table covered only /pulls and
+	// /pulls/{n}; this deeper PR sub-resource that also returns the PR was missed, leaking a fork-
+	// originated PR's denied head.repo on the write (round-21). The GET sibling returns only {users,teams}
+	// (no head/base.repo), which is why the GET scrub table legitimately omits it.
+	"/repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers": {"$.head.*repo.full_name", "$.base.*repo.full_name"},
 }
 
 var writeScrubTemplates []opTemplate

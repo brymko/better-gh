@@ -705,6 +705,20 @@ func (s *Schema) IsKnownObjectType(typename string) bool {
 	return def != nil && def.Kind == ast.Object
 }
 
+// IsBareNameRepoIdentityType reports whether typename is a repoIdentityNoPath type whose ONLY
+// repo-identity scalar is a BARE repositoryName (no owner) — RepositoryMigration today. Such a type
+// cannot self-derive its (owner, repo), and — unlike a repoOwnedNoPath CONTENT type, which genuinely
+// belongs to its enclosing repository — it is an ORG-level record naming a DIFFERENT repository. So
+// ambient attribution to the nearest marked ancestor is UNSOUND: reached via
+// repository(owner,name){ owner{ ...on Organization{ repositoryMigrations{ nodes{ repositoryName } } } } }
+// the migration node sits under the OUTER repository's marker (ambRepo = the allowed path repo) and
+// the round-20 type-marker ambient attribution would KEEP it, leaking a DENIED repo's name + migration
+// failure/log metadata. The response filter therefore redacts it UNCONDITIONALLY (round-21), matching
+// the node(id:) (round-18 H) and organization-root (round-20) entry paths that already fail it closed.
+func (s *Schema) IsBareNameRepoIdentityType(typename string) bool {
+	return s.repoIdentityScalar[typename] == "repositoryName"
+}
+
 // repoFromMarker extracts owner/repo from a marker value. The marker subtree contains only
 // the path to a single nameWithOwner (a bare "owner/repo" string for Repository, or a
 // nested object like {repository:{nameWithOwner:"owner/repo"}} or {discussion:{repository:

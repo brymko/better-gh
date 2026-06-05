@@ -34,6 +34,22 @@ var contentEnumResourceOps = map[string]string{
 	"/search/commits":                    "commits",
 	"/notifications":                     "issues",
 	"/notifications/threads/{thread_id}": "issues",
+	// Activity-event feeds: each element embeds a FULL content object (IssuesEvent.payload.issue,
+	// IssueCommentEvent.payload.comment, PullRequestEvent.payload.pull_request → title+body). They are
+	// NeedsFilter enum ops but were omitted from this table in round-20, so the keep-gate degenerated to
+	// metadata-only and a base=read + issues=none/pulls=none carve-out leaked its own issue/PR/comment
+	// content through the feed (round-21, the events sibling of the round-20 /issues fix). Gate on
+	// "issues" (dropping the whole event when issues is denied), accepting the same PR/push heterogeneity
+	// imprecision as /orgs/{org}/issues.
+	"/events":                                  "issues",
+	"/networks/{owner}/{repo}/events":          "issues",
+	"/orgs/{org}/events":                       "issues",
+	"/repos/{owner}/{repo}/events":             "issues",
+	"/users/{username}/events":                 "issues",
+	"/users/{username}/events/public":          "issues",
+	"/users/{username}/events/orgs/{org}":      "issues",
+	"/users/{username}/received_events":        "issues",
+	"/users/{username}/received_events/public": "issues",
 }
 
 type contentResourceTemplate struct {

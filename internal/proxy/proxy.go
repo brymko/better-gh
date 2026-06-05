@@ -537,6 +537,14 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 			}
 			return gqlfilter.KeepShell
 		}
+		// A bare-repositoryName repo-identity type (RepositoryMigration) is an ORG-level record naming a
+		// DIFFERENT repository than its enclosing marked ancestor, so the round-20 ambient attribution is
+		// unsound — reached via repository(){owner{...on Organization{repositoryMigrations}}} it would be
+		// kept against the allowed outer repo and leak a denied repo's name/migration metadata. Redact it
+		// unconditionally (round-21), matching the node(id:) and organization-root fail-closed paths.
+		if s.IsBareNameRepoIdentityType(typename) {
+			return gqlfilter.Deny
+		}
 		// A repo-marked object whose runtime __typename the embedded schema does NOT recognize is live
 		// schema drift (GitHub ahead of the snapshot): FilterResource would default it to "metadata"
 		// (base), under-enforcing its possibly-stricter real resource. Mirror the node resolver's drift
