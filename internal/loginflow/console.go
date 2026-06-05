@@ -327,6 +327,12 @@ func (h *Handler) apiCreateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ensureLoginUsable(&pol)
+	// Reject a misspelled per-resource key (round-19 D2): an unknown key silently degrades a
+	// per-resource `none` to base access, so surface it instead of minting a fail-open token.
+	if err := pol.ValidateResourceKeys(); err != nil {
+		jsonResp(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		name = "token-" + randHex(3)
@@ -364,6 +370,12 @@ func (h *Handler) apiParsePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := policy.ParseTOML([]byte(req.SpecTOML))
 	if err != nil {
+		jsonResp(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	// Surface a misspelled per-resource key here too, so the console's "parse" preview warns the
+	// operator before they mint a fail-open token (round-19 D2).
+	if err := p.ValidateResourceKeys(); err != nil {
 		jsonResp(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}

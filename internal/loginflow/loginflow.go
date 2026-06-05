@@ -252,8 +252,16 @@ func (h *Handler) runGitHubAuth(grantID string) (userCode, verification string, 
 	errCh := make(chan error, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), grantTTL)
 	// Hand the cancel to the grant so removing/expiring it actually stops the github.com polling
-	// goroutine below (round-12 audit M1) — otherwise it would run for the full 15-min ctx.
-	h.grants.withGrant(byID(grantID), func(g *grant) { g.cancel = cancel })
+	// goroutine below (round-12 audit M1) — otherwise it would run for the full 15-min ctx. Cancel any
+	// PRIOR in-flight goroutine for this grant first: apiBegin's retry path (g.started=false on a
+	// start error) re-enters runGitHubAuth, which would otherwise overwrite g.cancel and orphan the
+	// previous goroutine until its 15-min deadline (round-19 F7).
+	h.grants.withGrant(byID(grantID), func(g *grant) {
+		if g.cancel != nil {
+			g.cancel()
+		}
+		g.cancel = cancel
+	})
 
 	go func() {
 		defer cancel()
@@ -263,6 +271,12 @@ func (h *Handler) runGitHubAuth(grantID string) (userCode, verification string, 
 			OnCode: func(code, url string) { codeCh <- codeInfo{code, url} },
 		})
 		if ferr != nil {
+			// If THIS attempt's context was cancelled, it was superseded by a retry (which now owns the
+			// grant) or the grant was removed/expired — return silently rather than deny, so a cancelled
+			// orphan cannot clobber the live attempt's pending grant into "denied" (round-19 F7).
+			if ctx.Err() != nil {
+				return
+			}
 			select { // surfaced to the caller only if it happened before we got a code
 			case errCh <- ferr:
 			default:
@@ -506,6 +520,17 @@ func (h *Handler) apiApprove(w http.ResponseWriter, r *http.Request) {
 
 	pol := req.Policy
 	ensureLoginUsable(&pol)
+	// Reject a misspelled per-resource key (round-19 D2) before minting — otherwise a per-resource
+	// `none` under a typo'd key silently degrades to base access. Revert the provisional reservation.
+	if verr := pol.ValidateResourceKeys(); verr != nil {
+		h.grants.withGrant(byID(req.GrantID), func(g *grant) {
+			if g.status == statusApproved {
+				g.status = statusAuthenticated
+			}
+		})
+		jsonResp(w, http.StatusBadRequest, map[string]string{"error": verr.Error()})
+		return
+	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		name = "ghlogin-" + login

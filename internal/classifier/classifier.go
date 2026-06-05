@@ -1,6 +1,8 @@
 package classifier
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"regexp"
@@ -136,6 +138,24 @@ func Classify(method, path string, body []byte) Result {
 		// as a scope the policy must allow, so an un-permitted fork is denied (round-16).
 		res.Additional = append(res.Additional, compareForkScopes(segments)...)
 		return res
+	}
+
+	// GitHub's Copilot coding-agent endpoints embed the repository DEEPER than segment[0]:
+	// /agents/repos/{owner}/{repo}/tasks[/{task_id}]. Without this they classify to an EMPTY scope
+	// (segments[0]=="agents" matches none of repos/orgs/users), which under defaults.mode="allow" is
+	// allowed-by-default and falls back to the body-scan alone — and the task schema names its repo
+	// only by NUMERIC id, which restfilter.ContainsDeniedRepo cannot map, so a denied repo's task
+	// data leaks (round-19 F6). Scope to the path repo so a denied repo is denied regardless of mode.
+	// Resource is derived over the embedded repos/{o}/{r}/… triple (a known sub-resource is gated; an
+	// unknown one like "tasks" is ResourceUnknown → write-fail-closed under a per-resource rule).
+	if len(segments) >= 4 && segments[0] == "agents" && segments[1] == "repos" {
+		sub := segments[1:] // [repos, owner, repo, seg...]
+		return Result{
+			Owner:    sub[1],
+			Repo:     sub[2],
+			Access:   access,
+			Resource: restResource(sub),
+		}
 	}
 
 	if len(segments) >= 2 && segments[0] == "orgs" {
@@ -627,13 +647,40 @@ func resolveStringArg(args ast.ArgumentList, name string, vars map[string]interf
 // (no allowlist to fall behind). Over-extraction is harmless: a value that does not
 // resolve to a node is ignored by the resolver. The key exclusions and the minimum length
 // only avoid wasted resolve calls on obvious non-IDs (commit OIDs, client strings).
+//
+// The 16-char floor on legacyNodeIDPattern would MISS short legacy IDs: a small databaseId
+// encodes under 16 base64 chars (base64("05:Issue1") = "MDU6SXNzdWUx", 12 chars), so a mutation
+// could ride a denied object's short legacy ID past resolution behind an allowed carrier node
+// (round-19 F5). Rather than lower the floor — which would collect every 8+char owner login / ref
+// as a false candidate and trigger a wasteful upstream resolve on ordinary reads —
+// looksLikeShortLegacyNodeID closes the gap precisely: it base64-DECODES an 8–15 char value and
+// accepts it only if it has the legacy "NN:TypeName<id>" decoded shape (leading digit + colon), so
+// "facebook" (decodes to non-colon garbage) is not collected but "MDU6SXNzdWUx" is.
 var (
 	newNodeIDPattern    = regexp.MustCompile(`^[A-Za-z0-9]+_[A-Za-z0-9_=/+-]+$`)
 	legacyNodeIDPattern = regexp.MustCompile(`^[A-Za-z0-9+/]{16,}={0,2}$`)
 )
 
 func looksLikeNodeID(s string) bool {
-	return newNodeIDPattern.MatchString(s) || legacyNodeIDPattern.MatchString(s)
+	return newNodeIDPattern.MatchString(s) || legacyNodeIDPattern.MatchString(s) || looksLikeShortLegacyNodeID(s)
+}
+
+// looksLikeShortLegacyNodeID catches legacy GraphQL node IDs shorter than the 16-char floor of
+// legacyNodeIDPattern. Legacy IDs are base64 of "NN:TypeName<databaseId>"; a small databaseId makes
+// the encoding 8–15 chars. It is intentionally narrow (a leading ASCII digit and a colon in the
+// DECODED bytes) so it does not collect ordinary 8+char identifiers (owner logins, refs, cursors)
+// as false node-ID candidates — over-collection is safe but wastes upstream resolve calls.
+func looksLikeShortLegacyNodeID(s string) bool {
+	if len(s) < 8 || len(s) >= 16 {
+		return false // 16+ already handled by legacyNodeIDPattern; <8 is too short for a real legacy ID
+	}
+	dec, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		if dec, err = base64.RawStdEncoding.DecodeString(s); err != nil {
+			return false
+		}
+	}
+	return len(dec) >= 4 && dec[0] >= '0' && dec[0] <= '9' && bytes.IndexByte(dec, ':') > 0
 }
 
 // isExcludedNodeIDKey reports whether an argument/object-field name holds a NON-node value that
@@ -986,6 +1033,22 @@ var restResourceMap = map[string]string{
 	"pages":        "pages",
 	"keys":         "keys",
 	"deploy-keys":  "keys",
+}
+
+// KnownRepoResourceKeys is the set of per-resource policy keys that can actually gate a REPOSITORY
+// rule — the values restResource (incl. the git-data buckets) and the GraphQL resource mapping
+// produce, plus "metadata". A [repo.permissions] / --repo-perm key OUTSIDE this set never matches
+// any request, so a per-resource `none` written under a misspelled key (e.g. "contnets") silently
+// degrades to the rule's BASE access — a fail-open footgun. Mint paths validate against this so a
+// typo is rejected, not silently accepted (round-19 D2). Derived from restResourceMap so it cannot
+// drift from what the classifier emits. NOTE: org per-resource keys are open-ended (any org subpath
+// segment via orgResource), so this set governs REPO rules only.
+func KnownRepoResourceKeys() map[string]bool {
+	out := map[string]bool{"metadata": true}
+	for _, v := range restResourceMap {
+		out[v] = true
+	}
+	return out
 }
 
 // orgResource derives the per-resource key for an /orgs/{org}/... or /users/{user}/... path so an

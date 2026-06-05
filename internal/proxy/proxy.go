@@ -277,6 +277,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// allowed, and the enum redactor can't express it (it would drop every non-cross-ref event).
 		// Scrub nulls just the cross-ref sub-object per element when its repo is denied (audit F2).
 		scrubLocs := restfilter.ScrubLocations(norm)
+		// Bare-string repo arrays the OpenAPI generator can't locate (e.g. the CodeQL variant
+		// analysis's not_found_repos.repository_full_names) — dropped by a hand-maintained table so a
+		// denied repo's NAME doesn't leak (round-19 F4).
+		strArrayLocs := restfilter.StringArrayLocations(norm)
 		p := pol
 		// Gate each repo-bearing entry by BOTH the repo's own `metadata` access AND the enumerated
 		// endpoint's resource, NOT the lenient CanReadAnything. Two complementary leaks:
@@ -305,9 +309,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return p.Evaluate(repo, owner, classifier.Read, enumResource, "").Allowed
 		}
 		switch {
-		case dec == restfilter.NeedsFilter || len(scrubLocs) > 0:
-			// Redact denied enum entries (drop) and/or scrub embedded foreign cross-ref content
-			// (null in place); both fail closed on an unparseable body.
+		case dec == restfilter.NeedsFilter || len(scrubLocs) > 0 || len(strArrayLocs) > 0:
+			// Redact denied enum entries (drop), scrub embedded foreign cross-ref content (null in
+			// place), and drop denied bare-string repo names; all fail closed on an unparseable body.
 			respFilter = func(resp []byte) ([]byte, bool) {
 				out := resp
 				if dec == restfilter.NeedsFilter {
@@ -319,6 +323,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if len(scrubLocs) > 0 {
 					var ok bool
 					if out, ok = restfilter.Scrub(out, scrubLocs, canRead); !ok {
+						return nil, false
+					}
+				}
+				if len(strArrayLocs) > 0 {
+					var ok bool
+					if out, ok = restfilter.DropRepoStrings(out, strArrayLocs, canRead); !ok {
 						return nil, false
 					}
 				}
@@ -815,6 +825,22 @@ func EnforceRedirectPolicy(req *http.Request, via []*http.Request) error {
 		return nil // internal call with no policy attached (node resolution never redirects)
 	}
 	c := classifier.Classify(req.Method, req.URL.Path, nil)
+	// A same-host redirect must not change the response-FILTER shape the proxy already fixed for the
+	// REQUESTED endpoint. respFilter/passScan are derived once in ServeHTTP from the original path and
+	// reused for the final (post-redirect) body; re-checking authorization here is not enough. A
+	// no-filter path-scoped read (e.g. GET /repos/o/r/contents/x → respFilter==nil) that upstream
+	// redirects same-host to a cross-repo ENUMERATION endpoint (e.g. /user/repos, which the policy may
+	// independently allow) would then stream that enumeration body UNREDACTED, leaking denied repos
+	// (round-19 F1). The ONLY legitimate same-host redirect GitHub issues is a renamed/moved repo —
+	// path-scoped to a single repository on both sides — so require both the origin and the target to
+	// scope to one repo and refuse anything else. Cost is availability on exotic same-host redirects
+	// (e.g. /repositories/{id}, which already fails closed off-spec), never a leak.
+	if len(via) > 0 {
+		orig := classifier.Classify(via[0].Method, via[0].URL.Path, nil)
+		if !orig.HasRepo() || !c.HasRepo() {
+			return fmt.Errorf("redirect target %q changes the response-filter scope (origin/target not single-repo); refusing", req.URL.Path)
+		}
+	}
 	if res := evaluateScopes(pol, &c); !res.Allowed {
 		return fmt.Errorf("redirect target %q denied by policy: %s", req.URL.Path, res.Reason)
 	}

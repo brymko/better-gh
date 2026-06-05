@@ -3,6 +3,7 @@ package policy
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"better-gh/internal/classifier"
@@ -108,6 +109,32 @@ func ParseTOML(data []byte) (*Policy, error) {
 		return nil, fmt.Errorf("parsing policy: %w", err)
 	}
 	return &p, nil
+}
+
+// ValidateResourceKeys rejects a policy whose REPO rules carry a per-resource key that no request
+// can ever match (a typo like "contnets"), which would silently degrade the intended per-resource
+// `none` to the rule's BASE access — a fail-open footgun (round-19 D2). Org per-resource keys are
+// open-ended (any org subpath segment), so only repo keys are validated. Mint paths and the socket
+// policy loader call this so a typo'd key is surfaced as an error instead of silently fail-opening.
+func (p *Policy) ValidateResourceKeys() error {
+	known := classifier.KnownRepoResourceKeys()
+	for _, r := range p.Repo {
+		for k := range r.Permissions {
+			if !known[k] {
+				return fmt.Errorf("repo %q: unknown per-resource key %q (valid keys: %s)", r.Name, k, knownKeyList(known))
+			}
+		}
+	}
+	return nil
+}
+
+func knownKeyList(known map[string]bool) string {
+	keys := make([]string, 0, len(known))
+	for k := range known {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ", ")
 }
 
 func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resource, unscopedCategory string) Result {

@@ -211,10 +211,43 @@ func deriveNodeObjectTypes(schema *ast.Schema) map[string]bool {
 // itself) is intentionally NOT excluded, so own-repo-only types (Comparison, MergeBranchPayload)
 // keep their correct path; types whose ONLY link is head-side become non-repo-scoped and are gated
 // by their already-tagged parent (the PR's Repository container), which is sound.
+//
+// The cross-repo ISSUE-RELATION links (subIssue/blockingIssue/blockedIssue) point to a RELATED
+// issue that may live in a different repository (a sub-issue or a blocking/blocked issue can be
+// cross-repo). The timeline events whose ONLY repo link is one of these (SubIssueAdded/RemovedEvent,
+// Blocking/BlockedBy*Event) therefore have no own-repo path and fall to repoOwnedNoPath (ambient-
+// attributed + node-denied), exactly like CrossReferencedEvent; the *Payload types that ALSO carry
+// `issue` (the modified issue) keep deriving via that own link. Following the relation link instead
+// attributed the event to a foreign repo and leaked its metadata (round-19 F2).
+//
+// fromRepository (TransferredEvent's source repo) is listed for clarity, though the general
+// "direct Repository field must be named `repository`" rule in deriveRepoPaths already excludes it.
 var crossRepoNavFields = map[string]bool{
 	"parent": true, "source": true, "headRepository": true,
 	"baseRepository": true, "templateRepository": true,
 	"headRef": true, "headTarget": true,
+	"fromRepository": true,
+	"subIssue":       true, "blockingIssue": true, "blockedIssue": true,
+}
+
+// crossRepoNavByType excludes a link only on SPECIFIC types where it is cross-repo, because the
+// SAME field name is an own-repo link on other types and must not be excluded globally:
+//   - ReferencedEvent.commit / .commitRepository — the REFERENCING commit and its repo, which
+//     "originated in a different repository" (sibling isCrossRepository). `commit` is own-repo on
+//     BlameRange/PullRequestCommit/MergedEvent/Status/…, so it cannot be a global exclusion. With
+//     both excluded, ReferencedEvent has no path → repoOwnedNoPath (ambient + node-deny).
+//   - HeadRefForcePushedEvent.afterCommit / .beforeCommit — the HEAD-side commits of a force-push,
+//     which live in the (possibly forked) head repo; the event itself belongs to the PR's base
+//     repo, reached via the own `pullRequest` link. (BaseRefForcePushedEvent's after/beforeCommit
+//     ARE own-repo — the base ref is in the repo itself — so they are NOT excluded.)
+//   - PullRequestRevisionMarker.lastSeenCommit — a commit the viewer last saw, which can be a fork
+//     commit; the marker belongs to the PR's repo via the own `pullRequest` link.
+//
+// round-19 F2.
+var crossRepoNavByType = map[string]map[string]bool{
+	"ReferencedEvent":           {"commit": true, "commitRepository": true},
+	"HeadRefForcePushedEvent":   {"afterCommit": true, "beforeCommit": true},
+	"PullRequestRevisionMarker": {"lastSeenCommit": true},
 }
 
 // Load parses the embedded GitHub schema and derives, for every type that belongs to a
@@ -304,10 +337,22 @@ func deriveRepoPaths(schema *ast.Schema) map[string][]pathStep {
 				}
 				ft := f.Type.Name()
 				if tp, ok := paths[ft]; ok {
-					// Singular membership to an already-pathed CONCRETE type. Skip the cross-repo-
-					// nav fields (Repository.parent/source/headRepository/… point to a DIFFERENT
-					// repo); this exclusion is keyed on the concrete Repository link below.
-					if crossRepoNavFields[f.Name] {
+					// Singular membership to an already-pathed CONCRETE type. Skip cross-repo links
+					// that point to a DIFFERENT repository than this object's own: the global denylist
+					// (parent/source/headRepository/… and the cross-repo issue relations) and the
+					// per-(type,field) links that are cross-repo only on some types.
+					if crossRepoNavFields[f.Name] || crossRepoNavByType[name][f.Name] {
+						continue
+					}
+					// A DIRECT Repository link is the object's OWN repo only when named `repository`
+					// (the canonical membership the seed pass already handles). Every other
+					// Repository-typed field is a foreign link by GitHub convention (fromRepository,
+					// commitRepository, parent, source, head/base/templateRepository, an edge's node),
+					// so never derive an own-repo path through it — doing so mis-attributes the object
+					// to the WRONG repository and either leaks its metadata (when the foreign repo is
+					// allowed) or over-redacts (round-19 F2). This general rule subsumes the direct-
+					// Repository entries in crossRepoNavFields and bounds the whole class.
+					if ft == "Repository" && f.Name != "repository" {
 						continue
 					}
 					consider(append([]pathStep{{field: f.Name}}, tp...))

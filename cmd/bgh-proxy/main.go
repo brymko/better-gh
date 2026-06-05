@@ -94,6 +94,9 @@ Token subcommands:
 
 Resources: pulls, issues, contents, actions, releases, commits, branches, checks, comments, hooks, deployments, pages, keys, metadata
   (the Git Data API /repos/o/r/git/* is governed by branches [refs/tags], contents [blobs/trees], or commits)
+  A misspelled --repo-perm key is rejected (it would otherwise silently fall back to base access).
+  --repo-perm/--org-perm without a matching --repo/--org create a base-'none' rule (only the named
+  resource is granted); pass --repo owner/repo=read to also grant a read base.
 Unscoped categories: user, search, gists, notifications, events, meta
 
 `)
@@ -284,6 +287,12 @@ func cmdServe(configPath string) error {
 	socketPolicy, err := policy.LoadFromFile(cfg.PolicyFile)
 	if err != nil {
 		return fmt.Errorf("loading policy: %w", err)
+	}
+	// Fail startup on a misspelled per-resource key in policy.toml rather than serve a fail-open
+	// policy: an unknown [repo.permissions] key never matches a request, so a per-resource `none`
+	// under a typo would silently degrade to the rule's base access (round-19 D2).
+	if err := socketPolicy.ValidateResourceKeys(); err != nil {
+		return fmt.Errorf("invalid policy %s: %w", cfg.PolicyFile, err)
 	}
 
 	httpClient := &http.Client{
@@ -662,8 +671,14 @@ func tokenCreate(c *adminClient, args []string) error {
 			delete(orgPerms, orgRules[i].Name)
 		}
 	}
+	// A --org-perm/--repo-perm with no matching --org/--repo base rule creates the rule with base
+	// access "none" (least privilege), so e.g. `--repo-perm o/r:pulls=read-write` grants ONLY pulls,
+	// not whole-repo read. Defaulting the base to "read" (the old behavior) silently widened the grant
+	// — every other resource of that repo became readable — and contradicted socket-mode policy.toml,
+	// where a [repo.permissions] block with no `access` line defaults the base to the "none" zero
+	// value (round-19 D1). Specify `--repo o/r=read` explicitly to also grant a read base.
 	for orgName, p := range orgPerms {
-		orgRules = append(orgRules, rule{Name: orgName, Access: "read", Permissions: p})
+		orgRules = append(orgRules, rule{Name: orgName, Access: "none", Permissions: p})
 	}
 
 	for i := range repoRules {
@@ -673,7 +688,7 @@ func tokenCreate(c *adminClient, args []string) error {
 		}
 	}
 	for repoName, p := range repoPerms {
-		repoRules = append(repoRules, rule{Name: repoName, Access: "read", Permissions: p})
+		repoRules = append(repoRules, rule{Name: repoName, Access: "none", Permissions: p})
 	}
 
 	polBody := map[string]any{

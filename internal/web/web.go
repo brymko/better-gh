@@ -168,6 +168,12 @@ func (h *Handler) createToken(w http.ResponseWriter, r *http.Request) {
 		Org:      orgRules,
 		Repo:     repoRules,
 	}
+	// Reject a misspelled per-resource key (round-19 D2): an unknown key never matches a request, so
+	// a per-resource `none` written under a typo would silently degrade to the rule's base access.
+	if err := pol.ValidateResourceKeys(); err != nil {
+		jsonResp(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	tok, secret, err := h.store.Create(req.Name, pol)
 	if err != nil {

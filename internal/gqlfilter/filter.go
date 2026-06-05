@@ -383,7 +383,7 @@ func Filter(resp map[string]any, authorized func(owner, repo, resource, typename
 // FilterWithDecision walks a GraphQL JSON response and applies authorize's per-object Decision to
 // every repo-scoped (marked) object, then strips the injected markers.
 func FilterWithDecision(resp map[string]any, authorize func(owner, repo, resource, typename string) Decision) map[string]any {
-	v := filterValue(resp, authorize, "", "")
+	v := filterValue(resp, authorize, "", "", false)
 	if m, ok := v.(map[string]any); ok {
 		return m
 	}
@@ -392,8 +392,13 @@ func FilterWithDecision(resp map[string]any, authorize func(owner, repo, resourc
 
 // filterValue walks the response. ambOwner/ambRepo carry the repository of the nearest enclosing
 // marked-and-kept object — the "ambient repository" used to attribute repo-owned objects that cannot
-// self-identify their repo (the type-marker-only repoOwnedNoPath objects; see augment).
-func filterValue(v any, authorize func(owner, repo, resource, typename string) Decision, ambOwner, ambRepo string) any {
+// self-identify their repo (the type-marker-only repoOwnedNoPath objects; see augment). shell is set
+// while walking the subtree of a leniently-kept (KeepShell) repository container: in shell mode an
+// UNMARKED intermediate object is reduced to a structural shell (its own scalars/marker-free branches
+// stripped, only subtrees leading to a granted marked object recursed) so the container's own
+// metadata cannot leak through an intermediate the direct path would have denied (round-19 F3). Shell
+// mode ends at the first marked (and authorized) object, whose granted subtree is kept in full.
+func filterValue(v any, authorize func(owner, repo, resource, typename string) Decision, ambOwner, ambRepo string, shell bool) any {
 	switch val := v.(type) {
 	case map[string]any:
 		childOwner, childRepo := ambOwner, ambRepo
@@ -415,9 +420,10 @@ func filterValue(v any, authorize func(owner, repo, resource, typename string) D
 				return shellPrune(val, authorize, owner, repo)
 			default: // Keep
 			}
-			// A kept repo-scoped object establishes the repository context for its (possibly
-			// unmarkable) descendants.
+			// A kept repo-scoped object is fully readable and establishes the repository context
+			// for its (possibly unmarkable) descendants; its granted subtree leaves shell mode.
 			childOwner, childRepo = owner, repo
+			shell = false
 		} else if typename := markerTypename(val); typename != "" {
 			// A repo-OWNED content object with only a TYPE marker and NO repo marker (a
 			// repoOwnedNoPath type: timeline events, DeploymentReview, …). It cannot self-identify
@@ -430,15 +436,24 @@ func filterValue(v any, authorize func(owner, repo, resource, typename string) D
 			if authorize(ambOwner, ambRepo, typeResource(typename), typename) == Deny {
 				return nil
 			}
+			shell = false // an authorized per-resource content object is readable in full
+		} else if shell {
+			// An UNMARKED intermediate inside a KeepShell container (e.g. a linked ProjectV2 /
+			// DraftIssue — @docsCategory "projects" is deliberately un-markered because projects
+			// span repos). Reduce it to a structural shell too: without this it kept its OWN
+			// scalars (title/readme/shortDescription/url/…) of a base=none repo when a marked
+			// descendant rode along — exactly what the direct repository(secret){projectV2{…}}
+			// path denies (round-19 F3).
+			return shellPrune(val, authorize, ambOwner, ambRepo)
 		}
 		stripMarkers(val) // strip injected repo + type markers (whether or not a marker rode along)
 		for k, child := range val {
-			val[k] = filterValue(child, authorize, childOwner, childRepo)
+			val[k] = filterValue(child, authorize, childOwner, childRepo, shell)
 		}
 		return val
 	case []any:
 		for i, child := range val {
-			val[i] = filterValue(child, authorize, ambOwner, ambRepo)
+			val[i] = filterValue(child, authorize, ambOwner, ambRepo, shell)
 		}
 		return val
 	default:
@@ -456,9 +471,11 @@ func shellPrune(container map[string]any, authorize func(owner, repo, resource, 
 		switch child.(type) {
 		case map[string]any, []any:
 			if hasMarkerDescendant(child) {
-				// Granted children live here; recurse with the container's repo as the ambient
-				// context so any repoOwnedNoPath descendants are attributed to this repo.
-				container[k] = filterValue(child, authorize, ambOwner, ambRepo)
+				// Granted children live here; recurse in SHELL mode with the container's repo as
+				// the ambient context, so unmarked INTERMEDIATE objects between the container and
+				// the granted (marked) leaf are reduced to shells too (round-19 F3) and any
+				// repoOwnedNoPath descendants are attributed to this repo.
+				container[k] = filterValue(child, authorize, ambOwner, ambRepo, true)
 			} else {
 				delete(container, k) // pure container-owned data (no marked object beneath)
 			}
