@@ -58,6 +58,15 @@ var repoScrubOps = map[string][]string{
 	"GET /repos/{owner}/{repo}/pulls/{pull_number}":        {"$.head.*repo.full_name", "$.base.*repo.full_name"},
 	"GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls": {"$[].head.*repo.full_name", "$[].base.*repo.full_name"},
 
+	// A check run embeds pull_requests[].head/base.repo as MINIMAL {id,url,name} repos. GitHub's own
+	// schema does NOT guarantee these are same-repo (the description only says "head_sha/head_branch
+	// matches the check"), so a fork PR's head.repo could be a denied private repo — null it (gated via
+	// the api `url`, since the minimal repo has no full_name) when denied (round-21). The check-suite/
+	// commit forms nest the runs one level deeper (check_runs[].pull_requests[]).
+	"GET /repos/{owner}/{repo}/check-runs/{check_run_id}":                {"$.pull_requests[].head.*repo.url", "$.pull_requests[].base.*repo.url"},
+	"GET /repos/{owner}/{repo}/check-suites/{check_suite_id}/check-runs": {"$.check_runs[].pull_requests[].head.*repo.url", "$.check_runs[].pull_requests[].base.*repo.url"},
+	"GET /repos/{owner}/{repo}/commits/{ref}/check-runs":                 {"$.check_runs[].pull_requests[].head.*repo.url", "$.check_runs[].pull_requests[].base.*repo.url"},
+
 	// activity event feeds (forkee + PR head/base repo).
 	"GET /events":                                  eventForeignRepoLocs,
 	"GET /networks/{owner}/{repo}/events":          eventForeignRepoLocs,

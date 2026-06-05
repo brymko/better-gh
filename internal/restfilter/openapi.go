@@ -434,78 +434,83 @@ func Scrub(body []byte, locs []string, authorized func(ownerRepo string) bool) (
 	return out, true
 }
 
-// scrubApply dispatches an array-rooted scrub (recurse per element on the tail) or a singleton scrub
-// (walk fields from the root). Scrub locations always have the array (if any) at the front.
+// scrubApply walks a scrub location (which may contain arrays at ANY position), tracking the
+// '*'-marked null target's container+key, and nulls that marked sub-object when the repo at the end of
+// the path is DENIED. The terminal value is resolved as a one-slash full_name/name OR a repository API
+// url (repoFromAPIURL) — so a minimal {id,url,name} cross-ref repo (a check-run's pull_requests head/
+// base.repo) is gated by its url. It FAILS CLOSED when the marked cross-ref is present but its repo is
+// undeterminable on the primary path (GitHub's `issue` makes the nested `repository` optional while
+// `repository_url` is required), scanning the marked sub-object and nulling it on a denied OR
+// undeterminable repo — never forwarding an unverifiable foreign cross-ref (round-21).
 func scrubApply(cur any, steps []scrubStep, authorized func(string) bool) {
-	if len(steps) == 0 {
-		return
-	}
-	if steps[0].array {
-		arr, ok := cur.([]any)
-		if !ok {
-			return
-		}
-		for _, el := range arr {
-			scrubFields(el, steps[1:], authorized)
-		}
-		return
-	}
-	scrubFields(cur, steps, authorized)
+	scrubWalk(cur, steps, nil, "", nil, authorized)
 }
 
-// scrubFields walks pure field steps from obj, tracking the '*'-marked null target's container+key
-// and reading the repo at the terminal field; it nulls the marked field when that repo is present
-// and denied. The surrounding object is otherwise untouched.
-//
-// It FAILS CLOSED when the primary `.repository.full_name` path is unresolvable: GitHub's `issue`
-// schema makes the nested `repository` object OPTIONAL while `repository_url` is REQUIRED, so a
-// cross-referenced source issue returned with only `repository_url` left the path unresolved and the
-// foreign content streamed verbatim (round-21, a residual of the round-13 timeline scrub). When the
-// primary path does not resolve but the marked cross-ref object is present, it scans the marked
-// sub-object for any repo identity (full_name / repository_url / minimal-repo) and nulls the cross-ref
-// if that repo is denied OR if no repo can be determined at all — never forwarding an unverifiable
-// foreign cross-ref. (The other scrub locs — forkee/head.repo/base.repo — are full Repository objects
-// that always carry full_name, so they resolve on the primary path and this fallback never fires.)
-func scrubFields(obj any, steps []scrubStep, authorized func(string) bool) {
-	var nullContainer map[string]any
-	var nullKey string
-	var marked any // the '*'-marked field's value (the cross-ref sub-object), for the fallback scan
-	reachedTerminal := true
-	v := obj
-	for _, s := range steps {
-		if s.array {
-			return // nested arrays in a scrub path are unsupported (none in the table)
+func scrubWalk(v any, steps []scrubStep, nullContainer map[string]any, nullKey string, marked any, authorized func(string) bool) {
+	if len(steps) == 0 {
+		if nullContainer == nil {
+			return
 		}
-		m, ok := v.(map[string]any)
-		if !ok {
-			reachedTerminal = false
-			break
+		if _, present := nullContainer[nullKey]; !present || marked == nil {
+			return
 		}
-		if s.isNull {
-			nullContainer, nullKey, marked = m, s.field, m[s.field]
-		}
-		v = m[s.field]
-	}
-	if nullContainer == nil {
-		return // the marked cross-ref field was never reached → nothing to scrub
-	}
-	if _, present := nullContainer[nullKey]; !present || marked == nil {
-		return // marked cross-ref absent/null → no foreign content to leak
-	}
-	if reachedTerminal {
-		if repo, ok := v.(string); ok && strings.Count(repo, "/") == 1 {
+		if repo := repoFromScrubValue(v); repo != "" {
 			if !authorized(repo) {
 				nullContainer[nullKey] = nil
 			}
 			return
 		}
+		scrubFailClosed(nullContainer, nullKey, marked, authorized)
+		return
 	}
-	// Primary path unresolvable but the cross-ref is present: scan it for any repo identity and FAIL
-	// CLOSED (null the cross-ref) on a denied repo OR an undeterminable one.
-	denied, found := scanMarkedRepos(marked, authorized)
-	if denied || !found {
+	s := steps[0]
+	if s.array {
+		if arr, ok := v.([]any); ok {
+			for _, el := range arr {
+				scrubWalk(el, steps[1:], nullContainer, nullKey, marked, authorized)
+			}
+		}
+		return
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		// intermediate field missing after the marked cross-ref → terminal unresolvable; fail closed.
+		scrubFailClosed(nullContainer, nullKey, marked, authorized)
+		return
+	}
+	nc, nk, mk := nullContainer, nullKey, marked
+	if s.isNull {
+		nc, nk, mk = m, s.field, m[s.field]
+	}
+	scrubWalk(m[s.field], steps[1:], nc, nk, mk, authorized)
+}
+
+// scrubFailClosed nulls the marked cross-ref (when present) if its repo cannot be determined on the
+// primary path: it scans the marked sub-object for any repo identity and nulls on a denied OR
+// undeterminable repo.
+func scrubFailClosed(nullContainer map[string]any, nullKey string, marked any, authorized func(string) bool) {
+	if nullContainer == nil || marked == nil {
+		return
+	}
+	if _, present := nullContainer[nullKey]; !present {
+		return
+	}
+	if denied, found := scanMarkedRepos(marked, authorized); denied || !found {
 		nullContainer[nullKey] = nil
 	}
+}
+
+// repoFromScrubValue resolves a scrub terminal value to "owner/repo": a one-slash full_name/name string,
+// or a repository API url (https://api.github.com/repos/{owner}/{repo}[/…]). "" if neither.
+func repoFromScrubValue(v any) string {
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	if strings.Count(s, "/") == 1 {
+		return s
+	}
+	return repoFromAPIURL(s)
 }
 
 // scanMarkedRepos walks a marked cross-ref sub-object for repository identities (a full_name property,

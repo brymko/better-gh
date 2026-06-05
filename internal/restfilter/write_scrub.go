@@ -24,6 +24,19 @@ var writeScrubOps = map[string][]string{
 	// Repository objects; head.repo of a fork-originated PR is a different, possibly-denied private repo.
 	"/repos/{owner}/{repo}/pulls":               {"$.head.*repo.full_name", "$.base.*repo.full_name"},
 	"/repos/{owner}/{repo}/pulls/{pull_number}": {"$.head.*repo.full_name", "$.base.*repo.full_name"},
+	// Repo-CREATE responses echo the upstream parent/source/template_repository the new repo was forked/
+	// generated from — a possibly-denied private repo — the exact sibling of the round-20 PATCH
+	// /repos/{o}/{r} scrub, missed on the create paths (round-21, surfaced by the spec-coverage test).
+	"/orgs/{org}/repos": {"$.*parent.full_name", "$.*source.full_name", "$.*template_repository.full_name"},
+	"/user/repos":       {"$.*parent.full_name", "$.*source.full_name", "$.*template_repository.full_name"},
+	"/repos/{template_owner}/{template_repo}/generate": {"$.*parent.full_name", "$.*source.full_name", "$.*template_repository.full_name"},
+	// Publishing a codespace creates a repo; its `repository` carries the upstream parent/source.
+	"/user/codespaces/{codespace_name}/publish": {"$.repository.*parent.full_name", "$.repository.*source.full_name", "$.repository.*template_repository.full_name"},
+	// Creating/updating a check-run (POST/PATCH) or a check-suite returns pull_requests[].head/base.repo
+	// (minimal {id,url,name}); a fork PR's head.repo could be a denied repo — null it via its url (round-21).
+	"/repos/{owner}/{repo}/check-runs":                {"$.pull_requests[].head.*repo.url", "$.pull_requests[].base.*repo.url"},
+	"/repos/{owner}/{repo}/check-runs/{check_run_id}": {"$.pull_requests[].head.*repo.url", "$.pull_requests[].base.*repo.url"},
+	"/repos/{owner}/{repo}/check-suites":              {"$.pull_requests[].head.*repo.url", "$.pull_requests[].base.*repo.url"},
 	// POST/DELETE .../requested_reviewers ('Request reviewers' / 'Remove requested reviewers') return the
 	// SAME full pull-request object (head.repo/base.repo). The round-20 table covered only /pulls and
 	// /pulls/{n}; this deeper PR sub-resource that also returns the PR was missed, leaking a fork-

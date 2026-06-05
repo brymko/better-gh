@@ -72,3 +72,50 @@ func TestR21_NestedBucketCountDecremented(t *testing.T) {
 		t.Fatalf("nested repository_count not decremented (count oracle): %s", s)
 	}
 }
+
+// Round-21: scrubWalk handles a mid-path array + a `url` terminal (the check-run pull_requests[].head.repo
+// minimal {id,url,name} repo, gated by its api url).
+func TestR21_ScrubUrlTerminalMidArray(t *testing.T) {
+	loc := []string{"$.pull_requests[].head.*repo.url", "$.pull_requests[].base.*repo.url"}
+	body := `{"id":1,"pull_requests":[` +
+		`{"number":7,"head":{"ref":"f","repo":{"id":9,"name":"fork","url":"https://api.github.com/repos/victim/secretfork"}},` +
+		`"base":{"ref":"main","repo":{"id":2,"name":"app","url":"https://api.github.com/repos/acme/app"}}}]}`
+	out, ok := Scrub([]byte(body), loc, func(r string) bool { return r != "victim/secretfork" })
+	if !ok {
+		t.Fatal("Scrub not-ok")
+	}
+	s := string(out)
+	if strings.Contains(s, "victim/secretfork") || strings.Contains(s, "secretfork") {
+		t.Fatalf("denied fork head.repo (via url) not scrubbed: %s", s)
+	}
+	if !strings.Contains(s, "acme/app") {
+		t.Fatalf("allowed base.repo wrongly scrubbed: %s", s)
+	}
+}
+
+// Round-21: ScrubDeniedContent nulls a content field carrying a denied repo, keeps one with an allowed
+// repo, and keeps a repo-less item (a draft) — null-on-DENIED, not fail-closed.
+func TestR21_ContentScrubNullOnDenied(t *testing.T) {
+	deny := func(r string) bool { return r != "victim/secret" }
+	cases := []struct {
+		name, body string
+		nulled     bool
+	}{
+		{"denied", `{"id":1,"content":{"title":"SECRET","repository":{"full_name":"victim/secret"}}}`, true},
+		{"allowed", `{"id":1,"content":{"title":"OK","repository":{"full_name":"acme/pub"}}}`, false},
+		{"draft (no repo)", `{"id":1,"content":{"title":"DRAFT","body":"d"}}`, false},
+	}
+	for _, c := range cases {
+		out, ok := ScrubDeniedContent([]byte(c.body), []string{"content"}, deny)
+		if !ok {
+			t.Fatalf("%s: not-ok", c.name)
+		}
+		hasContent := strings.Contains(string(out), `"content":{`)
+		if c.nulled && hasContent {
+			t.Fatalf("%s: denied content not nulled: %s", c.name, out)
+		}
+		if !c.nulled && !hasContent {
+			t.Fatalf("%s: non-denied content wrongly nulled: %s", c.name, out)
+		}
+	}
+}

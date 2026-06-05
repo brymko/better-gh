@@ -302,6 +302,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// analysis's not_found_repos.repository_full_names) — dropped by a hand-maintained table so a
 		// denied repo's NAME doesn't leak (round-19 F4).
 		strArrayLocs := restfilter.StringArrayLocations(norm)
+		// Denied-content scrub: a few responses embed a full content object (a projectsV2 item's linked
+		// issue/PR) from another repo the client referenced by node id; null it when its repo is denied,
+		// so it can't be a REST sidedoor around the node(id:) content-read block (round-21).
+		contentScrubFields := restfilter.ContentScrubFields(norm)
 		// Gate each repo-bearing entry by BOTH the repo's own `metadata` access AND the enumerated
 		// endpoint's resource, NOT the lenient CanReadAnything. Two complementary leaks:
 		//   (a) base=none + a per-resource carve-out (permissions={issues="read"}) must NOT surface:
@@ -328,9 +332,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		canRead := canReadFor(enumResource)
 		switch {
-		case dec == restfilter.NeedsFilter || len(scrubLocs) > 0 || len(strArrayLocs) > 0:
+		case dec == restfilter.NeedsFilter || len(scrubLocs) > 0 || len(strArrayLocs) > 0 || len(contentScrubFields) > 0:
 			// Redact denied enum entries (drop), scrub embedded foreign cross-ref content (null in
-			// place), and drop denied bare-string repo names; all fail closed on an unparseable body.
+			// place), drop denied bare-string repo names, null denied linked content; all fail closed on
+			// an unparseable body.
 			respFilter = func(resp []byte) ([]byte, bool) {
 				out := resp
 				if dec == restfilter.NeedsFilter {
@@ -348,6 +353,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if len(strArrayLocs) > 0 {
 					var ok bool
 					if out, ok = restfilter.DropRepoStrings(out, strArrayLocs, canRead); !ok {
+						return nil, false
+					}
+				}
+				if len(contentScrubFields) > 0 {
+					var ok bool
+					if out, ok = restfilter.ScrubDeniedContent(out, contentScrubFields, canRead); !ok {
 						return nil, false
 					}
 				}
@@ -407,9 +418,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// scrub merely nulls the foreign sub-object, keeping the authorized write result. (GraphQL writes
 	// already have respFilter set and are skipped by the respFilter==nil guard.)
 	if respFilter == nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
-		if wlocs := restfilter.WriteScrubLocations(norm); len(wlocs) > 0 {
+		wlocs := restfilter.WriteScrubLocations(norm)
+		// A write response can also embed a full content object (a projectsV2 item's linked issue/PR)
+		// from a repo the client referenced by node id — null it when denied (round-21).
+		cfields := restfilter.ContentScrubFields(norm)
+		if len(wlocs) > 0 || len(cfields) > 0 {
 			canRead := canReadFor(classified.Resource)
-			respFilter = func(resp []byte) ([]byte, bool) { return restfilter.Scrub(resp, wlocs, canRead) }
+			respFilter = func(resp []byte) ([]byte, bool) {
+				out := resp
+				if len(wlocs) > 0 {
+					var ok bool
+					if out, ok = restfilter.Scrub(out, wlocs, canRead); !ok {
+						return nil, false
+					}
+				}
+				if len(cfields) > 0 {
+					var ok bool
+					if out, ok = restfilter.ScrubDeniedContent(out, cfields, canRead); !ok {
+						return nil, false
+					}
+				}
+				return out, true
+			}
 		}
 	}
 

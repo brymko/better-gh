@@ -224,3 +224,87 @@ func TestSec_R21_PathScopedContentFeedGates(t *testing.T) {
 		})
 	}
 }
+
+// Round-21 (surfaced by the spec-coverage test): a check-run's pull_requests[].head.repo (a minimal
+// {id,url,name} repo of a fork PR) must be scrubbed via its url when the fork is denied.
+func TestSec_R21_CheckRunForkScrub(t *testing.T) {
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Repo:     []policy.RepoRule{{Name: "acme/app", Access: policy.AccessRead}},
+	}
+	body := `{"id":1,"pull_requests":[{"number":7,` +
+		`"head":{"ref":"f","repo":{"id":9,"name":"fork","url":"https://api.github.com/repos/victim/secretfork"}},` +
+		`"base":{"ref":"main","repo":{"id":2,"name":"app","url":"https://api.github.com/repos/acme/app"}}}]}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}))
+	t.Cleanup(upstream.Close)
+	h := r15Handler(t, pol, upstream.URL)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL + "/repos/acme/app/check-runs/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if s := string(b); strings.Contains(s, "secretfork") {
+		t.Fatalf("check-run leaked a denied fork's head.repo: %s", s)
+	}
+}
+
+// Round-21: a codespace WRITE response (PATCH) exposes `repository` (the codespace's repo) which the
+// write path doesn't redact — null it when the repo is denied (a user-write + per-repo-none bypass).
+func TestSec_R21_CodespaceWriteRepoScrub(t *testing.T) {
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny, Unscoped: map[string]policy.Access{"user": policy.AccessReadWrite}},
+		Repo:     []policy.RepoRule{{Name: "victim/secret", Access: policy.AccessNone}},
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"name":"cs1","repository":{"full_name":"victim/secret","private":true,"description":"SECRET_DESC"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	h := r15Handler(t, pol, upstream.URL)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	req, _ := http.NewRequest(http.MethodPatch, srv.URL+"/user/codespaces/cs1", strings.NewReader(`{}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if s := string(b); strings.Contains(s, "victim/secret") || strings.Contains(s, "SECRET_DESC") {
+		t.Fatalf("codespace write leaked the denied repository: %s", s)
+	}
+}
+
+// Round-21: adding a denied repo's issue to a project (POST projectsV2 items) must null the linked
+// `content` — a REST sidedoor around the node(id:) content-read block.
+func TestSec_R21_ProjectItemContentScrub(t *testing.T) {
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Org:      []policy.OrgRule{{Name: "acme", Access: policy.AccessReadWrite}},
+		Repo:     []policy.RepoRule{{Name: "victim/secret", Access: policy.AccessNone}},
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":5,"content":{"title":"SECRET_ISSUE","body":"sb","repository":{"full_name":"victim/secret"}}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	h := r15Handler(t, pol, upstream.URL)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/orgs/acme/projectsV2/1/items", strings.NewReader(`{"content_id":1,"content_type":"Issue"}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if s := string(b); strings.Contains(s, "SECRET_ISSUE") || strings.Contains(s, "victim/secret") {
+		t.Fatalf("project-item-add leaked a denied repo's issue content: %s", s)
+	}
+}
