@@ -26,10 +26,11 @@ type Record struct {
 }
 
 type Store struct {
-	path     string
-	mu       sync.RWMutex
-	rec      Record
-	fallback string // custodian used before the owner is claimed (e.g. BGH_GITHUB_TOKEN)
+	path          string
+	mu            sync.RWMutex
+	rec           Record
+	fallback      string // custodian used before the owner is claimed (e.g. BGH_GITHUB_TOKEN)
+	fallbackLogin string // GitHub login that owns `fallback`, resolved before the first claim
 }
 
 // Open loads the owner record from path if it exists. fallbackToken is returned by Token()
@@ -64,6 +65,28 @@ func (s *Store) Token() string {
 	return s.fallback
 }
 
+// HasFallback reports whether a pre-seeded custodian token is configured (so an unclaimed
+// deployment is already serving traffic under it).
+func (s *Store) HasFallback() bool { s.mu.RLock(); defer s.mu.RUnlock(); return s.fallback != "" }
+
+// FallbackOwner is the GitHub login bound to the pre-seeded custodian, or "" if not yet
+// resolved. The sign-in path resolves it (viewer{login} of the fallback token) before the
+// first claim so a pre-seeded deployment can be claimed only by its own custodian's account.
+func (s *Store) FallbackOwner() string { s.mu.RLock(); defer s.mu.RUnlock(); return s.fallbackLogin }
+
+// SetFallbackOwner records the GitHub login that owns the pre-seeded custodian token. It is
+// idempotent (later calls with the same value are no-ops) and locks the TOFU claim to that
+// identity: with a fallback configured, only this login may claim the deployment.
+func (s *Store) SetFallbackOwner(login string) {
+	login = strings.TrimSpace(login)
+	if login == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fallbackLogin = login
+}
+
 // SignIn applies a completed GitHub sign-in (login + token). The first call claims the
 // deployment for login (TOFU); later calls must match that login and refresh the captured
 // token. Returns whether this call claimed the deployment and whether it was accepted; ok is
@@ -76,27 +99,44 @@ func (s *Store) SignIn(login, token string) (claimed, ok bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
+	var candidate Record
 	switch {
 	case s.rec.Login == "":
-		s.rec = Record{Login: login, Token: token, ClaimedAt: now, UpdatedAt: now}
+		// Unclaimed (TOFU). If a fallback custodian is configured, the deployment may be
+		// claimed ONLY by that custodian's own GitHub identity — otherwise the first
+		// network-reachable stranger could claim a pre-seeded deployment and swap the
+		// custodian (round-18 G). Fail closed if the fallback's owner has not been resolved
+		// yet (the sign-in path resolves it before calling SignIn): an unverified fallback
+		// must not be claimable. With no fallback, this is the documented open TOFU bootstrap.
+		if s.fallback != "" {
+			if s.fallbackLogin == "" || !strings.EqualFold(s.fallbackLogin, login) {
+				return false, false, nil
+			}
+		}
+		candidate = Record{Login: login, Token: token, ClaimedAt: now, UpdatedAt: now}
 		claimed = true
 	case strings.EqualFold(s.rec.Login, login):
-		s.rec.Token = token
-		s.rec.UpdatedAt = now
+		candidate = s.rec
+		candidate.Token = token
+		candidate.UpdatedAt = now
 	default:
 		return false, false, nil // not the owner of this deployment
 	}
-	if perr := s.persist(); perr != nil {
+	// Persist BEFORE mutating the in-memory record: a persist failure must leave the live
+	// owner/custodian state untouched (a failed first claim must not silently claim ownership
+	// or swap the custodian in memory while disk says otherwise — round-18 I).
+	if perr := s.persistRecord(candidate); perr != nil {
 		return claimed, false, perr
 	}
+	s.rec = candidate
 	return claimed, true, nil
 }
 
-func (s *Store) persist() error {
+func (s *Store) persistRecord(rec Record) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(s.rec, "", "  ")
+	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return err
 	}

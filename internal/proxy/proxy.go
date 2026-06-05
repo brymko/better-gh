@@ -278,21 +278,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Scrub nulls just the cross-ref sub-object per element when its repo is denied (audit F2).
 		scrubLocs := restfilter.ScrubLocations(norm)
 		p := pol
-		// Gate each repo-bearing entry by the repo's own `metadata` access, NOT the lenient
-		// CanReadAnything. A repo configured access="none" with a per-resource carve-out (e.g.
-		// permissions={issues="read"}) must NOT surface in an org/user enumeration: its metadata
-		// object, its dependabot/code-scanning/secret-scanning alerts, packages, codespaces, etc. are
-		// denied on the DIRECT path (GET /repos/{o}/{r}* → "metadata"/resource → deny) and stripped by
-		// the GraphQL KeepShell gate, so the REST enum/search/singleton path must drop them too.
-		// CanReadAnything returned true for any non-none per-resource grant, leaking exactly that data
-		// (round-15). A fully-denied repo (no matching rule under mode=deny) still evaluates to deny →
-		// dropped, as before; a base=read repo still passes.
+		// Gate each repo-bearing entry by BOTH the repo's own `metadata` access AND the enumerated
+		// endpoint's resource, NOT the lenient CanReadAnything. Two complementary leaks:
+		//   (a) base=none + a per-resource carve-out (permissions={issues="read"}) must NOT surface:
+		//       its metadata is denied on the DIRECT path, so the enum/search/singleton path must drop
+		//       it too. The `metadata` check covers this — CanReadAnything wrongly kept it (round-15).
+		//   (b) base=read + a per-resource DENY of THIS endpoint's resource (permissions={issues="none"})
+		//       must NOT surface either: GET /repos/{o}/{r}/issues is 403 (resource "issues" → deny), so
+		//       the org/user-wide GET /orgs/{org}/issues enumeration must drop that repo's issues too.
+		//       The `metadata`-only gate kept it (base=read passes metadata), leaking exactly the
+		//       title/body issues=none was meant to hide. ANDing the endpoint's resource (classified
+		//       .Resource — the per-repo resource the DIRECT path would gate on: "issues" for the issues
+		//       feeds, the org segment otherwise) closes it. For endpoints whose resource is "metadata"
+		//       or an unmapped/ResourceUnknown segment (most alert/package/codespace feeds), the resource
+		//       check degenerates to the base grant — identical to metadata — so this never over-denies.
+		// A fully-denied repo (no matching rule under mode=deny) still evaluates to deny → dropped.
+		enumResource := classified.Resource
 		canRead := func(repo string) bool {
 			owner := repo
 			if i := strings.IndexByte(repo, '/'); i > 0 {
 				owner = repo[:i]
 			}
-			return p.Evaluate(repo, owner, classifier.Read, "metadata", "").Allowed
+			if !p.Evaluate(repo, owner, classifier.Read, "metadata", "").Allowed {
+				return false
+			}
+			return p.Evaluate(repo, owner, classifier.Read, enumResource, "").Allowed
 		}
 		switch {
 		case dec == restfilter.NeedsFilter || len(scrubLocs) > 0:
@@ -692,6 +702,13 @@ func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[stri
 			// a surviving variant of the round-12 H1/H5 + round-15 drift-deny work — both coverage
 			// invariants passed with it present). We cannot prove the repository, so fail closed.
 			out[id] = nodeRes{kind: nodeDeny}
+		} else if typename != "" && h.GQLFilter != nil && h.GQLFilter.IsRepoIdentityUnattributableType(typename) {
+			// A known node type that exposes a repository identity (nameWithOwner) directly as a
+			// scalar but resolved to no Repository object — the enterprise/migration namespace types
+			// EnterpriseRepositoryInfo/UserNamespaceRepository/RepositoryMigration. The response
+			// filter does not tag them (not repo-scoped), so treating them as constraint-free would
+			// leak a denied repo's name/visibility under default=allow. Fail closed (round-18 H).
+			out[id] = nodeRes{kind: nodeDeny}
 		} else if typename != "" && h.GQLFilter != nil && !h.GQLFilter.IsKnownNodeObjectType(typename) {
 			// A non-null node whose runtime __typename this embedded schema does NOT recognize as a
 			// Node object type → live schema drift (GitHub's schema is ahead of the snapshot). The
@@ -1009,13 +1026,21 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 // strippedResponseHeaders are upstream response headers never forwarded to the client.
 // Transfer-Encoding/Content-Encoding are managed by our transport (bodies arrive decoded);
 // the X-OAuth-* headers reveal the custodian token's scopes and OAuth client id, which a
-// proxy-token holder must not learn (the proxy exists to hide that token's reach).
+// proxy-token holder must not learn (the proxy exists to hide that token's reach). X-GitHub-SSO
+// (canonicalized to "X-Github-Sso") reveals the SAML-SSO organization IDs the custodian token is
+// authorized for — the same custodian-reach class as X-OAuth-* — so it is stripped too. Set-Cookie
+// is never relayed: the proxy is not a cookie-session service and must not forward upstream cookies.
+// This is a denylist, not an allowlist: keeping the broad set of benign GitHub headers (ETag, Link,
+// X-RateLimit-*, X-GitHub-Request-Id, Retry-After, …) that clients depend on, at the cost of
+// requiring any new custodian-revealing header GitHub introduces to be added here.
 var strippedResponseHeaders = map[string]bool{
 	"Transfer-Encoding":       true,
 	"Content-Encoding":        true,
 	"X-Oauth-Scopes":          true,
 	"X-Accepted-Oauth-Scopes": true,
 	"X-Oauth-Client-Id":       true,
+	"X-Github-Sso":            true,
+	"Set-Cookie":              true,
 }
 
 func copyResponseHeaders(dst, src http.Header, stripContentLength bool) {

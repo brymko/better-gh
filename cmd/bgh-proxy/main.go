@@ -101,7 +101,7 @@ Unscoped categories: user, search, gists, notifications, events, meta
 
 func cmdInit() error {
 	dir := config.DefaultDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := config.EnsureDir(dir); err != nil {
 		return err
 	}
 
@@ -232,7 +232,7 @@ func cmdLogin(args []string) error {
 	}
 
 	path := config.GithubTokenFilePath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := config.EnsureDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	if err := os.WriteFile(path, []byte(token), 0o600); err != nil {
@@ -246,6 +246,12 @@ func cmdServe(configPath string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
+	}
+
+	// Tighten the config/secret dir to 0700 before any component writes secrets into it,
+	// even if it pre-exists with a looser mode (round-18 J).
+	if err := config.EnsureDir(config.DefaultDir()); err != nil {
+		return fmt.Errorf("securing config directory: %w", err)
 	}
 
 	storePath := filepath.Join(config.DefaultDir(), "tokens.json")
@@ -393,6 +399,7 @@ func cmdServe(configPath string) error {
 		loginHandler := loginflow.NewHandler(&loginflow.Handler{
 			Store:         tokenStore,
 			Owner:         ownerStore,
+			FallbackToken: cfg.GithubToken,
 			OAuthClientID: oauthClientID,
 			OAuthScopes:   cfg.OAuthScopes,
 			HTTPClient:    &http.Client{Timeout: 30 * time.Second},

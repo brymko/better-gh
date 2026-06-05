@@ -31,6 +31,20 @@ if [ -z "$NAME" ]; then
     exit 1
 fi
 
+# Refuse to expose an UNCLAIMED deployment. Ownership is trust-on-first-use: the moment the
+# tailnet can reach the /ui + /login IdP, the FIRST GitHub user to sign in claims the deployment
+# and can mint tokens (round-18). Claim it first over loopback, or pre-seed a custodian, so the
+# exposed listener is already owned. (A pre-seeded custodian is now bound to its own GitHub
+# identity, so only that account can claim — but still claim before exposing for defence in depth.)
+CFGDIR="${BGH_CONFIG_DIR:-$HOME/.config/bgh}"
+if [ ! -f "$CFGDIR/owner.json" ] && [ -z "${BGH_GITHUB_TOKEN:-}" ] && [ ! -f "$CFGDIR/github-token" ]; then
+    echo "refusing to expose an UNCLAIMED deployment (no owner.json, no custodian token)." >&2
+    echo "  Claim it first over loopback:  open https://127.0.0.1:$PORT/ui" >&2
+    echo "  (or 'gh auth login --hostname 127.0.0.1:$PORT'), or pre-seed BGH_GITHUB_TOKEN, then re-run." >&2
+    echo "  Override (NOT recommended): BGH_ALLOW_UNCLAIMED=1 $0 $PORT $NAME" >&2
+    [ "${BGH_ALLOW_UNCLAIMED:-}" = "1" ] || exit 1
+fi
+
 echo "Fronting 127.0.0.1:$PORT as https://$NAME"
 if ! tailscale serve --bg "https+insecure://127.0.0.1:$PORT" 2>serve.err; then
     echo "tailscale serve failed:" >&2

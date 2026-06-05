@@ -41,6 +41,7 @@ var uiPage []byte
 type Handler struct {
 	Store         *store.Store
 	Owner         *owner.Store // TOFU owner; sign-in claims/refreshes the captured custodian token
+	FallbackToken string       // pre-seeded custodian (cfg.GithubToken); binds the TOFU claim to its owner
 	OAuthClientID string       // gh's public app id; no registration needed
 	OAuthScopes   string       // scopes captured as the custodian (default "repo read:org gist workflow")
 	GitHubBaseURL string       // device-flow base; default https://github.com (overridden in tests)
@@ -274,6 +275,19 @@ func (h *Handler) runGitHubAuth(grantID string) (userCode, verification string, 
 			h.denyGrant(grantID, "could not read your GitHub identity")
 			slog.Info("loginflow: could not read GitHub identity", "grant", grantID, "err", rerr)
 			return
+		}
+		// With a pre-seeded fallback custodian, only that custodian's own GitHub account may
+		// claim an unclaimed deployment. Resolve the fallback's identity once and bind the TOFU
+		// claim to it, so a stranger who reaches this IdP cannot claim a pre-seeded deployment
+		// and swap the custodian (round-18 G). owner.SignIn fails closed if this is unresolved.
+		if !h.Owner.Claimed() && h.Owner.HasFallback() && h.Owner.FallbackOwner() == "" {
+			fbLogin, ferr := h.resolveLogin(ctx, h.FallbackToken)
+			if ferr != nil {
+				h.denyGrant(grantID, "could not verify the pre-seeded custodian's identity; try again")
+				slog.Info("loginflow: could not resolve fallback custodian identity", "grant", grantID, "err", ferr)
+				return
+			}
+			h.Owner.SetFallbackOwner(fbLogin)
 		}
 		if _, ok, serr := h.Owner.SignIn(who, token); serr != nil {
 			h.denyGrant(grantID, "could not record the sign-in")

@@ -86,6 +86,42 @@ func implementsInterface(def *ast.Definition, iface string) bool {
 	return false
 }
 
+// TestR18_RepoOwnedCategoryCoverageInvariant is the PERMANENT guard against the round-18 bug class:
+// a concrete OBJECT type whose @docsCategory is an unambiguously repo-owned category (issues/pulls/
+// commits/contents/checks/…) that is NEITHER repoScoped NOR repoOwnedNoPath would receive no marker
+// in augment() and leak under a per-resource `none` (e.g. Submodule under contents="none"). Every
+// such type MUST be covered by one of the two marker mechanisms. A schema refresh that introduces an
+// uncovered repo-owned type fails the build here instead of silently fail-opening.
+func TestR18_RepoOwnedCategoryCoverageInvariant(t *testing.T) {
+	s, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failures []string
+	for name, def := range s.schema.Types {
+		if def.Kind != ast.Object {
+			continue
+		}
+		d := def.Directives.ForName("docsCategory")
+		if d == nil {
+			continue
+		}
+		arg := d.Arguments.ForName("name")
+		if arg == nil || arg.Value == nil || !repoOwnedCategories[arg.Value.Raw] {
+			continue
+		}
+		if !s.repoScoped[name] && !s.repoOwnedNoPath[name] {
+			failures = append(failures, name+" (@docsCategory "+arg.Value.Raw+")")
+		}
+	}
+	if len(failures) > 0 {
+		sort.Strings(failures)
+		t.Fatalf("repo-owned-category OBJECT types covered by NEITHER repoScoped NOR repoOwnedNoPath "+
+			"(they would leak under a per-resource `none` — fix deriveRepoPaths/deriveRepoOwnedNoPath):\n  %s",
+			strings.Join(failures, "\n  "))
+	}
+}
+
 func hasOwnRepositoryField(def *ast.Definition) bool {
 	for _, f := range def.Fields {
 		if f.Name == "repository" && len(f.Arguments) == 0 && f.Type.Elem == nil && f.Type.Name() == "Repository" {

@@ -247,7 +247,7 @@ func classifyGraphQL(body []byte) Result {
 		escapes := false
 		navTooComplex := false
 		for _, op := range ops {
-			scanCrossRepoNav(op.SelectionSet, doc.Fragments, gqlCrossRepoNavFields, &escapes, 0, &navTooComplex)
+			scanCrossRepoNav(op.SelectionSet, doc.Fragments, gqlCrossRepoNavFields, &escapes, map[string]bool{}, 0, &navTooComplex)
 		}
 		if navTooComplex {
 			return Result{Access: Write}
@@ -270,7 +270,7 @@ func classifyGraphQL(body []byte) Result {
 	tooComplex := false
 	escapes := false
 	for _, op := range ops {
-		collectGraphQLScopes(op.SelectionSet, doc.Fragments, vars, add, 0, &tooComplex, &escapes)
+		collectGraphQLScopes(op.SelectionSet, doc.Fragments, vars, add, map[string]bool{}, 0, &tooComplex, &escapes)
 	}
 	if tooComplex {
 		// A query too deep/cyclic to fully walk could hide a denied scope past the
@@ -364,7 +364,7 @@ func isScopeField(name string) bool {
 func gqlRepoResources(repoField *ast.Field, fragments ast.FragmentDefinitionList) []string {
 	set := map[string]struct{}{}
 	baseGoverned := false
-	collectRepoResources(repoField.SelectionSet, fragments, set, &baseGoverned, 0)
+	collectRepoResources(repoField.SelectionSet, fragments, set, &baseGoverned, map[string]bool{}, 0)
 	if len(set) == 0 {
 		return []string{"metadata"}
 	}
@@ -385,7 +385,7 @@ func gqlRepoResources(repoField *ast.Field, fragments ast.FragmentDefinitionList
 // nested under it). The depth bound is the cyclic-fragment guard; on exceed it sets
 // baseGoverned (require the rule's base access) and stops — fail closed, never silently
 // drop a resource.
-func collectRepoResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, depth int) {
+func collectRepoResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, seenFrags map[string]bool, depth int) {
 	if depth > maxGraphQLDepth {
 		*baseGoverned = true
 		return
@@ -399,10 +399,14 @@ func collectRepoResources(sels ast.SelectionSet, fragments ast.FragmentDefinitio
 				*baseGoverned = true // metadata or any unmapped field → rule's base access
 			}
 		case *ast.InlineFragment:
-			collectRepoResources(s.SelectionSet, fragments, set, baseGoverned, depth+1)
+			collectRepoResources(s.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1)
 		case *ast.FragmentSpread:
+			if seenFrags[s.Name] {
+				continue // already expanded this fragment in this walk; re-expansion is redundant
+			}
 			if frag := fragments.ForName(s.Name); frag != nil {
-				collectRepoResources(frag.SelectionSet, fragments, set, baseGoverned, depth+1)
+				seenFrags[s.Name] = true
+				collectRepoResources(frag.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1)
 			} else {
 				*baseGoverned = true // unresolvable spread → can't see its fields → require base
 			}
@@ -475,7 +479,7 @@ var gqlForkNavFields = map[string]bool{
 // scanCrossRepoNav reports (via *escapes) whether a selection subtree navigates to a
 // repository outside the entry scope, using the given field denylist. It is run on the
 // children of a resolved scope, which are otherwise not policy-checked.
-func scanCrossRepoNav(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, fields map[string]bool, escapes *bool, depth int, tooComplex *bool) {
+func scanCrossRepoNav(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, fields map[string]bool, escapes *bool, seenFrags map[string]bool, depth int, tooComplex *bool) {
 	if *escapes {
 		return
 	}
@@ -490,12 +494,16 @@ func scanCrossRepoNav(sels ast.SelectionSet, fragments ast.FragmentDefinitionLis
 				*escapes = true
 				return
 			}
-			scanCrossRepoNav(s.SelectionSet, fragments, fields, escapes, depth+1, tooComplex)
+			scanCrossRepoNav(s.SelectionSet, fragments, fields, escapes, seenFrags, depth+1, tooComplex)
 		case *ast.InlineFragment:
-			scanCrossRepoNav(s.SelectionSet, fragments, fields, escapes, depth+1, tooComplex)
+			scanCrossRepoNav(s.SelectionSet, fragments, fields, escapes, seenFrags, depth+1, tooComplex)
 		case *ast.FragmentSpread:
+			if seenFrags[s.Name] {
+				continue // each fragment scanned once per walk: re-scan is redundant (escapes is monotonic)
+			}
 			if frag := fragments.ForName(s.Name); frag != nil {
-				scanCrossRepoNav(frag.SelectionSet, fragments, fields, escapes, depth+1, tooComplex)
+				seenFrags[s.Name] = true
+				scanCrossRepoNav(frag.SelectionSet, fragments, fields, escapes, seenFrags, depth+1, tooComplex)
 			}
 		}
 	}
@@ -506,7 +514,7 @@ func scanCrossRepoNav(sels ast.SelectionSet, fragments ast.FragmentDefinitionLis
 // resolved repository/search field is not descended into for scope collection (its
 // resource is captured by gqlRepoResource), but its subtree IS scanned for cross-repo
 // navigation, which would otherwise reach repos the entry scope doesn't cover.
-func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(Scope), depth int, tooComplex *bool, escapes *bool) {
+func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(Scope), seenFrags map[string]bool, depth int, tooComplex *bool, escapes *bool) {
 	if *tooComplex || *escapes {
 		return
 	}
@@ -527,7 +535,7 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					for _, res := range gqlRepoResources(s, fragments) {
 						add(Scope{Owner: owner, Repo: name, Resource: res})
 					}
-					scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, depth+1, tooComplex)
+					scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex)
 					continue
 				}
 			case "organization", "repositoryOwner", "user":
@@ -540,7 +548,7 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					add(Scope{Org: login})
 					// Enumerating this owner's own repos/orgs is allowed; reaching forks/
 					// parents in other owners is not.
-					scanCrossRepoNav(s.SelectionSet, fragments, gqlForkNavFields, escapes, depth+1, tooComplex)
+					scanCrossRepoNav(s.SelectionSet, fragments, gqlForkNavFields, escapes, map[string]bool{}, depth+1, tooComplex)
 					continue
 				}
 			case "search":
@@ -554,7 +562,7 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					add(Scope{UnscopedCategory: "search"})
 				}
 				// Result nodes can navigate off to other repos just like repository().
-				scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, depth+1, tooComplex)
+				scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex)
 				continue
 			case "viewer":
 				add(Scope{UnscopedCategory: "user"})
@@ -571,17 +579,21 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 			case "node", "nodes":
 				// Addressed by node ID (resolved + policy-checked by the proxy); scan
 				// the selection so navigation off the node also fails closed.
-				scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, depth+1, tooComplex)
+				scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex)
 				continue
 			}
 			if len(s.SelectionSet) > 0 {
-				collectGraphQLScopes(s.SelectionSet, fragments, vars, add, depth+1, tooComplex, escapes)
+				collectGraphQLScopes(s.SelectionSet, fragments, vars, add, seenFrags, depth+1, tooComplex, escapes)
 			}
 		case *ast.InlineFragment:
-			collectGraphQLScopes(s.SelectionSet, fragments, vars, add, depth+1, tooComplex, escapes)
+			collectGraphQLScopes(s.SelectionSet, fragments, vars, add, seenFrags, depth+1, tooComplex, escapes)
 		case *ast.FragmentSpread:
+			if seenFrags[s.Name] {
+				continue // expand each fragment once per walk: scopes are deduped, escapes monotonic
+			}
 			if frag := fragments.ForName(s.Name); frag != nil {
-				collectGraphQLScopes(frag.SelectionSet, fragments, vars, add, depth+1, tooComplex, escapes)
+				seenFrags[s.Name] = true
+				collectGraphQLScopes(frag.SelectionSet, fragments, vars, add, seenFrags, depth+1, tooComplex, escapes)
 			}
 		}
 	}
@@ -699,7 +711,7 @@ func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionLi
 		// Only mutations carry per-resource writes; for a mutation the operation's direct
 		// (and top-level-fragment) fields are root mutation fields whose name maps to a
 		// resource. Reads pass atRoot=false so every node maps to "".
-		walkSelectionArgs(op.SelectionSet, fragments, vars, add, addScope, op.Operation == ast.Mutation, "", 0, &tooComplex)
+		walkSelectionArgs(op.SelectionSet, fragments, vars, add, addScope, op.Operation == ast.Mutation, "", map[string]bool{}, 0, &tooComplex)
 	}
 	// Variables not bound to any walked argument: collected defensively with no resource.
 	walkVarsForIDs("", vars, func(id string) { add(id, "") }, addScope, 0, &tooComplex)
@@ -717,7 +729,7 @@ func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionLi
 // would otherwise never be resolved or policy-checked. atRoot is true while iterating root
 // mutation fields (preserved across top-level fragments); a root field's name fixes the
 // resource for its whole subtree. The depth bound doubles as the cyclic-fragment guard.
-func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(id, resource string), addScope func(owner, repo, resource string), atRoot bool, resource string, depth int, tooComplex *bool) {
+func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(id, resource string), addScope func(owner, repo, resource string), atRoot bool, resource string, seenFrags map[string]bool, depth int, tooComplex *bool) {
 	if *tooComplex {
 		return
 	}
@@ -736,13 +748,17 @@ func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionLi
 				walkArgValue(arg.Name, arg.Value, vars, add, addScope, res, depth+1, tooComplex)
 			}
 			if len(s.SelectionSet) > 0 {
-				walkSelectionArgs(s.SelectionSet, fragments, vars, add, addScope, false, res, depth+1, tooComplex)
+				walkSelectionArgs(s.SelectionSet, fragments, vars, add, addScope, false, res, seenFrags, depth+1, tooComplex)
 			}
 		case *ast.InlineFragment:
-			walkSelectionArgs(s.SelectionSet, fragments, vars, add, addScope, atRoot, resource, depth+1, tooComplex)
+			walkSelectionArgs(s.SelectionSet, fragments, vars, add, addScope, atRoot, resource, seenFrags, depth+1, tooComplex)
 		case *ast.FragmentSpread:
+			if seenFrags[s.Name] {
+				continue // expand each fragment once per walk: node IDs are deduped
+			}
 			if frag := fragments.ForName(s.Name); frag != nil {
-				walkSelectionArgs(frag.SelectionSet, fragments, vars, add, addScope, atRoot, resource, depth+1, tooComplex)
+				seenFrags[s.Name] = true
+				walkSelectionArgs(frag.SelectionSet, fragments, vars, add, addScope, atRoot, resource, seenFrags, depth+1, tooComplex)
 			}
 		}
 	}
@@ -890,16 +906,22 @@ func compareForkScopes(segments []string) []Scope {
 	seen := map[string]bool{}
 	var out []Scope
 	for _, side := range splitBasehead(basehead) {
-		fo := forkOwner(side)
-		if fo == "" || strings.EqualFold(fo, owner) {
+		fo, fr := forkTarget(side, repo)
+		if fo == "" {
+			continue // bare ref → lives in the path repo, already scoped
+		}
+		// Skip ONLY the exact path repo. A side that names the path OWNER but a DIFFERENT repo
+		// (the documented owner:repo:ref form) must still be scoped — otherwise a same-owner
+		// triple-colon compare leaks a denied repo's commits/patches (round-18 C).
+		if strings.EqualFold(fo, owner) && strings.EqualFold(fr, repo) {
 			continue
 		}
-		key := strings.ToLower(fo)
+		key := strings.ToLower(fo) + "/" + strings.ToLower(fr)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		out = append(out, Scope{Owner: fo, Repo: repo, Resource: "commits"})
+		out = append(out, Scope{Owner: fo, Repo: fr, Resource: "commits"})
 	}
 	return out
 }
@@ -917,14 +939,29 @@ func splitBasehead(basehead string) []string {
 	return []string{basehead}
 }
 
-// forkOwner returns the fork owner of a compare side written as "owner:ref", or "" when the side is
-// a bare ref (which lives in the path repo). A git ref cannot contain ':', so the owner is the part
-// before the first ':'.
-func forkOwner(side string) string {
-	if i := strings.IndexByte(side, ':'); i > 0 {
-		return side[:i]
+// forkTarget parses a compare basehead side into its (owner, repo). GitHub accepts three side forms:
+//   - a bare ref ("main") → ("", "") — it lives in the path repo, already scoped;
+//   - "owner:ref" → a same-network fork that SHARES the path repo name → (owner, pathRepo);
+//   - "owner:repo:ref" → an EXPLICIT, possibly different-named repository (GitHub docs: "octocat:
+//     awesome-app:main would use the main branch in the octocat/awesome-app repository").
+//
+// A git ref cannot contain ':', and a repo name contains neither ':' nor '/', so fields are
+// colon-delimited from the left and the middle field (if slash-free) is the repo name. Before
+// round-18 this returned only the owner and the caller always scoped the PATH repo name, so a
+// triple-colon side naming a different repo was mis-scoped or (same owner) dropped → leak.
+func forkTarget(side, pathRepo string) (owner, repo string) {
+	i := strings.IndexByte(side, ':')
+	if i <= 0 {
+		return "", "" // bare ref → path repo
 	}
-	return ""
+	owner = side[:i]
+	rest := side[i+1:]
+	if j := strings.IndexByte(rest, ':'); j > 0 {
+		if mid := rest[:j]; mid != "" && !strings.Contains(mid, "/") {
+			return owner, mid // owner:repo:ref
+		}
+	}
+	return owner, pathRepo // owner:ref → shares the path repo name
 }
 
 var restResourceMap = map[string]string{
@@ -1102,6 +1139,15 @@ func gqlMutationResource(name string) string {
 	}
 	if strings.Contains(name, "Release") {
 		return "releases"
+	}
+	// approveDeployments / rejectDeployments act on a workflow run's PENDING deployments
+	// (input workflowRunId: WorkflowRun) — the GraphQL equivalent of POST /repos/{o}/{r}/
+	// actions/runs/{run_id}/pending_deployments, which REST classifies as "actions". They
+	// contain "Deployment" so without this they would map to "deployments", letting an
+	// actions="none" token un-gate a protected environment via GraphQL (round-18 E). Keep
+	// them on "actions" so the REST and GraphQL surfaces enforce the same key.
+	if name == "approveDeployments" || name == "rejectDeployments" {
+		return "actions"
 	}
 	if strings.Contains(name, "Deployment") {
 		return "deployments"

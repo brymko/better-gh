@@ -98,15 +98,25 @@ func TestSec_GraphQLRecursionBoundedNoCrash(t *testing.T) {
 	deep.WriteString(`"}`)
 
 	for _, body := range [][]byte{cyclic, []byte(deep.String())} {
-		// Must not crash. An over-complex read fails closed to an unscoped write, which
-		// the policy engine denies unconditionally.
+		// Must not crash and must not yield an allowable repo scope. The per-walk
+		// fragment visited-guard now resolves a cyclic fragment to a benign no-scope read
+		// (each fragment expanded once) instead of tripping the depth bound — that is sound
+		// because the query carries no fields/scopes, and the proxy denies the (invalid)
+		// cyclic query at the augment-failure gate regardless (see proxy cyclic test).
 		r := Classify("POST", "/api/graphql", body)
-		if r.HasRepo() {
-			t.Fatalf("over-complex query must not yield an allowable repo scope, got %s", r.RepoFullName())
+		if r.HasRepo() || r.Org != "" {
+			t.Fatalf("over-complex query must not yield an allowable repo/org scope, got repo=%q org=%q", r.RepoFullName(), r.Org)
 		}
-		if r.Access != Write {
-			t.Fatalf("over-complex query should fail closed to Write (→ unscoped write denied), got %v", r.Access)
+		if len(r.NodeIDs) != 0 || len(r.Additional) != 0 {
+			t.Fatalf("over-complex query must carry no node IDs or additional scopes, got nodes=%v additional=%v", r.NodeIDs, r.Additional)
 		}
+	}
+
+	// The DEEP-NESTING case still fails closed to an unscoped Write (the token-limit parse
+	// bails and there is no usable scope). The cyclic case is now a no-scope Read, which the
+	// proxy denies via the augment-failure gate.
+	if r := Classify("POST", "/api/graphql", []byte(deep.String())); r.Access != Write {
+		t.Fatalf("deeply nested query should fail closed to Write, got %v", r.Access)
 	}
 }
 

@@ -39,6 +39,18 @@ func GithubTokenFilePath() string {
 	return filepath.Join(DefaultDir(), "github-token")
 }
 
+// EnsureDir creates the config/secret directory and tightens it to 0700 even if it already
+// exists. os.MkdirAll only applies the mode to components it CREATES, so a pre-existing dir
+// (made under a 022 umask, or by another tool) would otherwise keep its looser mode and let
+// other local users list filenames / stat sizes+mtimes (token count, mint/usage timing) —
+// round-18 J. The secret FILES are 0600 regardless, so this guards directory metadata only.
+func EnsureDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
+}
+
 func Load(path string) (*Config, error) {
 	c := &Config{
 		Bind:      "127.0.0.1:7843",

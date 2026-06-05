@@ -3,8 +3,10 @@
 When the proxy runs on a remote host (a VPS) and clients reach it over the network,
 `gh` must trust the proxy's TLS certificate. bgh-proxy's built-in cert is **self-signed**
 (meant for localhost), so a remote client would otherwise need a CA install — and on macOS
-that means a **global** keychain root (`gh`/Go ignore `SSL_CERT_FILE` on darwin), which can
-MITM any site. That's a poor fit for the model where the **client is assumed compromised**.
+the most reliable route is a **global** keychain root, which can MITM any site. (`SSL_CERT_FILE`
+is a process-scoped alternative; recent Go std-lib honors it on darwin, but support has varied by
+`gh`/Go version, so don't rely on it cross-platform.) A global trust root is a poor fit for the
+model where the **client is assumed compromised** — prefer the front-with-a-real-cert routes below.
 
 The clean answer is to give the proxy a **publicly-trusted** certificate, terminated on the
 **server** side, so the client needs *nothing* but the scoped `bgh_` token:
@@ -168,7 +170,7 @@ gh auth login --hostname proxy.example.com
 |---|---|
 | **SSH `-L` forward** | ✗ Requires SSH creds to the proxy host on the infected client → lateral movement to the box that holds the *real* token. Strictly worse than the problem. |
 | **Install the self-signed CA in the client keychain** | ✗ A global root CA that can MITM *any* site; persistent system change on an untrusted machine. |
-| **`SSL_CERT_FILE=ca.pem gh …`** | ~ Works and is *process-scoped* (good) — **but only on Linux**. macOS/Go ignores it. |
+| **`SSL_CERT_FILE=ca.pem gh …`** | ~ Works and is *process-scoped* (good); recent Go honors it on macOS too, but support has varied by `gh`/Go version — don't rely on it cross-platform. |
 | **Real cert, terminated server-side (this doc)** | ✓ Client needs nothing but the scoped token. |
 
 `gh auth login`'s OAuth client also bypasses `http_unix_socket` (it dials the host directly
@@ -188,7 +190,7 @@ around it — both bit us in testing:
   token. Clear it: `gh config set http_unix_socket ""`.
 
 Confirm you're actually on the proxy: `gh api user --hostname <proxy>` returns
-`{"login":"bgh-proxy"}` (a synthetic identity). If it returns your real GitHub profile, one of
+`{"login":"bgh-proxy","id":0}` (a synthetic identity). If it returns your real GitHub profile, one of
 the above is bypassing the proxy.
 
 ## Policy tips
@@ -266,8 +268,11 @@ Back these up **off-host, encrypted** — losing them loses access, leaking them
 | `ca-key.pem` / `server-key.pem` | the self-signed TLS keys | leak = MITM of clients that trust the CA |
 
 > Deleting `owner.json` **re-arms** the trust-on-first-use claim — a recovery lever *and* a footgun.
-> After deleting it, re-claim over **loopback** (sign in at `https://127.0.0.1:7843/ui`) **before**
-> re-exposing the listener, or a stranger wins the race.
+> The owner record is read **once at startup** and never reloaded, so you must **stop the proxy
+> before deleting `owner.json` and restart after** for the re-arm to take effect. Then re-claim over
+> **loopback** (sign in at `https://127.0.0.1:7843/ui`) **before** re-exposing the listener, or a
+> stranger wins the race. (If a fallback `BGH_GITHUB_TOKEN`/`github_token` is still configured, only
+> that token's own GitHub account can re-claim — the claim is bound to the custodian's identity.)
 
 ### Rotate the custodian / respond to compromise
 

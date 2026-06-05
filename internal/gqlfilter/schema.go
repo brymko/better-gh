@@ -31,14 +31,15 @@ type pathStep struct {
 
 // Schema wraps GitHub's GraphQL schema plus the derived repo-scoped type paths.
 type Schema struct {
-	schema           *ast.Schema
-	repoScoped       map[string]bool       // type name -> has a marker/resolve path to a single repository
-	repoPath         map[string][]pathStep // type name -> no-arg field path to its repo's nameWithOwner
-	nodeResolveQuery string                // nodes(ids:) query covering every repo-scoped Node type
-	typeRes          map[string]string     // object type -> per-resource policy key (derived from @docsCategory + overrides)
-	nodeTypes        map[string]bool       // object types implementing Node (recognized by this snapshot)
-	repoOwnedNoPath  map[string]bool       // Node object types that belong to a repo (by @docsCategory) but have NO derivable repoPath
-	validationRules  *rules.Rules          // default validation rules MINUS the O(n^2) OverlappingFieldsCanBeMerged (see Augment)
+	schema             *ast.Schema
+	repoScoped         map[string]bool       // type name -> has a marker/resolve path to a single repository
+	repoPath           map[string][]pathStep // type name -> no-arg field path to its repo's nameWithOwner
+	nodeResolveQuery   string                // nodes(ids:) query covering every repo-scoped Node type
+	typeRes            map[string]string     // object type -> per-resource policy key (derived from @docsCategory + overrides)
+	nodeTypes          map[string]bool       // object types implementing Node (recognized by this snapshot)
+	repoOwnedNoPath    map[string]bool       // concrete OBJECT types (Node or not) that belong to a repo (by @docsCategory) but have NO derivable repoPath
+	repoIdentityNoPath map[string]bool       // Node types exposing a repo-identity scalar (nameWithOwner) but neither repoScoped nor repoOwnedNoPath
+	validationRules    *rules.Rules          // default validation rules MINUS the O(n^2) OverlappingFieldsCanBeMerged (see Augment)
 }
 
 // repoOwnedCategories are @docsCategory values whose objects belong to exactly ONE repository. A
@@ -58,11 +59,53 @@ var repoOwnedCategories = map[string]bool{
 	"dependency-graph": true, "repos": true,
 }
 
-// deriveRepoOwnedNoPath returns the Node OBJECT types whose @docsCategory marks them as belonging to
-// a single repository but for which deriveRepoPaths found NO path to that repository. Deriving from
-// @docsCategory (not a hand-maintained list) means a schema refresh that introduces another such
-// type is covered automatically — the node resolver fails it closed.
+// deriveRepoOwnedNoPath returns the concrete OBJECT types whose @docsCategory marks them as
+// belonging to a single repository but for which deriveRepoPaths found NO path to that repository.
+// This is NOT restricted to Node implementors: many repo-owned CONTENT objects are embedded leaves
+// that do not implement Node (Submodule→contents, IssueTemplate→issues, PullRequestChangedFile→pulls,
+// CheckAnnotation→checks, ContributingGuidelines/RepositoryCodeowners→contents, the ruleset
+// *Parameters types, …). Before round-18 the Node gate excluded them, so they received NO marker in
+// augment() and the response filter forwarded them verbatim — bypassing a per-resource `none` on any
+// object reached by navigation (e.g. repository{submodules{gitUrl}} leaked .gitmodules under
+// contents="none"). Including them lets augment() inject a type-only marker so the filter attributes
+// each to its nearest marked ancestor's repository and enforces s.FilterResource(type) there
+// (fail-closed when no ancestor repo). Deriving from @docsCategory (not a hand-maintained list) means
+// a schema refresh that introduces another such type is covered automatically. The node resolver,
+// which also reads this set (IsRepoOwnedUnattributableNodeType), only ever sees Node typenames, so the
+// added non-Node entries never change its behavior — they only widen the response filter's coverage.
 func deriveRepoOwnedNoPath(schema *ast.Schema, repoPath map[string][]pathStep) map[string]bool {
+	out := map[string]bool{}
+	for name, def := range schema.Types {
+		if def.Kind != ast.Object {
+			continue
+		}
+		if _, pathed := repoPath[name]; pathed {
+			continue // resolvable/markable already
+		}
+		if d := def.Directives.ForName("docsCategory"); d != nil {
+			if arg := d.Arguments.ForName("name"); arg != nil && arg.Value != nil && repoOwnedCategories[arg.Value.Raw] {
+				out[name] = true
+			}
+		}
+	}
+	return out
+}
+
+// repoIdentityScalars are field names that expose a repository's identity directly on a node as a
+// scalar (no navigation), so a node carrying one discloses a repo's name even when it has no field
+// PATH to a Repository object the resolver/filter could attribute.
+var repoIdentityScalars = map[string]bool{"nameWithOwner": true, "repositoryName": true}
+
+// deriveRepoIdentityNoPath returns Node OBJECT types that expose a repository-identifying SCALAR
+// (nameWithOwner/repositoryName) directly on the node yet are NEITHER repoScoped (no derivable repo
+// path to tag/resolve) NOR repoOwnedNoPath (not a per-resource content object) — e.g. the
+// enterprise/migration namespace types EnterpriseRepositoryInfo, UserNamespaceRepository,
+// RepositoryMigration. A node(id:) reference to one resolves to no repository and gets no response
+// marker, so before round-18 it was treated as a constraint-free non-repo node and leaked a denied
+// repo's name/visibility under default=allow. The node resolver fails these CLOSED instead. Their
+// @docsCategory (enterprise-admin/migrations) is NOT single-repo-owned in general, so they cannot be
+// folded into repoOwnedCategories without over-denying legitimate non-repo node reads.
+func deriveRepoIdentityNoPath(schema *ast.Schema, repoScoped, repoOwnedNoPath map[string]bool) map[string]bool {
 	nodeImpl := map[string]bool{}
 	for _, d := range schema.PossibleTypes["Node"] {
 		if d.Kind == ast.Object {
@@ -74,12 +117,13 @@ func deriveRepoOwnedNoPath(schema *ast.Schema, repoPath map[string][]pathStep) m
 		if def.Kind != ast.Object || !nodeImpl[name] {
 			continue
 		}
-		if _, pathed := repoPath[name]; pathed {
-			continue // resolvable/markable already
+		if repoScoped[name] || repoOwnedNoPath[name] {
+			continue
 		}
-		if d := def.Directives.ForName("docsCategory"); d != nil {
-			if arg := d.Arguments.ForName("name"); arg != nil && arg.Value != nil && repoOwnedCategories[arg.Value.Raw] {
+		for _, f := range def.Fields {
+			if repoIdentityScalars[f.Name] && f.Type.Elem == nil && f.Type.Name() == "String" {
 				out[name] = true
+				break
 			}
 		}
 	}
@@ -193,6 +237,7 @@ func Load() (*Schema, error) {
 	sch.typeRes = deriveTypeResources(s)
 	sch.nodeTypes = deriveNodeObjectTypes(s)
 	sch.repoOwnedNoPath = deriveRepoOwnedNoPath(s, paths)
+	sch.repoIdentityNoPath = deriveRepoIdentityNoPath(s, rs, sch.repoOwnedNoPath)
 	// Build the validation rule set Augment uses ONCE: the default rules minus
 	// OverlappingFieldsCanBeMerged. That rule is O(n^2) in the number of fields sharing a response
 	// name within a selection set (it compares every pair and recurses into their sub-selections with
@@ -314,13 +359,24 @@ func (s *Schema) isRepoScoped(typeName string) bool { return s.repoScoped[typeNa
 // The proxy's node resolver uses it to fail closed if such a node resolves without a repository.
 func (s *Schema) IsRepoScopedType(typeName string) bool { return s.repoScoped[typeName] }
 
-// IsRepoOwnedUnattributableNodeType reports whether typename is a Node OBJECT type that belongs to a
-// single repository (by @docsCategory) but has NO derivable path to that repository, so the node
-// resolver cannot attribute it and the response filter cannot tag it. The proxy fails such a
-// node(id:)/nodes(ids:) reference CLOSED instead of treating it as a constraint-free non-repo node
-// (round-16). It is disjoint from IsRepoScopedType (those HAVE a path): a type satisfies at most one.
+// IsRepoOwnedUnattributableNodeType reports whether typename is a concrete OBJECT type that belongs
+// to a single repository (by @docsCategory) but has NO derivable path to that repository, so it
+// cannot be tagged with its repo. The node resolver uses it to fail a node(id:)/nodes(ids:) reference
+// CLOSED instead of treating it as a constraint-free non-repo node (round-16); since node IDs only
+// resolve to Node types, the non-Node members of this set (added round-18 for response-filter
+// coverage) never reach the resolver. It is disjoint from IsRepoScopedType (those HAVE a path).
 func (s *Schema) IsRepoOwnedUnattributableNodeType(typeName string) bool {
 	return s.repoOwnedNoPath[typeName]
+}
+
+// IsRepoIdentityUnattributableType reports whether typename is a Node OBJECT type that exposes a
+// repository-identifying scalar (nameWithOwner/repositoryName) directly on the node but has no
+// derivable repo path and is not a per-resource content type — so a node(id:) reference to it
+// resolves to no repository and the response filter cannot tag it. The node resolver fails such a
+// reference CLOSED rather than treat it as a constraint-free non-repo node, which would leak a
+// denied repo's name/visibility under default=allow (round-18 H).
+func (s *Schema) IsRepoIdentityUnattributableType(typeName string) bool {
+	return s.repoIdentityNoPath[typeName]
 }
 
 // NodeResolveQuery is a nodes(ids:) query that asks GitHub for each node's __typename and,
