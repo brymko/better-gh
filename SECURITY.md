@@ -47,6 +47,10 @@ These are accepted trade-offs of being a policy proxy over a broad token, docume
 - **Host compromise** exposes the plaintext custodian token (encrypted-at-rest is a non-goal).
 - **Schema/spec freshness** — a brand-new GitHub endpoint/field not yet in the embedded OpenAPI/
   GraphQL snapshot is **denied** (availability cost), never forwarded unfiltered.
+- **Socket mode authenticates the user, not the process** — the `0600` unix socket admits any process
+  running as your UID, all under the single socket policy.
+- **API only, not git** — a client that already holds a direct `github.com` credential bypasses the
+  proxy entirely; the proxy governs API access (`/api/v3`, `/api/graphql`), not git transport.
 
 ## Supported versions
 

@@ -74,9 +74,9 @@ func (s *Store) HasFallback() bool { s.mu.RLock(); defer s.mu.RUnlock(); return 
 // first claim so a pre-seeded deployment can be claimed only by its own custodian's account.
 func (s *Store) FallbackOwner() string { s.mu.RLock(); defer s.mu.RUnlock(); return s.fallbackLogin }
 
-// SetFallbackOwner records the GitHub login that owns the pre-seeded custodian token. It is
-// idempotent (later calls with the same value are no-ops) and locks the TOFU claim to that
-// identity: with a fallback configured, only this login may claim the deployment.
+// SetFallbackOwner records the GitHub login that owns the pre-seeded custodian token. It is set-once
+// (the first non-empty value wins; later calls are no-ops) and locks the TOFU claim to that identity:
+// with a fallback configured, only this login may claim the deployment.
 func (s *Store) SetFallbackOwner(login string) {
 	login = strings.TrimSpace(login)
 	if login == "" {
@@ -84,6 +84,10 @@ func (s *Store) SetFallbackOwner(login string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.fallbackLogin != "" {
+		return // set-once: the TOFU fallback-owner binding gates who may claim a pre-seeded deployment
+		// (owner.SignIn compares against it), so it must not be overwritten by a later call (round-20).
+	}
 	s.fallbackLogin = login
 }
 

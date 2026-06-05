@@ -141,6 +141,28 @@ func byAuthCode(code string) func(*grant) bool {
 	return func(g *grant) bool { return code != "" && ctEq(g.authCode, code) }
 }
 
+// consume runs fn against the matching grant under the store lock; if fn returns true the grant is
+// deleted (and its background goroutine cancelled) atomically in the SAME critical section, so the
+// read-and-invalidate of a one-time secret cannot race a concurrent poll into handing the same token
+// out twice (round-20). Returns whether a (non-expired) match was found.
+func (s *grantStore) consume(match func(*grant) bool, fn func(*grant) bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for id, g := range s.grants {
+		if g.expiresAt.After(now) && match(g) {
+			if fn(g) {
+				if g.cancel != nil {
+					g.cancel()
+				}
+				delete(s.grants, id)
+			}
+			return true
+		}
+	}
+	return false
+}
+
 func (s *grantStore) sweepLoop() {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()

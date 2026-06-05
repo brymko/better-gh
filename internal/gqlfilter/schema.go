@@ -39,6 +39,8 @@ type Schema struct {
 	nodeTypes          map[string]bool       // object types implementing Node (recognized by this snapshot)
 	repoOwnedNoPath    map[string]bool       // concrete OBJECT types (Node or not) that belong to a repo (by @docsCategory) but have NO derivable repoPath
 	repoIdentityNoPath map[string]bool       // Node types exposing a repo-identity scalar (nameWithOwner) but neither repoScoped nor repoOwnedNoPath
+	repoIdentityScalar map[string]string     // repoIdentityNoPath type -> its repo-identity scalar field ("nameWithOwner" preferred; else "repositoryName")
+	ownerOwnedNode     map[string]bool       // Node object types owned by an org/user/enterprise (not a repo, not public) — node(id:) reads fail closed
 	validationRules    *rules.Rules          // default validation rules MINUS the O(n^2) OverlappingFieldsCanBeMerged (see Augment)
 }
 
@@ -91,21 +93,25 @@ func deriveRepoOwnedNoPath(schema *ast.Schema, repoPath map[string][]pathStep) m
 	return out
 }
 
-// repoIdentityScalars are field names that expose a repository's identity directly on a node as a
-// scalar (no navigation), so a node carrying one discloses a repo's name even when it has no field
-// PATH to a Repository object the resolver/filter could attribute.
-var repoIdentityScalars = map[string]bool{"nameWithOwner": true, "repositoryName": true}
+// ownerOwnedNodeCategories are @docsCategory values whose Node OBJECT types expose ORG/USER/ENTERPRISE-
+// private data (members/emails, project items, audit entries, sponsorships, migrations, team data)
+// rather than a repository or globally-public data. They are deliberately EXCLUDED from
+// repoOwnedCategories (which is repo-only). A node(id:)/nodes(ids:) read of such a type is NOT
+// repo-attributable, so neither the classifier scopes it nor the repo-only response filter redacts it;
+// under default=allow an empty-scope read of one bypasses an [[org]] deny — the owner-level parallel
+// of the round-16 repo-node bypass (round-20). The node resolver fails these closed, so an org/user/
+// project is read via the SCOPED organization(login:)/user(login:) roots, which ARE policy-checked and
+// response-filtered. The set is limited to unambiguously owner-private categories so genuinely public
+// node types (licenses/code-of-conduct/marketplace/apps/…) are not over-denied.
+var ownerOwnedNodeCategories = map[string]bool{
+	"orgs": true, "teams": true, "projects": true, "projects-classic": true,
+	"enterprise-admin": true, "migrations": true, "sponsors": true, "users": true,
+}
 
-// deriveRepoIdentityNoPath returns Node OBJECT types that expose a repository-identifying SCALAR
-// (nameWithOwner/repositoryName) directly on the node yet are NEITHER repoScoped (no derivable repo
-// path to tag/resolve) NOR repoOwnedNoPath (not a per-resource content object) — e.g. the
-// enterprise/migration namespace types EnterpriseRepositoryInfo, UserNamespaceRepository,
-// RepositoryMigration. A node(id:) reference to one resolves to no repository and gets no response
-// marker, so before round-18 it was treated as a constraint-free non-repo node and leaked a denied
-// repo's name/visibility under default=allow. The node resolver fails these CLOSED instead. Their
-// @docsCategory (enterprise-admin/migrations) is NOT single-repo-owned in general, so they cannot be
-// folded into repoOwnedCategories without over-denying legitimate non-repo node reads.
-func deriveRepoIdentityNoPath(schema *ast.Schema, repoScoped, repoOwnedNoPath map[string]bool) map[string]bool {
+// deriveOwnerOwnedNodes returns Node OBJECT types whose @docsCategory marks them as owner-private
+// (ownerOwnedNodeCategories) and that are NOT repo-attributable (so the repo resolver/filter cannot
+// gate them). The node resolver fails a node(id:) reference to one closed (round-20).
+func deriveOwnerOwnedNodes(schema *ast.Schema, repoScoped, repoOwnedNoPath map[string]bool) map[string]bool {
 	nodeImpl := map[string]bool{}
 	for _, d := range schema.PossibleTypes["Node"] {
 		if d.Kind == ast.Object {
@@ -120,11 +126,62 @@ func deriveRepoIdentityNoPath(schema *ast.Schema, repoScoped, repoOwnedNoPath ma
 		if repoScoped[name] || repoOwnedNoPath[name] {
 			continue
 		}
+		if d := def.Directives.ForName("docsCategory"); d != nil {
+			if arg := d.Arguments.ForName("name"); arg != nil && arg.Value != nil && ownerOwnedNodeCategories[arg.Value.Raw] {
+				out[name] = true
+			}
+		}
+	}
+	return out
+}
+
+// repoIdentityScalars are field names that expose a repository's identity directly on a node as a
+// scalar (no navigation), so a node carrying one discloses a repo's name even when it has no field
+// PATH to a Repository object the resolver/filter could attribute. nameWithOwner is "owner/repo"
+// (fully attributable); repositoryName is a BARE repo name (no owner) the response filter cannot turn
+// into a policy (owner, repo) on its own, so a type whose only such scalar is repositoryName is
+// response-tagged with a TYPE marker and fails closed under a non-repo (e.g. org) scope.
+var repoIdentityScalars = map[string]bool{"nameWithOwner": true, "repositoryName": true}
+
+// deriveRepoIdentityNoPath returns Node OBJECT types that expose a repository-identifying SCALAR
+// (nameWithOwner/repositoryName) directly on the node yet are NEITHER repoScoped (no derivable repo
+// path to tag/resolve) NOR repoOwnedNoPath (not a per-resource content object) — e.g. the
+// enterprise/migration namespace types EnterpriseRepositoryInfo, UserNamespaceRepository,
+// RepositoryMigration. A node(id:) reference to one resolves to no repository and gets no response
+// marker, so before round-18 it was treated as a constraint-free non-repo node and leaked a denied
+// repo's name/visibility under default=allow. The node resolver fails these CLOSED instead. Their
+// @docsCategory (enterprise-admin/migrations) is NOT single-repo-owned in general, so they cannot be
+// folded into repoOwnedCategories without over-denying legitimate non-repo node reads.
+func deriveRepoIdentityNoPath(schema *ast.Schema, repoScoped, repoOwnedNoPath map[string]bool) map[string]string {
+	nodeImpl := map[string]bool{}
+	for _, d := range schema.PossibleTypes["Node"] {
+		if d.Kind == ast.Object {
+			nodeImpl[d.Name] = true
+		}
+	}
+	out := map[string]string{}
+	for name, def := range schema.Types {
+		if def.Kind != ast.Object || !nodeImpl[name] {
+			continue
+		}
+		if repoScoped[name] || repoOwnedNoPath[name] {
+			continue
+		}
+		scalar := ""
 		for _, f := range def.Fields {
 			if repoIdentityScalars[f.Name] && f.Type.Elem == nil && f.Type.Name() == "String" {
-				out[name] = true
-				break
+				// Prefer nameWithOwner (fully attributable "owner/repo") over a bare repositoryName.
+				if f.Name == "nameWithOwner" {
+					scalar = f.Name
+					break
+				}
+				if scalar == "" {
+					scalar = f.Name
+				}
 			}
+		}
+		if scalar != "" {
+			out[name] = scalar
 		}
 	}
 	return out
@@ -148,6 +205,13 @@ var docsCategoryResource = map[string]string{
 	"checks":      "checks",
 	"releases":    "releases",
 	"git":         "contents", // git objects (blobs/trees/tags) expose file content; ref-like types overridden below
+	// deploy-keys → "keys": DeployKey (@docsCategory deploy-keys) exposes the public key material,
+	// title, and read/write flag the REST `keys`/`deploy-keys` resource gates (restResourceMap). Without
+	// this entry FilterResource("DeployKey") fell to "metadata", so repository{deployKeys{…}} navigation
+	// authorized against base access and bypassed a keys="none" carve-out the direct GET /repos/{o}/{r}/
+	// keys (and the node(id:DeployKey) resolver) enforce — round-20. Keeps the per-resource axis identical
+	// on REST and GraphQL for this key.
+	"deploy-keys": "keys",
 }
 
 // typeResourceOverride pins types whose @docsCategory names a different axis than the policy
@@ -159,6 +223,13 @@ var typeResourceOverride = map[string]string{
 	"StatusContext":     "checks",
 	"StatusCheckRollup": "checks",
 	"Ref":               "branches",
+	// RefUpdateRule (@docsCategory "git" → would derive "contents") is the effective branch-protection
+	// rule for a ref (allowsForcePushes/requiredApprovingReviewCount/requiredStatusCheckContexts/…), the
+	// "branches" resource — like its sibling BranchProtectionRule and Ref. It is reachable only via the
+	// branches-gated Ref.refUpdateRule today (so masked), but pinning it keeps the per-resource axis
+	// correct if a future schema adds a non-branches path to it (round-20). Guarded by the extended
+	// repoOwnedNoPath resource invariant below.
+	"RefUpdateRule": "branches",
 }
 
 // deriveTypeResources builds the object-type → per-resource-key map from the embedded schema's
@@ -270,7 +341,12 @@ func Load() (*Schema, error) {
 	sch.typeRes = deriveTypeResources(s)
 	sch.nodeTypes = deriveNodeObjectTypes(s)
 	sch.repoOwnedNoPath = deriveRepoOwnedNoPath(s, paths)
-	sch.repoIdentityNoPath = deriveRepoIdentityNoPath(s, rs, sch.repoOwnedNoPath)
+	sch.repoIdentityScalar = deriveRepoIdentityNoPath(s, rs, sch.repoOwnedNoPath)
+	sch.repoIdentityNoPath = make(map[string]bool, len(sch.repoIdentityScalar))
+	for name := range sch.repoIdentityScalar {
+		sch.repoIdentityNoPath[name] = true
+	}
+	sch.ownerOwnedNode = deriveOwnerOwnedNodes(s, rs, sch.repoOwnedNoPath)
 	// Build the validation rule set Augment uses ONCE: the default rules minus
 	// OverlappingFieldsCanBeMerged. That rule is O(n^2) in the number of fields sharing a response
 	// name within a selection set (it compares every pair and recurses into their sub-selections with
@@ -422,6 +498,15 @@ func (s *Schema) IsRepoOwnedUnattributableNodeType(typeName string) bool {
 // denied repo's name/visibility under default=allow (round-18 H).
 func (s *Schema) IsRepoIdentityUnattributableType(typeName string) bool {
 	return s.repoIdentityNoPath[typeName]
+}
+
+// IsOwnerOwnedNodeType reports whether typename is a Node OBJECT type owned by an org/user/enterprise
+// (Organization/Team/ProjectV2/audit entries/…) that exposes owner-private data and is not
+// repo-attributable. The node resolver fails a node(id:)/nodes(ids:) reference to one CLOSED so an
+// empty-scope read cannot bypass an [[org]] deny under default=allow (round-20); the data is reachable
+// via the policy-checked organization(login:)/user(login:) roots instead.
+func (s *Schema) IsOwnerOwnedNodeType(typeName string) bool {
+	return s.ownerOwnedNode[typeName]
 }
 
 // NodeResolveQuery is a nodes(ids:) query that asks GitHub for each node's __typename and,

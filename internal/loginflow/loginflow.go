@@ -155,8 +155,12 @@ func (h *Handler) accessToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var secret, errCode, grantID string
-	found := h.grants.withGrant(match, func(g *grant) {
+	var secret, errCode string
+	// consume reads the minted secret AND deletes the grant in ONE locked critical section, so two
+	// concurrent polls of the same device_code cannot both read it before either removal lands (the
+	// read-then-remove was previously two separate lock acquisitions — round-20). The grant is deleted
+	// only when a real secret is handed out (fn returns true); a pending/denied poll leaves it in place.
+	found := h.grants.consume(match, func(g *grant) bool {
 		switch g.status {
 		case statusApproved:
 			// apiApprove flips the status to statusApproved BEFORE Store.Create (a synchronous disk
@@ -165,13 +169,16 @@ func (h *Handler) accessToken(w http.ResponseWriter, r *http.Request) {
 			// succeeds, instead of handing gh "" and removing the grant (round-17).
 			if g.secret == "" {
 				errCode = "authorization_pending"
-			} else {
-				secret, grantID = g.secret, g.id
+				return false
 			}
+			secret = g.secret
+			return true // one-time issuance: consume the grant so a replayed exchange can't re-fetch it
 		case statusDenied:
 			errCode = "access_denied"
+			return false
 		default:
 			errCode = "authorization_pending"
+			return false
 		}
 	})
 	if !found {
@@ -183,7 +190,6 @@ func (h *Handler) accessToken(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, http.StatusOK, map[string]string{"error": errCode})
 		return
 	}
-	h.grants.remove(grantID) // one-time issuance: a replayed exchange can't re-fetch the secret
 	jsonResp(w, http.StatusOK, map[string]string{
 		"access_token": secret,
 		"token_type":   "bearer",
@@ -586,15 +592,30 @@ func (h *Handler) resolveLogin(ctx context.Context, token string) (string, error
 	if err != nil {
 		return "", err
 	}
+	// This identity is the deployment-ownership boundary (owner.SignIn / the fallback-owner binding),
+	// so a non-200, a GraphQL error, or an empty login must be a HARD error — not a silent empty string
+	// downstream code must remember to reject (round-20). The sibling githubGet already does this.
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("identity request returned %d", resp.StatusCode)
+	}
 	var parsed struct {
 		Data struct {
 			Viewer struct {
 				Login string `json:"login"`
 			} `json:"viewer"`
 		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return "", err
+	}
+	if len(parsed.Errors) > 0 {
+		return "", fmt.Errorf("identity query error: %s", parsed.Errors[0].Message)
+	}
+	if parsed.Data.Viewer.Login == "" {
+		return "", fmt.Errorf("identity query returned an empty login")
 	}
 	return parsed.Data.Viewer.Login, nil
 }

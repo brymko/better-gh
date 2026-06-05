@@ -27,14 +27,22 @@ func GenerateSecret(path string) (string, error) {
 	return secret, nil
 }
 
-// LoadOrCreateSecret returns the secret stored at path, generating and persisting a
-// new one only if the file does not yet exist. This keeps a distributed admin secret
-// stable across restarts instead of invalidating it every time the server starts.
+// LoadOrCreateSecret returns the secret stored at path, generating and persisting a new one ONLY if
+// the file does not yet exist. This keeps a distributed admin secret stable across restarts instead of
+// invalidating it every time the server starts. It distinguishes "absent" (os.IsNotExist → generate)
+// from "unreadable" (EACCES/EISDIR/EIO/empty → return an error): a transiently unreadable existing
+// secret must NOT be silently rotated, which would discard the operator's distributed secret and
+// overwrite it on disk, locking admins out and masking whether a compromise occurred (round-20).
 func LoadOrCreateSecret(path string) (string, error) {
-	if data, err := os.ReadFile(path); err == nil {
+	data, err := os.ReadFile(path)
+	if err == nil {
 		if s := strings.TrimSpace(string(data)); s != "" {
 			return s, nil
 		}
+		return "", fmt.Errorf("admin secret file %s is present but empty; remove it to regenerate", path)
+	}
+	if !os.IsNotExist(err) {
+		return "", fmt.Errorf("reading admin secret %s (refusing to rotate an unreadable secret): %w", path, err)
 	}
 	return GenerateSecret(path)
 }

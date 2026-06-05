@@ -145,7 +145,7 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 			if strings.EqualFold(r.Name, repo) {
 				if r.Permissions != nil {
 					if resource != "" && resource != classifier.ResourceUnknown {
-						if permAccess, ok := r.Permissions[resource]; ok {
+						if permAccess, ok := lookupResource(r.Permissions, resource); ok {
 							if permits(permAccess, access) {
 								return Result{Allowed: true}
 							}
@@ -182,7 +182,7 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 			if strings.EqualFold(o.Name, org) {
 				if o.Permissions != nil {
 					if resource != "" && resource != classifier.ResourceUnknown {
-						if permAccess, ok := o.Permissions[resource]; ok {
+						if permAccess, ok := lookupResource(o.Permissions, resource); ok {
 							if permits(permAccess, access) {
 								return Result{Allowed: true}
 							}
@@ -337,6 +337,24 @@ func (p *Policy) CanReadAnything(repo, org string) bool {
 		}
 	}
 	return p.Defaults.Mode == ModeAllow
+}
+
+// lookupResource resolves a per-resource permission, matching the key case-INSENSITIVELY. Repo
+// keys are already canonicalized lowercase (ValidateResourceKeys rejects others), and request
+// resources are lowercase, so the exact fast-path normally hits; the case-fold fallback covers an
+// ORG per-resource key authored in mixed case (e.g. [org.permissions] Members="none"), which org
+// keys being unvalidated would otherwise leave as a silent fail-open to base access — case-folding
+// names but not keys was an asymmetry (round-20). Mirrors the EqualFold rule/org NAME matching.
+func lookupResource(perms map[string]Access, resource string) (Access, bool) {
+	if a, ok := perms[resource]; ok {
+		return a, true
+	}
+	for k, a := range perms {
+		if strings.EqualFold(k, resource) {
+			return a, true
+		}
+	}
+	return AccessNone, false
 }
 
 func permits(rule Access, requested classifier.AccessLevel) bool {

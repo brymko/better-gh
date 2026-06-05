@@ -122,6 +122,72 @@ func TestR18_RepoOwnedCategoryCoverageInvariant(t *testing.T) {
 	}
 }
 
+// TestR20_RepoOwnedCategoryResourceMapping is the PERMANENT guard against the round-20 keys=none bug
+// class: a repo-owned @docsCategory that corresponds to a real per-resource policy key but is MISSING
+// from docsCategoryResource, so FilterResource() silently falls to "metadata" and a per-resource
+// carve-out (e.g. keys=none on DeployKey, @docsCategory "deploy-keys") is bypassed by GraphQL
+// navigation while the REST/direct-node paths enforce it. Every repoOwnedCategory must either map to a
+// per-resource key in docsCategoryResource or be in the explicit "intentionally metadata" allowlist.
+func TestR20_RepoOwnedCategoryResourceMapping(t *testing.T) {
+	// Categories that legitimately have NO dedicated per-resource policy key, so their objects fall to
+	// "metadata" (base access) by design — the documented no-per-resource-key residual.
+	intentionallyMetadata := map[string]string{
+		"discussions":      "no `discussions` policy key (documented residual)",
+		"dependency-graph": "no `dependency-graph` policy key (dep/SBOM data gated by base/metadata)",
+		"repos":            "the repository container/metadata itself",
+	}
+	for cat := range repoOwnedCategories {
+		_, mapped := docsCategoryResource[cat]
+		_, exempt := intentionallyMetadata[cat]
+		if !mapped && !exempt {
+			t.Errorf("repoOwnedCategory %q maps to NEITHER a docsCategoryResource per-resource key nor the "+
+				"intentionally-metadata allowlist — its objects fall to \"metadata\" and bypass a per-resource "+
+				"carve-out over GraphQL navigation (cf. round-20 deploy-keys). Add it to docsCategoryResource "+
+				"(with its policy key) or intentionallyMetadata (with a reason).", cat)
+		}
+	}
+}
+
+// TestR20_RepoIdentityScalarCoverage is the PERMANENT guard against the round-20 repoIdentityNoPath
+// navigation leak: a Node OBJECT type that exposes a repository-identity scalar (nameWithOwner/
+// repositoryName) must be covered by one of augment()'s marker mechanisms (repoScoped, repoOwnedNoPath,
+// or repoIdentityScalar) so navigating to it is tagged + redacted, not forwarded verbatim
+// (RepositoryMigration/EnterpriseRepositoryInfo/UserNamespaceRepository leaked a denied repo's
+// name/metadata under [[org]]-read before round-20).
+func TestR20_RepoIdentityScalarCoverage(t *testing.T) {
+	s, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeImpl := map[string]bool{}
+	for _, d := range s.schema.PossibleTypes["Node"] {
+		if d.Kind == ast.Object {
+			nodeImpl[d.Name] = true
+		}
+	}
+	for name, def := range s.schema.Types {
+		if def.Kind != ast.Object || !nodeImpl[name] {
+			continue
+		}
+		hasIdentityScalar := false
+		for _, f := range def.Fields {
+			if repoIdentityScalars[f.Name] && f.Type.Elem == nil && f.Type.Name() == "String" {
+				hasIdentityScalar = true
+				break
+			}
+		}
+		if !hasIdentityScalar {
+			continue
+		}
+		if !s.repoScoped[name] && !s.repoOwnedNoPath[name] && s.repoIdentityScalar[name] == "" {
+			t.Errorf("Node type %q exposes a repo-identity scalar but is covered by NO augment marker "+
+				"mechanism (repoScoped/repoOwnedNoPath/repoIdentityScalar) — navigating to it forwards a repo "+
+				"identity unredacted (round-20). Cover it in deriveRepoPaths/deriveRepoOwnedNoPath/"+
+				"deriveRepoIdentityNoPath.", name)
+		}
+	}
+}
+
 func hasOwnRepositoryField(def *ast.Definition) bool {
 	for _, f := range def.Fields {
 		if f.Name == "repository" && len(f.Arguments) == 0 && f.Type.Elem == nil && f.Type.Name() == "Repository" {

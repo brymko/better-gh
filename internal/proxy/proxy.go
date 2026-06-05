@@ -83,6 +83,11 @@ var hopByHopOrManaged = map[string]bool{
 	"Te":                   true,
 	"Trailer":              true,
 	"Upgrade":              true,
+	// Cookie is a browser-managed header the upstream GitHub API never needs; forwarding it would
+	// send a client's cookies (e.g. the loginflow bgh_grant browser-binding secret, set Path=/ and
+	// thus attached to same-origin proxy API requests) upstream under the real custodian token. The
+	// proxy strips Set-Cookie on responses (round-18); strip Cookie on requests symmetrically (round-20).
+	"Cookie": true,
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -263,6 +268,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// canReadFor gates a repo entry by BOTH its `metadata` read AND the endpoint's per-resource read,
+	// so a base=none repo and a base=read + <resource>=none carve-out are both dropped/scrubbed. Shared
+	// by the GET/HEAD enum/scrub path and the write-response cross-ref scrub below.
+	canReadFor := func(enumResource string) func(string) bool {
+		return func(repo string) bool {
+			owner := repo
+			if i := strings.IndexByte(repo, '/'); i > 0 {
+				owner = repo[:i]
+			}
+			if !pol.Evaluate(repo, owner, classifier.Read, "metadata", "").Allowed {
+				return false
+			}
+			return pol.Evaluate(repo, owner, classifier.Read, enumResource, "").Allowed
+		}
+	}
+
 	// REST read isolation, typed against GitHub's OpenAPI description (internal/restfilter):
 	// a GET is classified as NeedsFilter (response carries repositories → redact denied ones at
 	// the spec-derived locations, failing closed on an unparseable body), Pass (no repositories
@@ -281,7 +302,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// analysis's not_found_repos.repository_full_names) — dropped by a hand-maintained table so a
 		// denied repo's NAME doesn't leak (round-19 F4).
 		strArrayLocs := restfilter.StringArrayLocations(norm)
-		p := pol
 		// Gate each repo-bearing entry by BOTH the repo's own `metadata` access AND the enumerated
 		// endpoint's resource, NOT the lenient CanReadAnything. Two complementary leaks:
 		//   (a) base=none + a per-resource carve-out (permissions={issues="read"}) must NOT surface:
@@ -298,16 +318,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		//       check degenerates to the base grant — identical to metadata — so this never over-denies.
 		// A fully-denied repo (no matching rule under mode=deny) still evaluates to deny → dropped.
 		enumResource := classified.Resource
-		canRead := func(repo string) bool {
-			owner := repo
-			if i := strings.IndexByte(repo, '/'); i > 0 {
-				owner = repo[:i]
-			}
-			if !p.Evaluate(repo, owner, classifier.Read, "metadata", "").Allowed {
-				return false
-			}
-			return p.Evaluate(repo, owner, classifier.Read, enumResource, "").Allowed
+		// Cross-repo CONTENT feeds (e.g. /user/issues, /issues, /search/issues, /search/code) classify
+		// to an unscoped category, so classified.Resource is "" and the per-resource keep-gate below
+		// would degenerate to a metadata-only check — leaking a [[repo]] base=read + <resource>=none
+		// carve-out through the feed (the non-path-scoped sibling of the round-18-D /orgs/{org}/issues
+		// fix — round-20). Derive the feed's content resource so the carve-out is enforced here too.
+		if er := restfilter.EnumContentResource(norm); er != "" {
+			enumResource = er
 		}
+		canRead := canReadFor(enumResource)
 		switch {
 		case dec == restfilter.NeedsFilter || len(scrubLocs) > 0 || len(strArrayLocs) > 0:
 			// Redact denied enum entries (drop), scrub embedded foreign cross-ref content (null in
@@ -355,9 +374,45 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// untouched — and path-scoped Pass responses keep streaming (authorized by their repo
 			// scope; cross-ref embeds handled by the scrub table), so the hot path (contents/blobs) is
 			// unaffected.
-			passScan = canRead
+			//
+			// EXCEPT two shapes the body-scan cannot map:
+			//   - an OPAQUE NUMERIC repo id (the Copilot agent-task lookups /agents/tasks[/{id}]):
+			//     ContainsDeniedRepo can't map a numeric id, so it fails closed (round-20).
+			//   - a bare {id,name} repo array qualified by the path org (/orgs/{org}/attestations/
+			//     repositories): the name has no owner, so it is redacted with the path owner instead.
+			switch {
+			case restfilter.HasOpaqueRepoID(norm):
+				if result.Allowed {
+					result = policy.Result{Reason: "endpoint identifies repositories only by opaque id; cannot be repo-filtered (fail closed)"}
+				}
+			case restfilter.IsOrgNamedRepoArray(norm):
+				owner := classified.Org
+				if owner == "" {
+					owner = classified.Owner
+				}
+				respFilter = func(resp []byte) ([]byte, bool) {
+					return restfilter.RedactOrgNamedRepos(resp, owner, canRead)
+				}
+			default:
+				passScan = canRead
+			}
 		}
 	}
+
+	// Write responses echo the SAME foreign-repo cross-reference objects as their GET siblings (a PR's
+	// head/base.repo from a fork, a repo's parent/source/template_repository), but the GET/HEAD-gated
+	// block above never runs for writes — so PATCH /repos/{o}/{r}/pulls/{n} streamed a denied fork's
+	// metadata unredacted (round-20). Run the cross-ref scrub (only) on write responses too; enum
+	// redaction / passScan stay GET-only since a write is single-repo-scoped by the classifier and the
+	// scrub merely nulls the foreign sub-object, keeping the authorized write result. (GraphQL writes
+	// already have respFilter set and are skipped by the respFilter==nil guard.)
+	if respFilter == nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		if wlocs := restfilter.WriteScrubLocations(norm); len(wlocs) > 0 {
+			canRead := canReadFor(classified.Resource)
+			respFilter = func(resp []byte) ([]byte, bool) { return restfilter.Scrub(resp, wlocs, canRead) }
+		}
+	}
+
 	// Fallback when the filter is DISABLED entirely (GQLFilter == nil, e.g. tests): rely on
 	// the classifier's cross-repo-nav denylist to deny navigating requests.
 	if result.Allowed && classified.NavEscapes && respFilter == nil {
@@ -481,6 +536,15 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 				return gqlfilter.Keep
 			}
 			return gqlfilter.KeepShell
+		}
+		// A repo-marked object whose runtime __typename the embedded schema does NOT recognize is live
+		// schema drift (GitHub ahead of the snapshot): FilterResource would default it to "metadata"
+		// (base), under-enforcing its possibly-stricter real resource. Mirror the node resolver's drift
+		// fail-closed and redact it — the accepted "schema freshness = deny" residual — rather than
+		// authorize it against base access (round-20). Only fires for genuinely unrecognized runtime types
+		// (typename=="" maps to metadata by design and is unaffected).
+		if typename != "" && !s.IsKnownObjectType(typename) {
+			return gqlfilter.Deny
 		}
 		// Derive the per-resource key from the object's runtime type via the schema's @docsCategory
 		// (FilterResource), NOT the incomplete value the filter passes in: this enforces per-resource
@@ -718,6 +782,14 @@ func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[stri
 			// EnterpriseRepositoryInfo/UserNamespaceRepository/RepositoryMigration. The response
 			// filter does not tag them (not repo-scoped), so treating them as constraint-free would
 			// leak a denied repo's name/visibility under default=allow. Fail closed (round-18 H).
+			out[id] = nodeRes{kind: nodeDeny}
+		} else if typename != "" && h.GQLFilter != nil && h.GQLFilter.IsOwnerOwnedNodeType(typename) {
+			// A known Node type owned by an ORG/USER/ENTERPRISE (Organization/Team/ProjectV2/audit
+			// entries/…), not a repository. It is not repo-attributable, so neither the classifier scopes
+			// it nor the repo-only response filter redacts it; under default=allow an empty-scope
+			// node(id:) read of one would bypass an [[org]] deny (round-20, the owner-level analogue of the
+			// round-16 repo-node fail-closed). Fail closed — the data is reachable via the SCOPED
+			// organization(login:)/user(login:) root, which is policy-checked and filtered.
 			out[id] = nodeRes{kind: nodeDeny}
 		} else if typename != "" && h.GQLFilter != nil && !h.GQLFilter.IsKnownNodeObjectType(typename) {
 			// A non-null node whose runtime __typename this embedded schema does NOT recognize as a
@@ -1067,6 +1139,11 @@ var strippedResponseHeaders = map[string]bool{
 	"X-Oauth-Client-Id":       true,
 	"X-Github-Sso":            true,
 	"Set-Cookie":              true,
+	// Github-Authentication-Token-Expiration discloses the CUSTODIAN token's expiry timestamp (and,
+	// by its presence, that the custodian is an expiring OAuth/user-to-server or fine-grained token —
+	// exactly what loginflow mints). The value isn't the token, but a property of the custodian's
+	// reach/lifecycle, the same disclosure class as X-OAuth-Scopes/X-Github-Sso — so strip it (round-20).
+	"Github-Authentication-Token-Expiration": true,
 }
 
 func copyResponseHeaders(dst, src http.Header, stripContentLength bool) {

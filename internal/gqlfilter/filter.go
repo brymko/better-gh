@@ -221,6 +221,26 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 		budget.count(1)
 		return
 	}
+	if scalar := s.repoIdentityScalar[typeName]; scalar != "" {
+		// A Node type that self-identifies its repository via a SCALAR (nameWithOwner/repositoryName)
+		// but has no derivable repo PATH and is not a per-resource content type — the migration/
+		// enterprise namespace types RepositoryMigration / EnterpriseRepositoryInfo /
+		// UserNamespaceRepository. The node(id:) resolver already fails these closed (round-18 H), but
+		// augment never tagged them, so reaching one by NAVIGATION (e.g.
+		// organization(login:){repositoryMigrations{nodes{repositoryName state …}}}) forwarded its repo
+		// name + migration metadata unredacted (round-20). Inject a repo marker from nameWithOwner
+		// ("owner/repo" → authorized against its real repo); for a type whose only scalar is a BARE
+		// repositoryName (no owner) inject a TYPE marker only, so the filter attributes it to its nearest
+		// marked ancestor and fails CLOSED under a non-repo (org) scope where there is none.
+		if scalar == "nameWithOwner" {
+			*sels = append(*sels, &ast.Field{Alias: markerAlias, Name: scalar}, typenameMarker())
+			budget.count(2)
+		} else {
+			*sels = append(*sels, typenameMarker())
+			budget.count(1)
+		}
+		return
+	}
 	// Abstract type (interface/union): the runtime object is one of its concrete members.
 	// Interfaces/unions are NEVER themselves repo-scoped (deriveRepoPaths only pathes concrete
 	// types), so a selection written against the abstract type — `... on Comment { body }`,
@@ -244,6 +264,52 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 		*sels = append(*sels, s.memberTypeMarkerFragment(member))
 	}
 	budget.count(len(noPathMembers))
+	// Repo-identity-scalar members (RepositoryMigration / Enterprise…): a nameWithOwner member gets a
+	// repo-marker fragment (authorized against its own repo); a bare-repositoryName member gets a
+	// type-marker fragment (attributed to the nearest marked ancestor, fail-closed under an org scope) —
+	// mirroring the concrete repoIdentityScalar branch above (round-20).
+	idMembers := s.repoIdentityNoPathMembers(typeName)
+	for _, member := range idMembers {
+		if s.repoIdentityScalar[member] == "nameWithOwner" {
+			*sels = append(*sels, s.memberIdentityMarkerFragment(member))
+		} else {
+			*sels = append(*sels, s.memberTypeMarkerFragment(member))
+		}
+	}
+	budget.count(len(idMembers))
+}
+
+// repoIdentityNoPathMembers returns the repo-identity-scalar concrete object members of an
+// interface/union (sorted), so an abstract selection that could resolve to one is tagged and
+// attributed/fail-closed by the response filter. Empty for concrete types and for abstract types with
+// no such member.
+func (s *Schema) repoIdentityNoPathMembers(typeName string) []string {
+	def := s.schema.Types[typeName]
+	if def == nil || (def.Kind != ast.Interface && def.Kind != ast.Union) {
+		return nil
+	}
+	var out []string
+	for _, pt := range s.schema.PossibleTypes[typeName] {
+		if s.repoIdentityScalar[pt.Name] != "" {
+			out = append(out, pt.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// memberIdentityMarkerFragment builds `... on T { bghRepoTagZ9_T: nameWithOwner bghRepoTypeZ9: __typename }`
+// for a repoIdentityNoPath concrete type T (one whose self-identifying scalar is nameWithOwner) reached
+// through an enclosing abstract selection: T self-identifies its repository and the filter authorizes it
+// against that repo. The per-member alias avoids field-merge conflicts with sibling member fragments.
+func (s *Schema) memberIdentityMarkerFragment(typeName string) *ast.InlineFragment {
+	return &ast.InlineFragment{
+		TypeCondition: typeName,
+		SelectionSet: ast.SelectionSet{
+			&ast.Field{Alias: markerAlias + "_" + typeName, Name: s.repoIdentityScalar[typeName]},
+			typenameMarker(),
+		},
+	}
 }
 
 // repoOwnedNoPathMembers returns the repo-owned-but-unattributable concrete object members of an
@@ -627,6 +693,16 @@ func (s *Schema) FilterResource(typename string) string {
 // NOT recognized here (live schema drift), instead of treating it as a constraint-free non-repo node.
 func (s *Schema) IsKnownNodeObjectType(typename string) bool {
 	return s.nodeTypes[typename]
+}
+
+// IsKnownObjectType reports whether typename is an OBJECT type the embedded schema recognizes (not just
+// Node implementors — repo-scoped leaf content like Submodule is not a Node). The response filter denies
+// a repo-marked object whose runtime __typename is unknown (live schema drift) rather than authorize it
+// against the lenient "metadata" FilterResource default, mirroring the node resolver's drift
+// fail-closed (round-20).
+func (s *Schema) IsKnownObjectType(typename string) bool {
+	def := s.schema.Types[typename]
+	return def != nil && def.Kind == ast.Object
 }
 
 // repoFromMarker extracts owner/repo from a marker value. The marker subtree contains only

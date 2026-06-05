@@ -434,6 +434,71 @@ func collectRepoResources(sels ast.SelectionSet, fragments ast.FragmentDefinitio
 	}
 }
 
+// gqlOrgFieldToResource maps an organization owner-root sub-field to the org per-resource policy key
+// the REST surface gates the same data under (orgResource = the URL segment): membersWithRole/members
+// → "members" (REST /orgs/{org}/members), teams/team → "teams" (REST /orgs/{org}/teams). So a
+// [org.permissions] members="none" / teams="none" carve-out is enforced on the GraphQL owner-root too,
+// the parity of the round-17 REST orgResource fix that the GraphQL path was missing (round-20). Only
+// the member/team LIST fields an operator realistically carves out are mapped; every other org
+// sub-field is base-governed (Resource ""), so plain org-metadata reads are unaffected.
+var gqlOrgFieldToResource = map[string]string{
+	"membersWithRole": "members",
+	"members":         "members",
+	"pendingMembers":  "members",
+	"team":            "teams",
+	"teams":           "teams",
+}
+
+// gqlOrgResources returns each distinct org per-resource key an owner-root (organization/
+// repositoryOwner/user) selection touches, plus "" (base org access) for any base-governed field or a
+// pure-metadata selection. A query reading membersWithRole is thus gated on the "members" key; reading
+// only name/description is gated on base org access exactly as before. It walks fragment boundaries
+// (so `... on Organization{ membersWithRole }` under a repositoryOwner root is caught) but not into a
+// field's own sub-selection, mirroring gqlRepoResources.
+func gqlOrgResources(orgField *ast.Field, fragments ast.FragmentDefinitionList) []string {
+	set := map[string]struct{}{}
+	baseGoverned := false
+	collectOrgResources(orgField.SelectionSet, fragments, set, &baseGoverned, map[string]bool{}, 0)
+	out := make([]string, 0, len(set)+1)
+	for r := range set {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	if baseGoverned || len(out) == 0 {
+		out = append(out, "") // base-governed/metadata fields get their own base scope (listed last)
+	}
+	return out
+}
+
+func collectOrgResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, seenFrags map[string]bool, depth int) {
+	if depth > maxGraphQLDepth {
+		*baseGoverned = true
+		return
+	}
+	for _, sel := range sels {
+		switch s := sel.(type) {
+		case *ast.Field:
+			if r, ok := gqlOrgFieldToResource[s.Name]; ok {
+				set[r] = struct{}{}
+			} else if s.Name != "__typename" {
+				*baseGoverned = true // metadata or any unmapped field → base org access
+			}
+		case *ast.InlineFragment:
+			collectOrgResources(s.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1)
+		case *ast.FragmentSpread:
+			if seenFrags[s.Name] {
+				continue
+			}
+			if frag := fragments.ForName(s.Name); frag != nil {
+				seenFrags[s.Name] = true
+				collectOrgResources(frag.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1)
+			} else {
+				*baseGoverned = true // unresolvable spread → require base
+			}
+		}
+	}
+}
+
 func gqlUnscopedCategory(doc *ast.QueryDocument) string {
 	for _, op := range doc.Operations {
 		for _, sel := range op.SelectionSet {
@@ -565,7 +630,13 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 				// user(login:){repositories} read dodged the owner scope.
 				login := resolveStringArg(s.Arguments, "login", vars)
 				if login != "" {
-					add(Scope{Org: login})
+					// Emit one org scope per per-resource key the selection touches (membersWithRole →
+					// "members", teams → "teams"), so a [org.permissions] carve-out is enforced over
+					// GraphQL too — not just the base org access (round-20). A pure-metadata selection
+					// yields a single "" (base) scope, unchanged.
+					for _, res := range gqlOrgResources(s, fragments) {
+						add(Scope{Org: login, Resource: res})
+					}
 					// Enumerating this owner's own repos/orgs is allowed; reaching forks/
 					// parents in other owners is not.
 					scanCrossRepoNav(s.SelectionSet, fragments, gqlForkNavFields, escapes, map[string]bool{}, depth+1, tooComplex)
@@ -695,6 +766,20 @@ func looksLikeShortLegacyNodeID(s string) bool {
 func isExcludedNodeIDKey(name string) bool {
 	n := strings.ToLower(name)
 	return n == "clientmutationid" || n == "externalid" || strings.HasSuffix(n, "oid")
+}
+
+// collectibleNodeIDKey reports whether a value under argument/field `name` should be collected as a
+// node ID. Excluded keys (clientMutationId/externalId and *Oid git-SHA fields) are skipped UNLESS the
+// value has the modern "prefix_base64" node-ID shape — which a 40-hex GitObjectID never matches (it has
+// no underscore) — so a genuine ID-typed argument whose name merely ends in "oid" (e.g.
+// AddDiscussionCommentInput.replyToId, whose value is a DiscussionComment node ID) is still scoped
+// rather than silently dropped from policy. The blind *oid suffix exclusion was a name-based fail-open;
+// this narrows it to actual SHA-shaped values (round-20). add() re-filters by node-ID shape regardless.
+func collectibleNodeIDKey(name, value string) bool {
+	if !isExcludedNodeIDKey(name) {
+		return true
+	}
+	return newNodeIDPattern.MatchString(value)
 }
 
 // isRepoSpecKey reports whether an input field names a repository by STRING ("owner/repo")
@@ -857,7 +942,7 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 			if o, r, ok := splitOwnerRepo(v.Raw); ok {
 				addScope(o, r, resource)
 			}
-		} else if !isExcludedNodeIDKey(name) {
+		} else if collectibleNodeIDKey(name, v.Raw) {
 			add(v.Raw, resource) // add() re-filters by node-ID shape
 		}
 	case ast.Variable:
@@ -866,7 +951,7 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 			if o, r, ok := splitOwnerRepo(s); ok {
 				addScope(o, r, resource)
 			}
-		} else if s != "" && !isExcludedNodeIDKey(name) {
+		} else if s != "" && collectibleNodeIDKey(name, s) {
 			add(s, resource)
 		}
 	case ast.ObjectValue:
@@ -894,7 +979,7 @@ func walkVarsForIDs(key string, v interface{}, add func(string), addScope func(o
 			if o, r, ok := splitOwnerRepo(val); ok {
 				addScope(o, r, "")
 			}
-		} else if !isExcludedNodeIDKey(key) {
+		} else if collectibleNodeIDKey(key, val) {
 			add(val)
 		}
 	case map[string]interface{}:
@@ -1175,6 +1260,12 @@ var gqlFieldToResource = map[string]string{
 	"commitComments": "commits",
 
 	"deployments": "deployments",
+
+	// deployKeys → "keys": mirror restResourceMap (keys/deploy-keys → "keys") so the classifier scopes
+	// repository(){deployKeys{…}} to the `keys` resource and a keys="none" carve-out denies the query at
+	// the front gate, identical to GET /repos/{o}/{r}/keys. The response filter also redacts DeployKey
+	// objects (docsCategoryResource deploy-keys→keys) as defense in depth (round-20).
+	"deployKeys": "keys",
 }
 
 func gqlMutationResource(name string) string {
