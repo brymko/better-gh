@@ -508,6 +508,19 @@ var gqlOrgFieldToResource = map[string]string{
 	// centric response filter never redacts (AuditEntry is @docsCategory "enterprise-admin"/"orgs", not a
 	// repo). Unmapped it degraded to base org read, bypassing members="none" (round-22). Gate on "members".
 	"auditLog": "members",
+	// Owner-private CONTENT the REST per-resource axis already gates but the GraphQL owner-root degraded to
+	// base read, so an `[org.permissions] projects="none"`/`sponsors="none"` carve-out the REST sibling
+	// enforces (GET /orgs/{org}/projects → "projects") was bypassed over GraphQL — including via the
+	// repository().owner navigation path (round-37). Org ProjectV2/classic boards can be PRIVATE; the org
+	// Sponsors financials/activity feed is org-admin-only. Gate them on the same keys REST uses.
+	// sponsorsListing/hasSponsorsListing are the PUBLIC sponsor profile, so they are intentionally NOT mapped.
+	"projectsV2": "projects", "projectV2": "projects", "projects": "projects",
+	"project": "projects", "recentProjects": "projects",
+	"sponsorsActivities": "sponsors", "monthlyEstimatedSponsorsIncomeInCents": "sponsors",
+	"estimatedNextSponsorsPayoutInCents": "sponsors", "totalSponsorshipAmountAsSponsorInCents": "sponsors",
+	"lifetimeReceivedSponsorshipValues": "sponsors", "sponsorshipsAsMaintainer": "sponsors",
+	"sponsorshipsAsSponsor": "sponsors", "sponsorshipNewsletters": "sponsors",
+	"sponsors": "sponsors", "sponsoring": "sponsors",
 }
 
 // gqlOrgResources returns each distinct org per-resource key an owner-root (organization/
@@ -1033,6 +1046,18 @@ func isRepoSpecKey(name string) bool {
 	return strings.EqualFold(name, "repositoryNameWithOwner")
 }
 
+// repoSpecKeyResource returns the TYPE-derived per-resource key a string repo-target implies IN ADDITION to
+// the enclosing mutation's resource — mirroring the node-form's nodeResourceKeys union (round-25). The only
+// repositoryNameWithOwner-bearing input is CommittableBranch (createCommitOnBranch), which advances a branch
+// tip, so it requires "branches" too; without it the string form bypassed a branches="none" carve-out while
+// the equivalent Ref-node form (branch:{id:…}) was correctly gated on contents+branches (round-37).
+func repoSpecKeyResource(name string) string {
+	if strings.EqualFold(name, "repositoryNameWithOwner") {
+		return "branches"
+	}
+	return ""
+}
+
 // splitOwnerRepo parses an "owner/repo" string (exactly one slash, non-empty halves).
 func splitOwnerRepo(s string) (owner, repo string, ok bool) {
 	if strings.Count(s, "/") != 1 {
@@ -1195,6 +1220,9 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 		if isRepoSpecKey(name) {
 			if o, r, ok := splitOwnerRepo(v.Raw); ok {
 				addScope(o, r, resource)
+				if tr := repoSpecKeyResource(name); tr != "" && tr != resource {
+					addScope(o, r, tr) // string-target type resource (branches), mirroring the node-form union
+				}
 			}
 		} else if collectibleNodeIDKey(name, v.Raw) {
 			add(v.Raw, resource) // add() re-filters by node-ID shape
@@ -1204,6 +1232,9 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 		if isRepoSpecKey(name) {
 			if o, r, ok := splitOwnerRepo(s); ok {
 				addScope(o, r, resource)
+				if tr := repoSpecKeyResource(name); tr != "" && tr != resource {
+					addScope(o, r, tr)
+				}
 			}
 		} else if s != "" && collectibleNodeIDKey(name, s) {
 			add(s, resource)

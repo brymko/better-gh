@@ -1187,13 +1187,26 @@ var crossRepoURIScrubTypes = map[string]bool{"CrossReferencedEvent": true}
 // scalars point at the FOREIGN referencing issue/PR, so they must be checked against THAT repo. An
 // unparseable value fails closed (nulled); a same-repo reference parses to the allowed repo → Keep → kept.
 func scrubCrossRepoURIScalars(val map[string]any, authorize func(owner, repo, resource, typename string) Decision, typename string) {
+	// VALUE-driven (not key-driven): scan EVERY string field, because a client ALIAS (`leak: url`) moves the
+	// scalar off its canonical key, dodging a key-name lookup — the round-26/36 alias class, surfaced again
+	// here (round-37). Null any field whose value parses to an issue/PR ref in a repo the policy denies.
+	for k, v := range val {
+		s, ok := v.(string)
+		if !ok || s == "" {
+			continue
+		}
+		if owner, repo, parsed := repoFromIssueOrPullRef(s); parsed && authorize(owner, repo, typeResource(typename), typename) == Deny {
+			val[k] = nil
+		}
+	}
+	// Preserve the round-22 canonical-key FAIL-CLOSED: a `url`/`resourcePath` that does not cleanly parse to
+	// an ALLOWED repo is nulled even when the value-driven scan could not classify it.
 	for _, field := range []string{"url", "resourcePath"} {
 		s, ok := val[field].(string)
 		if !ok || s == "" {
 			continue
 		}
-		owner, repo, parsed := repoFromIssueOrPullRef(s)
-		if !parsed || authorize(owner, repo, typeResource(typename), typename) == Deny {
+		if owner, repo, parsed := repoFromIssueOrPullRef(s); !parsed || authorize(owner, repo, typeResource(typename), typename) == Deny {
 			val[field] = nil
 		}
 	}
