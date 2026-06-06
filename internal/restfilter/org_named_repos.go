@@ -26,12 +26,102 @@ var orgNamedRepoArrayOps = []string{
 	"/orgs/{org}/attestations/repositories",
 }
 
+// nestedBareNameRepoOps return a DEEPLY-NESTED bare-`name` repository array (no full_name/id/url) the
+// generator/body-scan cannot locate — the org Copilot metrics feeds, whose
+// copilot_dotcom_pull_requests.repositories[] names a repo only by a bare `name` qualified by the path org.
+// A client with the org at base=read but a per-repo `none` carve-out otherwise enumerated the denied
+// private repo's NAME + Copilot usage (round-33, same class as attestations/repositories round-20).
+// TestSpecCoverage_NestedBareNameRepos asserts this list equals the spec ops with that shape.
+var nestedBareNameRepoOps = []string{
+	"/orgs/{org}/copilot/metrics",
+	"/orgs/{org}/team/{team_slug}/copilot/metrics",
+}
+
 var orgNamedRepoTemplates []opTemplate
+var nestedBareNameRepoTemplates []opTemplate
 
 func init() {
 	for _, p := range orgNamedRepoArrayOps {
 		orgNamedRepoTemplates = append(orgNamedRepoTemplates, parseTemplate(p, nil))
 	}
+	for _, p := range nestedBareNameRepoOps {
+		nestedBareNameRepoTemplates = append(nestedBareNameRepoTemplates, parseTemplate(p, nil))
+	}
+}
+
+// IsNestedBareNameRepoOp reports whether normPath returns a nested bare-`name` repository array qualified
+// by the path org (segments[1]).
+func IsNestedBareNameRepoOp(normPath string) bool {
+	ps := segments(normPath)
+	for _, t := range nestedBareNameRepoTemplates {
+		if t.matches(ps) {
+			return true
+		}
+	}
+	return false
+}
+
+// RedactNestedBareNameRepos walks the response and, for every nested `repositories` array whose elements
+// name a repo only by a bare `name` (no full_name/url), drops the ones whose owner/name the policy denies
+// (owner = the path org). Fails closed on a non-empty unparseable body or a missing path owner. Other
+// `repositories` shapes (full_name-bearing) are left to the full_name scan.
+func RedactNestedBareNameRepos(body []byte, owner string, authorized func(ownerRepo string) bool) ([]byte, bool) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return body, true
+	}
+	if owner == "" {
+		return nil, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var root any
+	if dec.Decode(&root) != nil {
+		return nil, false
+	}
+	redactBareNameReposWalk(root, owner, authorized)
+	out, err := json.Marshal(root)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func redactBareNameReposWalk(v any, owner string, authorized func(string) bool) {
+	switch t := v.(type) {
+	case map[string]any:
+		if arr, ok := t["repositories"].([]any); ok && isBareNameRepoArray(arr) {
+			t["repositories"] = filterNamedRepoArray(arr, owner, authorized)
+		}
+		for _, c := range t {
+			redactBareNameReposWalk(c, owner, authorized)
+		}
+	case []any:
+		for _, c := range t {
+			redactBareNameReposWalk(c, owner, authorized)
+		}
+	}
+}
+
+// isBareNameRepoArray reports whether arr is a non-empty array of objects each naming a repo by a BARE
+// `name` (no "/") with no full_name (so it is the bare-name shape, not a full-repository array).
+func isBareNameRepoArray(arr []any) bool {
+	if len(arr) == 0 {
+		return false
+	}
+	for _, el := range arr {
+		m, ok := el.(map[string]any)
+		if !ok {
+			return false
+		}
+		name, ok := m["name"].(string)
+		if !ok || strings.Contains(name, "/") {
+			return false
+		}
+		if _, hasFull := m["full_name"]; hasFull {
+			return false
+		}
+	}
+	return true
 }
 
 // IsOrgNamedRepoArray reports whether normPath returns a bare {id,name} repo array qualified by the

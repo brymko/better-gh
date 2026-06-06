@@ -405,6 +405,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				respFilter = func(resp []byte) ([]byte, bool) {
 					return restfilter.RedactOrgNamedRepos(resp, owner, canRead)
 				}
+			case restfilter.IsNestedBareNameRepoOp(norm):
+				owner := classified.Org
+				if owner == "" {
+					owner = classified.Owner
+				}
+				respFilter = func(resp []byte) ([]byte, bool) {
+					return restfilter.RedactNestedBareNameRepos(resp, owner, canRead)
+				}
 			default:
 				passScan = canRead
 			}

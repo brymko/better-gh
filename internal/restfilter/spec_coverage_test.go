@@ -146,6 +146,102 @@ func TestSpecCoverage_PathNamedReposScoped(t *testing.T) {
 
 func mapOf(v any) map[string]any { m, _ := v.(map[string]any); return m }
 
+// TestSpecCoverage_NestedBareNameRepos derives from the embedded spec every GET whose response nests a
+// `repositories` array of BARE-`name` repo objects (no full_name/url/id — the shape the generator and the
+// Pass body-scan can't locate) and asserts each is in nestedBareNameRepoOps, so a spec refresh adding
+// another such op (the round-33 Copilot-metrics class) fails the build instead of silently leaking a denied
+// repo's name (RepoReach's bare-name blind spot — these ops are otherwise skipped by NoPathScopedLeak).
+func TestSpecCoverage_NestedBareNameRepos(t *testing.T) {
+	raw, err := os.ReadFile("testdata/api.github.com.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec struct {
+		Paths      map[string]map[string]json.RawMessage `json:"paths"`
+		Components struct {
+			Schemas map[string]json.RawMessage `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	var deref func(m map[string]any, depth int) map[string]any
+	deref = func(m map[string]any, depth int) map[string]any {
+		if m == nil || depth > 12 {
+			return m
+		}
+		if ref, ok := m["$ref"].(string); ok {
+			var sub map[string]any
+			if json.Unmarshal(spec.Components.Schemas[ref[strings.LastIndex(ref, "/")+1:]], &sub) == nil {
+				return deref(sub, depth+1)
+			}
+		}
+		return m
+	}
+	var nestsBareNameRepos func(sch map[string]any, depth int) bool
+	nestsBareNameRepos = func(sch map[string]any, depth int) bool {
+		sch = deref(sch, depth)
+		if sch == nil || depth > 12 {
+			return false
+		}
+		props, _ := sch["properties"].(map[string]any)
+		for name, p := range props {
+			pm := deref(mapOf(p), depth)
+			if name == "repositories" {
+				items := deref(mapOf(pm["items"]), depth)
+				ip, _ := items["properties"].(map[string]any)
+				_, hasName := ip["name"]
+				_, hasFull := ip["full_name"]
+				_, hasURL := ip["url"]
+				_, hasID := ip["id"]
+				if hasName && !hasFull && !hasURL && !hasID {
+					return true
+				}
+			}
+			if nestsBareNameRepos(pm, depth+1) {
+				return true
+			}
+		}
+		if items, ok := pm2(sch["items"]); ok && nestsBareNameRepos(items, depth+1) {
+			return true
+		}
+		return false
+	}
+	registered := map[string]bool{}
+	for _, p := range nestedBareNameRepoOps {
+		registered[p] = true
+	}
+	var missing []string
+	for path, methods := range spec.Paths {
+		rawOp, ok := methods["get"]
+		if !ok {
+			continue
+		}
+		var op struct {
+			Responses map[string]struct {
+				Content map[string]struct {
+					Schema map[string]any `json:"schema"`
+				} `json:"content"`
+			} `json:"responses"`
+		}
+		if json.Unmarshal(rawOp, &op) != nil {
+			continue
+		}
+		sch := op.Responses["200"].Content["application/json"].Schema
+		if sch != nil && nestsBareNameRepos(sch, 0) && !registered[path] {
+			missing = append(missing, "GET "+path)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Fatalf("%d GET op(s) nest a bare-name repositories[] array but are NOT in nestedBareNameRepoOps — "+
+			"they leak a denied repo's name (the Pass body-scan can't see a bare name): add them:\n  %s",
+			len(missing), strings.Join(missing, "\n  "))
+	}
+}
+
+func pm2(v any) (map[string]any, bool) { m, ok := v.(map[string]any); return m, ok }
+
 func classifierScopesRepo(r classifier.Result, owner, repo string) bool {
 	for _, s := range r.AllScopes() {
 		if s.Owner == owner && s.Repo == repo {
