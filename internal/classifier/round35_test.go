@@ -73,11 +73,11 @@ func classifierScopesOrgR35(r Result, org string) bool {
 	return false
 }
 
-// r35ViewerRelativePublic are the viewerPrivateFieldCategory User fields intentionally NOT response-nulled
-// on a NAVIGATED User: they are about the requesting VIEWER's relationship to the navigated user (not the
-// navigated user's own private data), and round-28 keeps them public on navigation (sponsorablePublicFields).
+// r35ViewerRelativePublic are the viewerPrivateFieldCategory User fields intentionally NOT response-nulled on
+// a NAVIGATED User. Only sponsorsListing remains: it is the PUBLIC sponsor profile. (sponsorshipForViewerAs*
+// were here until round-40 F3/F4/F8 showed they leak the custodian's OWN tier price / payment source — they
+// are now in gqlfilter.userPrivateFields, gated on user_private on User AND Organization nav paths.)
 var r35ViewerRelativePublic = map[string]bool{
-	"sponsorshipForViewerAsSponsor": true, "sponsorshipForViewerAsSponsorable": true,
 	"sponsorsListing": true,
 }
 

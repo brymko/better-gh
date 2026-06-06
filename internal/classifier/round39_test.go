@@ -14,8 +14,20 @@ import (
 // enforced at the request gate but bypassed on a navigation path the request scope cannot reach.
 func TestR39_OwnerContentResourceInSync(t *testing.T) {
 	gqlMap := gqlfilter.OwnerContentResource()
-	// (1) forward: gqlfilter ⊆ classifier, same resource.
+	// (1) forward: gqlfilter ⊆ classifier, same resource. The viewer-private sentinel fields
+	// (sponsorshipForViewerAs*) are gated on the user_private CATEGORY (not an org/enterprise per-resource
+	// key), so they are classified via viewerPrivateFieldCategory at the roots, not gqlOrgFieldToResource —
+	// exclude them from this request↔response per-resource coupling.
+	viewerPrivateSentinel := map[string]bool{
+		"sponsorshipForViewerAsSponsor": true, "sponsorshipForViewerAsSponsorable": true,
+	}
 	for field, res := range gqlMap {
+		if viewerPrivateSentinel[field] {
+			if viewerPrivateFieldCategory[field] != "user_private" {
+				t.Errorf("viewer-private sentinel field %q must be classified user_private at the roots, got %q", field, viewerPrivateFieldCategory[field])
+			}
+			continue
+		}
 		if gqlOrgFieldToResource[field] != res && gqlEnterpriseFieldToResource[field] != res {
 			t.Errorf("gqlfilter.ownerContentResource[%q]=%q but classifier maps it to org=%q/ent=%q — request/response drift",
 				field, res, gqlOrgFieldToResource[field], gqlEnterpriseFieldToResource[field])

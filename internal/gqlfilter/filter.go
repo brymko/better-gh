@@ -69,7 +69,18 @@ const ownerContentMarkerPrefix = "bghOwnerCZ9_"
 // ownerMemberMarkerPrefix mechanism) to its per-resource policy key, mirroring the classifier's
 // gqlOrgFieldToResource + gqlEnterpriseFieldToResource. TestR39_OwnerContentResourceInSync couples it to the
 // classifier so the request and response sides cannot drift.
+//
+// viewerPrivateContentResource is a SENTINEL "resource" (alias-safe, matches no real per-resource key) for an
+// owner field that is actually the VIEWER's (custodian's) private data, not the owner's — the Sponsorable
+// `sponsorshipForViewerAs*` fields, which return the custodian's own sponsorship tier price / payment source /
+// privacy level relative to the navigated org/user (round-40 F3/F4/F8). RedactDeniedOwnerPrivate gates a marker
+// carrying this sentinel on the user_private CATEGORY (categoryDenied), not the owner's per-resource policy, so
+// it is denied to any token lacking user_private regardless of the owner grant.
+const viewerPrivateContentResource = "viewerprivateZZ"
+
 var ownerContentResource = map[string]string{
+	// viewer-private-on-owner (gated on the user_private category via the sentinel)
+	"sponsorshipForViewerAsSponsor": viewerPrivateContentResource, "sponsorshipForViewerAsSponsorable": viewerPrivateContentResource,
 	// Organization
 	"projectsV2": "projects", "projectV2": "projects", "projects": "projects",
 	"project": "projects", "recentProjects": "projects",
@@ -193,6 +204,10 @@ var userPrivateFields = map[string]bool{
 	// (Gist|Repository) union — gated on "gists" so a navigated author's pinned secret gists are nulled
 	// when the gists category is denied (round-36).
 	"pinnableItems": true, "pinnedItems": true, "itemShowcase": true,
+	// sponsorshipForViewerAs* return the CUSTODIAN's own (viewer-relative) private sponsorship — tier price,
+	// payment source, privacy level — relative to this navigated user; gated on user_private so a navigated
+	// User edge cannot leak the custodian's financials (round-40 F3/F4/F8, correcting r35ViewerRelativePublic).
+	"sponsorshipForViewerAsSponsor": true, "sponsorshipForViewerAsSponsorable": true,
 }
 
 // userGistFields are the userPrivateFields whose policy category is "gists" (parity with REST /gists and
@@ -376,7 +391,13 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 				}
 			}
 			for _, cm := range contentMarks {
-				if effectiveOwner == "" || denied(effectiveOwner, cm.resource) {
+				var deny bool
+				if cm.resource == viewerPrivateContentResource {
+					deny = categoryDenied("user_private") // the custodian's own data, gated on the category
+				} else {
+					deny = effectiveOwner == "" || denied(effectiveOwner, cm.resource)
+				}
+				if deny {
 					if _, present := val[cm.key]; present {
 						val[cm.key] = nil
 					}

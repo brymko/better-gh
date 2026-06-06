@@ -1111,6 +1111,23 @@ func repoSpecKeyResource(name string) string {
 	return ""
 }
 
+// argValueString resolves an ast.Value to its string content (a string/block literal, or a variable bound to
+// a string), or "" otherwise — used to read SPLIT repo-target fields (repositoryOwnerLogin/repositoryName,
+// round-40).
+func argValueString(v *ast.Value, vars map[string]interface{}) string {
+	if v == nil {
+		return ""
+	}
+	switch v.Kind {
+	case ast.StringValue, ast.BlockValue:
+		return v.Raw
+	case ast.Variable:
+		s, _ := vars[v.Raw].(string)
+		return s
+	}
+	return ""
+}
+
 // splitOwnerRepo parses an "owner/repo" string (exactly one slash, non-empty halves).
 func splitOwnerRepo(s string) (owner, repo string, ok bool) {
 	if strings.Count(s, "/") != 1 {
@@ -1293,6 +1310,22 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 			add(s, resource)
 		}
 	case ast.ObjectValue:
+		// SPLIT string repo target: an input object naming a repo by SEPARATE owner + name fields
+		// (createSponsorsTier's repositoryOwnerLogin + repositoryName) rather than the combined
+		// repositoryNameWithOwner — the round-37 string-target sibling that rode a benign carrier node past a
+		// per-repo `none` (round-40). Combine them into an explicit scope so the policy can deny the target.
+		var splitOwner, splitRepo string
+		for _, child := range v.Children {
+			switch {
+			case strings.EqualFold(child.Name, "repositoryOwnerLogin"):
+				splitOwner = argValueString(child.Value, vars)
+			case strings.EqualFold(child.Name, "repositoryName"):
+				splitRepo = argValueString(child.Value, vars)
+			}
+		}
+		if splitOwner != "" && splitRepo != "" && !strings.Contains(splitRepo, "/") {
+			addScope(splitOwner, splitRepo, resource)
+		}
 		for _, child := range v.Children {
 			walkArgValue(child.Name, child.Value, vars, add, addScope, resource, depth+1, tooComplex)
 		}

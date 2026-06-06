@@ -141,3 +141,37 @@ func TestR40_NonOwnerContentRedacted(t *testing.T) {
 		t.Fatalf("EnterpriseOwnerInfo.domains not nulled under settings-denied: %s", js)
 	}
 }
+
+// TestR40_ViewerSponsorshipGatedOnNav pins the round-40 F3/F4/F8 fix: the custodian's own (viewer-relative)
+// sponsorship financials reached via a navigated Organization (or User) are gated on the user_private CATEGORY
+// (the sentinel resource), so a token lacking user_private cannot read the custodian's tier price / payment
+// source even on a base-ALLOWED owner.
+func TestR40_ViewerSponsorshipGatedOnNav(t *testing.T) {
+	s, _ := Load()
+	out, err := s.Augment(`{ repository(owner:"a",name:"r"){ owner{ ...on Organization{ sp: sponsorshipForViewerAsSponsor{ tier{ monthlyPriceInCents } } } } } }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, ownerContentMarkerPrefix+resourceCode(viewerPrivateContentResource)+"__sp") {
+		t.Fatalf("sponsorshipForViewerAsSponsor not content-marked (sentinel) on navigated Organization:\n%s", out)
+	}
+	// org base-ALLOWED but user_private DENIED → the custodian's sponsorship is nulled. (Fresh body per call —
+	// RedactDeniedOwnerPrivate mutates the map in place.)
+	orgAllowed := func(owner, resource string) bool { return false }
+	body := func() map[string]any {
+		return map[string]any{
+			ownerMarkerAlias: "acme",
+			ownerContentMarkerPrefix + resourceCode(viewerPrivateContentResource) + "__sp": "Organization",
+			"sp":   map[string]any{"tier": map[string]any{"monthlyPriceInCents": "SECRET_TIER_PRICE"}},
+			"name": "acme",
+		}
+	}
+	upDenied := func(cat string) bool { return cat == "user_private" }
+	if js := mustJSON(RedactDeniedOwnerPrivate(body(), orgAllowed, upDenied)); strings.Contains(js, "SECRET_TIER_PRICE") {
+		t.Fatalf("custodian sponsorship leaked under user_private-denied on a base-allowed org nav: %s", js)
+	}
+	upAllowed := func(string) bool { return false }
+	if js := mustJSON(RedactDeniedOwnerPrivate(body(), orgAllowed, upAllowed)); !strings.Contains(js, "SECRET_TIER_PRICE") {
+		t.Fatalf("sponsorship wrongly nulled when user_private granted: %s", js)
+	}
+}
