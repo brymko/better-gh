@@ -34,6 +34,7 @@ func TestSec_R25_NestedOrgMemberRoster(t *testing.T) {
 			t.Errorf("proxy did not inject the org-login marker into the forwarded query")
 		}
 		io.WriteString(w, `{"data":{"organization":{"bghOrgLoginZ9":"acme","teams":{"nodes":[{"organization":{"bghOrgLoginZ9":"acme",`+
+			`"bghOrgMemZ9_membersWithRole":"Organization",`+
 			`"membersWithRole":{"nodes":[{"login":"secret-admin","email":"admin@acme.internal"}]}}}]}}}}`)
 	}))
 	t.Cleanup(upstream.Close)

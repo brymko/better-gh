@@ -18,7 +18,7 @@ func TestR25_OrgMemberResponseFieldsInSync(t *testing.T) {
 		}
 	}
 	responseFields := map[string]bool{}
-	for _, f := range gqlfilter.OrgMemberResponseFields() {
+	for _, f := range gqlfilter.OrgMemberFieldNames() {
 		responseFields[f] = true
 	}
 	for f := range requestMembers {

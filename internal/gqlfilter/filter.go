@@ -24,57 +24,96 @@ const markerAlias = "bghRepoTagZ9"
 // repo-only marker cannot do (it is repo-granular). Stripped from the response like markerAlias.
 const markerTypeAlias = "bghRepoTypeZ9"
 
-// orgLoginMarkerAlias is injected as `bghOrgLoginZ9: login` onto every Organization object so the
-// response filter can enforce [org.permissions] members="none" on member-identity fields reached by ANY
-// navigation path, not just an org/user ROOT (round-25). Reserved like the repo markers so a client cannot
+// ownerMarkerAlias is injected as `bghOrgLoginZ9: login` (Organization) / `: slug` (Enterprise) onto every
+// owner object so the response filter can enforce org/enterprise policy on owner-private data reached by
+// ANY navigation path, not just an org/user/enterprise ROOT (round-25/26). Reserved so a client cannot
 // pre-declare it to forge/suppress redaction.
-const orgLoginMarkerAlias = "bghOrgLoginZ9"
+const ownerMarkerAlias = "bghOrgLoginZ9"
 
-// orgMemberResponseFields are the Organization fields that expose owner-private member identity (the
-// GraphQL counterparts of the classifier's gqlOrgFieldToResource "members" keys); RedactDeniedOrgMembers
-// nulls them on an org whose members carve-out is denied. Keep in sync with gqlOrgFieldToResource.
-var orgMemberResponseFields = map[string]bool{
+// ownerMemberMarkerPrefix + the member field's RESPONSE KEY is injected as a sibling marker for each
+// member-identity field selected on an owner object, so RedactDeniedOwnerPrivate can null that field by
+// its real key regardless of a client ALIAS (round-26: a `roster: membersWithRole` alias defeated the
+// round-25 null-by-field-name). The suffix is the response key, which is a valid GraphQL name.
+const ownerMemberMarkerPrefix = "bghOrgMemZ9_"
+
+// orgMemberFieldNames are Organization member-identity fields (synced with the classifier's
+// gqlOrgFieldToResource "members" keys); enterpriseMemberFieldNames are the Enterprise counterparts.
+// A member field is nulled when the owner's "members" carve-out is denied but base IS readable.
+var orgMemberFieldNames = map[string]bool{
 	"membersWithRole": true, "members": true, "pendingMembers": true, "memberStatuses": true,
 	"mannequins": true, "enterpriseOwners": true, "samlIdentityProvider": true, "auditLog": true,
 }
+var enterpriseMemberFieldNames = map[string]bool{
+	"members": true, "administrators": true, "ownerInfo": true, "memberInvitations": true,
+}
 
-// OrgMemberResponseFields returns the Organization member-identity field names the response filter nulls
-// for a members-denied org. A classifier test asserts this equals the gqlOrgFieldToResource "members"
-// keys, so the request-side scope set and the response-side redaction set cannot drift apart.
-func OrgMemberResponseFields() []string {
-	out := make([]string, 0, len(orgMemberResponseFields))
-	for f := range orgMemberResponseFields {
+// ownerPublicFields are the only fields kept when an owner object is BASE-denied (the client has no
+// org/enterprise access at all); every other field — billing, IP allow-list, domains, 2FA, members, … —
+// is nulled. Keeping by exact key (an aliased public field is also nulled) is safe here precisely BECAUSE
+// base is denied: over-redaction costs availability, never a leak. This is drift-proof: it does not
+// enumerate the (large, GitHub-evolving) owner-private field set, it nulls everything NOT public.
+var ownerPublicFields = map[string]bool{
+	"login": true, "name": true, "id": true, "__typename": true, "slug": true,
+	"url": true, "avatarUrl": true, "databaseId": true, "resourcePath": true,
+}
+
+// OrgMemberFieldNames returns the Organization member-identity field names; a classifier test asserts it
+// equals the gqlOrgFieldToResource "members" keys so the request and response sides cannot drift.
+func OrgMemberFieldNames() []string {
+	out := make([]string, 0, len(orgMemberFieldNames))
+	for f := range orgMemberFieldNames {
 		out = append(out, f)
 	}
 	sort.Strings(out)
 	return out
 }
 
-// RedactDeniedOrgMembers strips the injected org-login marker from every Organization object in a GraphQL
-// response and, when membersDenied reports that org's members carve-out is denied, NULLS its
-// member-identity fields. This is the response-side enforcement of org members="none" over GraphQL,
-// covering member data reached by navigation that the request-side classifier scope (org ROOT only) and
-// the repo-centric marker filter both miss (round-25). Always strips the marker, denied or not.
-func RedactDeniedOrgMembers(v any, membersDenied func(orgLogin string) bool) any {
+// RedactDeniedOwnerPrivate enforces org/enterprise policy on owner-private GraphQL data reached by ANY
+// navigation path — the response-side backstop the repo-centric marker filter and the org-ROOT-only
+// classifier scope both miss. For every owner object the augmenter marked (Organization/Enterprise):
+//   - if the owner is BASE-denied (no access), keep only public-identity fields and null the rest
+//     (billing/IP-allow-list/domains/2FA/members/…) — drift-proof and alias-proof;
+//   - else if its "members" carve-out is denied, null exactly the member-identity fields, addressed by
+//     the per-field RESPONSE-KEY markers so a client ALIAS cannot evade the null (round-26).
+//
+// `denied(owner, resource)` reports whether the policy denies that owner's resource ("" = base). The owner
+// marker and all member markers are always stripped, denied or not.
+func RedactDeniedOwnerPrivate(v any, denied func(owner, resource string) bool) any {
 	switch val := v.(type) {
 	case map[string]any:
-		if login, ok := val[orgLoginMarkerAlias].(string); ok {
-			delete(val, orgLoginMarkerAlias)
-			if membersDenied(login) {
-				for f := range orgMemberResponseFields {
-					if _, present := val[f]; present {
-						val[f] = nil
+		if owner, ok := val[ownerMarkerAlias].(string); ok {
+			delete(val, ownerMarkerAlias)
+			var memberKeys []string
+			for k := range val {
+				if strings.HasPrefix(k, ownerMemberMarkerPrefix) {
+					memberKeys = append(memberKeys, strings.TrimPrefix(k, ownerMemberMarkerPrefix))
+				}
+			}
+			for _, key := range memberKeys {
+				delete(val, ownerMemberMarkerPrefix+key)
+			}
+			switch {
+			case denied(owner, ""):
+				for k := range val {
+					if !ownerPublicFields[k] {
+						val[k] = nil
+					}
+				}
+			case denied(owner, "members"):
+				for _, key := range memberKeys {
+					if _, present := val[key]; present {
+						val[key] = nil
 					}
 				}
 			}
 		}
 		for k, c := range val {
-			val[k] = RedactDeniedOrgMembers(c, membersDenied)
+			val[k] = RedactDeniedOwnerPrivate(c, denied)
 		}
 		return val
 	case []any:
 		for i, c := range val {
-			val[i] = RedactDeniedOrgMembers(c, membersDenied)
+			val[i] = RedactDeniedOwnerPrivate(c, denied)
 		}
 		return val
 	}
@@ -252,10 +291,11 @@ func usesReservedAlias(sels ast.SelectionSet, depth int) bool {
 			if key == "" {
 				key = f.Name
 			}
-			if strings.HasPrefix(key, markerAlias) || strings.HasPrefix(key, markerTypeAlias) || strings.HasPrefix(key, orgLoginMarkerAlias) {
+			if strings.HasPrefix(key, markerAlias) || strings.HasPrefix(key, markerTypeAlias) ||
+				strings.HasPrefix(key, ownerMarkerAlias) || strings.HasPrefix(key, ownerMemberMarkerPrefix) {
 				// Reserve the whole marker namespace (exact aliases AND the per-member
-				// "markerAlias_Type" suffixes augment injects, plus the org-login marker), so a client
-				// cannot pre-declare a look-alike key to spoof/suppress a tag and defeat redaction.
+				// "markerAlias_Type" suffixes augment injects, plus the owner + per-member-field markers),
+				// so a client cannot pre-declare a look-alike key to spoof/suppress a tag and defeat redaction.
 				return true
 			}
 			if usesReservedAlias(f.SelectionSet, depth+1) {
@@ -351,16 +391,33 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 		}
 		return
 	}
-	if typeName == "Organization" {
-		// An Organization object is owner-private but NOT repo-scoped, so it carries no repo marker and
-		// the response filter never redacts its member-identity fields (membersWithRole/mannequins/
-		// auditLog/…). The classifier enforces [org.permissions] members="none" only when such a field is a
-		// DIRECT child of an org/repositoryOwner/user ROOT — a field reached by navigation
-		// (organization(){teams{nodes{organization{membersWithRole}}}}, user(){organizations{nodes{…}}})
-		// bypassed it (round-25). Inject the org login so RedactDeniedOrgMembers can null the member fields
-		// of any members-denied org REGARDLESS of the navigation path that reached it — the response-side
-		// backstop the repo-centric filter could not provide. Concrete type → no abstract member fanout.
-		*sels = append(*sels, &ast.Field{Alias: orgLoginMarkerAlias, Name: "login"})
+	if typeName == "Organization" || typeName == "Enterprise" {
+		// An Organization/Enterprise object is owner-private but NOT repo-scoped, so it carries no repo
+		// marker and the response filter never redacts its member/admin/billing data. The classifier
+		// enforces org/enterprise policy only at an org/user/enterprise ROOT; data reached by navigation
+		// (organization(){teams{nodes{organization{membersWithRole}}}}, user(){organizations|enterprises},
+		// repository().owner) bypassed it (round-25/26). Inject the owner identifier (login/slug) so
+		// RedactDeniedOwnerPrivate can enforce policy regardless of the navigation path, plus a per-field
+		// RESPONSE-KEY marker for each member-identity field so an alias can't dodge the null (round-26).
+		idField := "login"
+		memberFields := orgMemberFieldNames
+		if typeName == "Enterprise" {
+			idField = "slug"
+			memberFields = enterpriseMemberFieldNames
+		}
+		for _, sel := range *sels {
+			f, ok := sel.(*ast.Field)
+			if !ok || !memberFields[f.Name] {
+				continue
+			}
+			key := f.Alias
+			if key == "" {
+				key = f.Name
+			}
+			*sels = append(*sels, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
+			budget.count(1)
+		}
+		*sels = append(*sels, &ast.Field{Alias: ownerMarkerAlias, Name: idField})
 		budget.count(1)
 		return
 	}

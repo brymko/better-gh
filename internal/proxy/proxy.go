@@ -616,13 +616,14 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 	if ext, ok := filtered["extensions"]; ok {
 		filtered["extensions"] = scrubDeniedRepoStrings(ext, deniedRepo)
 	}
-	// Enforce [org.permissions] members="none" on member-identity fields reached by ANY navigation path
-	// (not just an org/user root the classifier scopes): null a members-denied org's member fields using
-	// the org login the augmenter injected (round-25).
-	membersDenied := func(orgLogin string) bool {
-		return orgLogin != "" && !pol.Evaluate("", orgLogin, classifier.Read, "members", "").Allowed
+	// Enforce org/enterprise policy on owner-private data (members + admin/billing/settings) reached by ANY
+	// navigation path, not just an org/user/enterprise root the classifier scopes: a base-denied owner is
+	// reduced to public identity and a members-denied owner loses its member-identity fields, using the
+	// owner identifier the augmenter injected (round-25/26).
+	ownerDenied := func(owner, resource string) bool {
+		return owner != "" && !pol.Evaluate("", owner, classifier.Read, resource, "").Allowed
 	}
-	filtered = gqlfilter.RedactDeniedOrgMembers(filtered, membersDenied).(map[string]any)
+	filtered = gqlfilter.RedactDeniedOwnerPrivate(filtered, ownerDenied).(map[string]any)
 	out, err := json.Marshal(filtered)
 	if err != nil {
 		return nil, false
