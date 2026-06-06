@@ -393,7 +393,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			//   - a bare {id,name} repo array qualified by the path org (/orgs/{org}/attestations/
 			//     repositories): the name has no owner, so it is redacted with the path owner instead.
 			switch {
-			case restfilter.HasOpaqueRepoID(norm):
+			// HasOpaqueRepoID excludes the SPECIFIC redactable-shape literals it would otherwise shadow: a
+			// wildcard opaque template (/orgs/{org}/attestations/{subject_digest}) also matches the literal
+			// redactable /orgs/{org}/attestations/repositories, so the redaction tables must win (round-35).
+			case restfilter.HasOpaqueRepoID(norm) && !restfilter.IsOrgNamedRepoArray(norm) && !restfilter.IsNestedBareNameRepoOp(norm):
 				if result.Allowed {
 					result = policy.Result{Reason: "endpoint identifies repositories only by opaque id; cannot be repo-filtered (fail closed)"}
 				}
@@ -631,7 +634,19 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 	ownerDenied := func(owner, resource string) bool {
 		return owner != "" && !pol.Evaluate("", owner, classifier.Read, resource, "").Allowed
 	}
-	filtered = gqlfilter.RedactDeniedOwnerPrivate(filtered, ownerDenied).(map[string]any)
+	// A navigated User's owner-private field is gated on its POLICY CATEGORY (gists for gist
+	// fields, user_private otherwise) — the response-side parity of the classifier's viewer/
+	// user(login:) front gate — so a token holding only an `[[org]] name="<login>"` repo-enumeration
+	// grant (which satisfies ownerDenied for that login) still cannot read the resolved user's private
+	// email/gists/keys via an author/uploadedBy/owner edge (round-35).
+	userFieldDenied := func(field string) bool {
+		cat := "user_private"
+		if gqlfilter.UserGistField(field) {
+			cat = "gists"
+		}
+		return !pol.Evaluate("", "", classifier.Read, "", cat).Allowed
+	}
+	filtered = gqlfilter.RedactDeniedOwnerPrivate(filtered, ownerDenied, userFieldDenied).(map[string]any)
 	out, err := json.Marshal(filtered)
 	if err != nil {
 		return nil, false

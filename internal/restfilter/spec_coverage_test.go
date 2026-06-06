@@ -240,6 +240,128 @@ func TestSpecCoverage_NestedBareNameRepos(t *testing.T) {
 	}
 }
 
+// TestSpecCoverage_OpaqueRepoIDOps is the build-time completeness guard for the opaque-numeric-id leak class
+// (round-20 /agents/tasks, round-35 copilot-spaces): a Pass GET op whose response declares a `repository_id`
+// integer property identifies its repo by a number the generator/body-scan cannot map, so a denied repo's
+// existence/id/name leaks unless the op fails closed. It derives from the embedded spec every GET op that
+// (a) declares a `repository_id` property, (b) is NOT repo-detectable (specderive RepoReach.Any()==false, so
+// it is a Pass op), and (c) is NOT path-scoped (no {owner}/{repo} the repo scope already gates), and asserts
+// each is registered in opaqueRepoIDOps (→ fail closed when not path-scoped). A spec refresh that adds such
+// an op fails the build. (Ops whose repo id hides under an opaque additionalProperties metadata object carry
+// no declared `repository_id` and are invisible here — those are hand-audited; see opaque_repo.go.)
+func TestSpecCoverage_OpaqueRepoIDOps(t *testing.T) {
+	raw, err := os.ReadFile("testdata/api.github.com.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec struct {
+		Paths      map[string]map[string]json.RawMessage `json:"paths"`
+		Components struct {
+			Schemas map[string]json.RawMessage `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	var deref func(m map[string]any, depth int) map[string]any
+	deref = func(m map[string]any, depth int) map[string]any {
+		if m == nil || depth > 12 {
+			return m
+		}
+		if ref, ok := m["$ref"].(string); ok {
+			var sub map[string]any
+			if json.Unmarshal(spec.Components.Schemas[ref[strings.LastIndex(ref, "/")+1:]], &sub) == nil {
+				return deref(sub, depth+1)
+			}
+		}
+		return m
+	}
+	// declaresOpaqueRepoID reports whether the schema (anywhere, recursively) has an object with a numeric
+	// `repository_id` and NO mapping sibling (repository_name/full_name/repository_full_name/repository_url)
+	// in the same object — i.e. a number the body-scan cannot resolve to owner/repo. An object that DOES
+	// carry a sibling name is mapped by scanForDeniedRepo (round-30 {repository_id,repository_name}), so it
+	// is not opaque and is excluded here.
+	var declaresOpaqueRepoID func(sch map[string]any, depth int) bool
+	declaresOpaqueRepoID = func(sch map[string]any, depth int) bool {
+		sch = deref(sch, depth)
+		if sch == nil || depth > 12 {
+			return false
+		}
+		props, _ := sch["properties"].(map[string]any)
+		if p, ok := props["repository_id"]; ok {
+			pm := deref(mapOf(p), depth)
+			if tp, _ := pm["type"].(string); tp == "integer" || tp == "number" {
+				_, hasName := props["repository_name"]
+				_, hasFull := props["full_name"]
+				_, hasRepoFull := props["repository_full_name"]
+				_, hasURL := props["repository_url"]
+				if !hasName && !hasFull && !hasRepoFull && !hasURL {
+					return true
+				}
+			}
+		}
+		for _, p := range props {
+			if declaresOpaqueRepoID(mapOf(p), depth+1) {
+				return true
+			}
+		}
+		if items, ok := pm2(sch["items"]); ok && declaresOpaqueRepoID(items, depth+1) {
+			return true
+		}
+		return false
+	}
+
+	// repo-detectable (Pass=false) ops — so we only flag the ones that ride the numeric-id-blind Pass scan.
+	sd := loadSpec(t)
+	detectable := map[string]bool{}
+	for _, o := range sd.Ops() {
+		if sd.RepoReach(o).Any() {
+			detectable[strings.ToUpper(o.Method)+" "+o.Path] = true
+		}
+	}
+	registered := map[string]bool{}
+	for _, p := range opaqueRepoIDOps {
+		registered[p] = true
+	}
+	var missing []string
+	for path, methods := range spec.Paths {
+		rawOp, ok := methods["get"]
+		if !ok {
+			continue
+		}
+		var op struct {
+			Responses map[string]struct {
+				Content map[string]struct {
+					Schema map[string]any `json:"schema"`
+				} `json:"content"`
+			} `json:"responses"`
+		}
+		if json.Unmarshal(rawOp, &op) != nil {
+			continue
+		}
+		sch := op.Responses["200"].Content["application/json"].Schema
+		if sch == nil || !declaresOpaqueRepoID(sch, 0) {
+			continue
+		}
+		if detectable["GET "+path] {
+			continue // the generator/body-scan CAN map this op's repo (full_name/minimal-repo present too)
+		}
+		cl := classifier.Classify("GET", concretePath(path), nil)
+		if cl.HasRepo() {
+			continue // path-scoped ({owner}/{repo}) — the repo scope already gates it
+		}
+		if !registered[path] {
+			missing = append(missing, "GET "+path)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Fatalf("%d Pass GET op(s) declare a numeric repository_id the generator/body-scan cannot map but are "+
+			"NOT in opaqueRepoIDOps — they leak a denied repo's id/existence; add them (fail closed):\n  %s",
+			len(missing), strings.Join(missing, "\n  "))
+	}
+}
+
 func pm2(v any) (map[string]any, bool) { m, ok := v.(map[string]any); return m, ok }
 
 func classifierScopesRepo(r classifier.Result, owner, repo string) bool {

@@ -173,6 +173,20 @@ func Classify(method, path string, body []byte) Result {
 	}
 
 	if len(segments) >= 2 && segments[0] == "users" {
+		// /users/{username}/<sub> is a PUBLIC third-person view for most subtrees (repos/events/followers/
+		// keys/… — the repo-bearing feeds are redacted by restfilter), BUT the authenticated-only subtrees
+		// (settings/billing, projectsV2, docker, installation, copilot-spaces) return the CUSTODIAN's OWN
+		// private data when {username} is the custodian's login — the proxy is authed AS the custodian, so
+		// GitHub resolves /users/<custodian>/... to the custodian's account. The org-scope routing treated
+		// the custodian's login like any allowed org, so a documented `[[org]] name="<custodian-login>"`
+		// read grant (deployment.md, for `gh repo list <login>`) silently exposed /users/<login>/settings/
+		// billing/* and /users/<login>/projectsV2 (round-35) — the third-person sibling of the /user/* split
+		// (round-30). Un-floor every non-public subtree to "user_private" so default-deny denies it; the set
+		// is INVERTED (allowlist the public subtrees, deny the rest) so a NEW authenticated-only subtree fails
+		// closed instead of leaking.
+		if len(segments) >= 3 && !usersPublicSubtrees[segments[2]] {
+			return Result{Access: access, UnscopedCategory: "user_private"}
+		}
 		return Result{
 			Org:      segments[1],
 			Access:   access,
@@ -1546,6 +1560,23 @@ var restUnscopedMap = map[string]string{
 	"octocat":       "meta",
 	"zen":           "meta",
 	"emojis":        "meta",
+}
+
+// usersPublicSubtrees are the /users/{username}/<sub> first segments that return that user's PUBLIC
+// third-person data (safe to forward — the repo-bearing feeds repos/events/starred/subscriptions are
+// redacted by restfilter, the keys/gpg_keys/ssh_signing_keys listings are the user's published public
+// keys, etc.). EVERY other /users/{username}/<sub> — settings/billing, projectsV2, docker, installation,
+// copilot-spaces, and any FUTURE authenticated-only subtree — is treated as the custodian's owner-private
+// data (un-floored "user_private", denied under default-deny) because for {username}==the custodian's own
+// login the proxy returns the custodian's PRIVATE account data (round-35). Inverted (allowlist public,
+// deny the rest) so a new private subtree fails closed; TestR35_UsersPathPrivateSubtreesDenied pins it
+// against the embedded spec. Bare /users/{username} (no sub-segment) is the public profile (org-scoped).
+var usersPublicSubtrees = map[string]bool{
+	"events": true, "followers": true, "following": true, "gists": true,
+	"gpg_keys": true, "hovercard": true, "keys": true, "orgs": true,
+	"packages": true, "received_events": true, "repos": true,
+	"social_accounts": true, "ssh_signing_keys": true, "starred": true,
+	"subscriptions": true, "attestations": true,
 }
 
 func restUnscopedCategory(segments []string) string {

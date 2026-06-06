@@ -54,21 +54,54 @@ var enterpriseMemberFieldNames = map[string]bool{
 // fields are nulled, by the per-field response-key markers, and only when a private field is selected.
 const userMarkerAlias = "bghOwnerUserZ9"
 
-// userPrivateFields are User fields that are owner-private (GitHub Sponsors financials + org-verified
-// domain emails) and that also appear as Sponsorable common fields, so a denied User reached via an
-// interface field leaks them past the Organization-only owner marking (round-28). On Organization these
-// same fields are covered by the base-denied coarse redaction; on User they are nulled precisely.
+// userPrivateFields are User fields that are owner-private — the custodian's (or any user's) account data
+// that GitHub returns ONLY to that user themselves: the navigated User resolves to the custodian via an
+// author/owner/uploadedBy/collaborators.node/...on User edge (the viewer IS the custodian), so without
+// response-side nulling these stream to a token that holds only an ordinary repo grant — bypassing the
+// classifier's viewer/user(login:)/repositoryOwner(login:) front gate, which never sees a NAVIGATED User
+// (round-35). On a denied User they are nulled PRECISELY (per-field markers), NOT coarse-redacted like an
+// Organization — a User is reached everywhere as a plain Actor/author{login}, so coarse nulling would
+// break every author. A User is marked (and these fields injected) ONLY when one of these is selected, so
+// author{login} stays unmarked. The set is build-time coupled to the classifier's viewerPrivateFieldCategory
+// (the front-gate private set) by TestR35_UserPrivateFieldSetsCoupled so the two cannot drift.
 var userPrivateFields = map[string]bool{
+	// Sponsors financials + org-verified domain emails (also Sponsorable common fields, round-28/30).
 	"monthlyEstimatedSponsorsIncomeInCents": true, "estimatedNextSponsorsPayoutInCents": true,
 	"totalSponsorshipAmountAsSponsorInCents": true, "lifetimeReceivedSponsorshipValues": true,
 	"sponsorsActivities": true, "organizationVerifiedDomainEmails": true,
 	// incoming/outgoing sponsorship CONNECTIONS (include PRIVATE sponsorships: sponsor identity, tier
-	// price, paymentSource, newsletters) — owner-private to the account, not just the *InCents scalars
-	// (round-30). On Organization these are caught by the base-denied coarse redaction; on User only the
-	// userPrivateFields set is nulled, so they must be listed here.
+	// price, paymentSource, newsletters) — owner-private to the account (round-30).
 	"sponsorshipsAsMaintainer": true, "sponsorshipsAsSponsor": true, "sponsorshipNewsletters": true,
 	"sponsors": true, "sponsoring": true,
+	// The custodian's private account collections/scalars (round-35) — the response-side parity of the
+	// classifier's viewer/user(login:) un-flooring. Reached via author/uploadedBy/owner/...on User edges.
+	"email": true, "gists": true, "gist": true, "gistComments": true, "savedReplies": true,
+	"organizations": true, "organization": true, "enterprises": true, "publicKeys": true,
+	"gpgKeys": true, "sshSigningKeys": true, "socialAccounts": true, "projectsV2": true,
+	"projectV2": true, "projects": true, "project": true, "recentProjects": true,
+	"interactionAbility": true,
 }
+
+// userGistFields are the userPrivateFields whose policy category is "gists" (parity with REST /gists and
+// node(id:Gist)) rather than "user_private", so the response-side redaction gates them on the gists grant.
+var userGistFields = map[string]bool{
+	"gists": true, "gist": true, "gistComments": true,
+}
+
+// UserPrivateFields returns the owner-private User field names (sorted), so a cross-package guard can
+// couple them to the classifier's viewer-private front-gate set. UserGistField reports whether a
+// private User field is gated on the "gists" category rather than "user_private".
+func UserPrivateFields() []string {
+	out := make([]string, 0, len(userPrivateFields))
+	for f := range userPrivateFields {
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// UserGistField reports whether an owner-private User field is gated on the "gists" policy category.
+func UserGistField(field string) bool { return userGistFields[field] }
 
 // memberBearingNonOwnerTypes are object types that are NOT themselves an owner (Organization/Enterprise)
 // but expose their owning org's/enterprise's member identity — Team (members/memberStatuses/invitations),
@@ -112,8 +145,14 @@ func OrgMemberFieldNames() []string {
 //
 // `denied(owner, resource)` reports whether the policy denies that owner's resource ("" = base). The owner
 // marker and all member markers are always stripped, denied or not.
-func RedactDeniedOwnerPrivate(v any, denied func(owner, resource string) bool) any {
-	return redactOwnerPrivate(v, denied, "")
+//
+// `userFieldDenied(field)` reports whether the policy denies a navigated User's owner-private field by its
+// POLICY CATEGORY (gists for gist fields, user_private otherwise) — independent of the user's login, so a
+// token that merely holds an `[[org]] name="<login>"` repo-enumeration grant (which would satisfy the
+// org-login `denied` gate) still cannot read the resolved user's private email/gists/keys via navigation,
+// matching the classifier's viewer/user(login:) front gate (round-35).
+func RedactDeniedOwnerPrivate(v any, denied func(owner, resource string) bool, userFieldDenied func(field string) bool) any {
+	return redactOwnerPrivate(v, denied, userFieldDenied, "")
 }
 
 // redactOwnerPrivate threads the ambientOwner — the login/slug of the nearest enclosing marked
@@ -121,12 +160,12 @@ func RedactDeniedOwnerPrivate(v any, denied func(owner, resource string) bool) a
 // to its owner and redacted under that owner's "members" carve-out (round-26 structural). An owner object
 // supplies its own owner (and becomes the ambient for its subtree); a member-bearing object with NO
 // attributable owner fails closed (its member fields are nulled).
-func redactOwnerPrivate(v any, denied func(owner, resource string) bool, ambientOwner string) any {
+func redactOwnerPrivate(v any, denied func(owner, resource string) bool, userFieldDenied func(field string) bool, ambientOwner string) any {
 	switch val := v.(type) {
 	case map[string]any:
-		// A User is marked ONLY for its own owner-private fields (sponsors financials / verified-domain
-		// emails) and is NEVER coarse-redacted: null exactly the per-field-marked private fields when THIS
-		// user is base-denied, keeping all its public data (round-28).
+		// A User is marked ONLY for its own owner-private fields and is NEVER coarse-redacted: null exactly
+		// the per-field-marked private fields when THIS user is base-denied OR the field's policy category
+		// (user_private/gists) is denied, keeping all its public data (round-28; category gate round-35).
 		if userLogin, ok := val[userMarkerAlias].(string); ok {
 			delete(val, userMarkerAlias)
 			var keys []string
@@ -137,14 +176,14 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, ambient
 			}
 			for _, key := range keys {
 				delete(val, ownerMemberMarkerPrefix+key)
-				if denied(userLogin, "") {
+				if denied(userLogin, "") || userFieldDenied(key) {
 					if _, present := val[key]; present {
 						val[key] = nil
 					}
 				}
 			}
 			for k, c := range val {
-				val[k] = redactOwnerPrivate(c, denied, ambientOwner)
+				val[k] = redactOwnerPrivate(c, denied, userFieldDenied, ambientOwner)
 			}
 			return val
 		}
@@ -185,12 +224,12 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, ambient
 			nextAmbient = effectiveOwner
 		}
 		for k, c := range val {
-			val[k] = redactOwnerPrivate(c, denied, nextAmbient)
+			val[k] = redactOwnerPrivate(c, denied, userFieldDenied, nextAmbient)
 		}
 		return val
 	case []any:
 		for i, c := range val {
-			val[i] = redactOwnerPrivate(c, denied, ambientOwner)
+			val[i] = redactOwnerPrivate(c, denied, userFieldDenied, ambientOwner)
 		}
 		return val
 	}

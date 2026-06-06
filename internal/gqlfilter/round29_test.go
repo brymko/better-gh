@@ -33,7 +33,7 @@ func TestR29_ConcreteAndInlineUserMarked(t *testing.T) {
 	red := RedactDeniedOwnerPrivate(map[string]any{"author": map[string]any{
 		userMarkerAlias: "victim", ownerMemberMarkerPrefix + "estimatedNextSponsorsPayoutInCents": "User",
 		"estimatedNextSponsorsPayoutInCents": "VICTIM_PAYOUT", "login": "victim",
-	}}, func(o, _ string) bool { return o == "victim" }).(map[string]any)
+	}}, func(o, _ string) bool { return o == "victim" }, noUserFieldDenied).(map[string]any)
 	if s := mustJSON(red); strings.Contains(s, "VICTIM_PAYOUT") {
 		t.Fatalf("denied user's payout leaked via concrete nav: %s", s)
 	}

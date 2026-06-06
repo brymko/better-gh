@@ -8,6 +8,11 @@ import (
 	"github.com/vektah/gqlparser/v2/ast"
 )
 
+// noUserFieldDenied is the shared owner-private-test userFieldDenied predicate that allows all user-private
+// CATEGORIES (user_private/gists), so a test's redaction is driven only by its org-login `denied` callback
+// (the round-26/27/28/29 semantics); the round-35 category gate is exercised separately in round35_test.go.
+func noUserFieldDenied(string) bool { return false }
+
 // denied callback for the tests: acme = base read + members none; ent-none / noorg = base denied; others allow.
 func r26Denied(owner, resource string) bool {
 	switch owner {
@@ -26,7 +31,7 @@ func r26Redact(t *testing.T, body string) map[string]any {
 	if err := json.Unmarshal([]byte(body), &m); err != nil {
 		t.Fatal(err)
 	}
-	return RedactDeniedOwnerPrivate(m, r26Denied).(map[string]any)
+	return RedactDeniedOwnerPrivate(m, r26Denied, noUserFieldDenied).(map[string]any)
 }
 
 // TestR26_AliasedMemberFieldRedacted pins the round-26 HIGH-2 fix: a members-denied org's member field is

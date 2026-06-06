@@ -31,7 +31,7 @@ func TestR28_UserSponsorsPrivateRedacted(t *testing.T) {
 	red := RedactDeniedOwnerPrivate(map[string]any{"sponsorable": map[string]any{
 		userMarkerAlias: "alice", ownerMemberMarkerPrefix + "inc": "User",
 		"inc": "ALICE_INCOME", "login": "alice",
-	}}, denied).(map[string]any)
+	}}, denied, noUserFieldDenied).(map[string]any)
 	if s := mustJSON(red); strings.Contains(s, "ALICE_INCOME") {
 		t.Fatalf("denied user's sponsors income leaked: %s", s)
 	}
@@ -41,7 +41,7 @@ func TestR28_UserSponsorsPrivateRedacted(t *testing.T) {
 	// an ALLOWED user's income is kept (operator granted it)
 	keep := RedactDeniedOwnerPrivate(map[string]any{"sponsorable": map[string]any{
 		userMarkerAlias: "bob", ownerMemberMarkerPrefix + "inc": "User", "inc": "BOB_INCOME", "login": "bob",
-	}}, denied).(map[string]any)
+	}}, denied, noUserFieldDenied).(map[string]any)
 	if s := mustJSON(keep); !strings.Contains(s, "BOB_INCOME") {
 		t.Fatalf("allowed user's income wrongly redacted: %s", s)
 	}

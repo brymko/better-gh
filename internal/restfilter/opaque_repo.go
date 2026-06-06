@@ -10,11 +10,40 @@ package restfilter
 // repo's task data. The path-scoped sibling /agents/repos/{owner}/{repo}/tasks[/{id}] is scoped to a
 // single repository by the classifier (round-19 F6) and never reaches this branch.
 //
-// Maintenance: hand-maintained. When refreshing against a new spec, audit Pass ops whose response
-// schema carries a bare numeric repository_id with no full_name/repository_url and add them here.
+// Maintenance: hand-maintained, but TestSpecCoverage_OpaqueRepoIDOps DERIVES the detectable members
+// from the embedded spec (every Pass GET op whose response declares a `repository_id` property the
+// generator/body-scan can't map) and fails the build if one is missing — so the round-20/33/35 class
+// (a denied repo named only by a numeric id) cannot silently grow. When refreshing, run the suite and
+// add any op the guard flags; also audit ops whose repo id hides under an opaque `additionalProperties`
+// metadata object (which the guard cannot see) and add those by hand.
 var opaqueRepoIDOps = []string{
 	"/agents/tasks",
 	"/agents/tasks/{task_id}",
+	// Copilot Spaces: a space's resources_attributes[].metadata names an attached repo only by a numeric
+	// repository_id (+ bare name / file_path), and the /resources[/{id}] metadata is an opaque
+	// additionalProperties object — neither the generator nor the body-scan can map it, so a token carved
+	// out of a private repo otherwise learned its existence + id + name + internal file paths (round-35).
+	// Fail closed (the numeric id carries no in-body owner to redact against) — the /agents/tasks precedent.
+	"/orgs/{org}/copilot-spaces",
+	"/orgs/{org}/copilot-spaces/{space_number}",
+	"/orgs/{org}/copilot-spaces/{space_number}/resources",
+	"/orgs/{org}/copilot-spaces/{space_number}/resources/{space_resource_id}",
+	"/users/{username}/copilot-spaces",
+	"/users/{username}/copilot-spaces/{space_number}",
+	"/users/{username}/copilot-spaces/{space_number}/resources",
+	"/users/{username}/copilot-spaces/{space_number}/resources/{space_resource_id}",
+	// Webhook deliveries name the event's repo by a bare numeric repository_id (no repository_name), and
+	// attestation-by-digest bundles carry the producing repo's numeric repository_id — both unmappable in
+	// body, so a token carved out of a private repo would learn its id/existence. Surfaced by the derived
+	// TestSpecCoverage_OpaqueRepoIDOps guard (the rest of the round-20/33 class). Fail closed when not
+	// path-scoped. (/app/hook/* additionally needs a GitHub App JWT the user-token custodian lacks, so
+	// failing it closed costs nothing.)
+	"/app/hook/deliveries",
+	"/app/hook/deliveries/{delivery_id}",
+	"/orgs/{org}/hooks/{hook_id}/deliveries",
+	"/orgs/{org}/hooks/{hook_id}/deliveries/{delivery_id}",
+	"/orgs/{org}/attestations/{subject_digest}",
+	"/users/{username}/attestations/{subject_digest}",
 }
 
 var opaqueRepoIDTemplates []opTemplate

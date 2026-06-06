@@ -230,6 +230,16 @@ access = "none"
 > (`ensureLoginUsable`), so they already list your own repos. This `[defaults.unscoped] user` tip is
 > for **socket-mode** `policy.toml`, which gets no such floor.
 
+> The `[[org]] name = "your-login"` grant is **enumeration-only**: it does not expose your own
+> account's authenticated-only data. The proxy authenticates *as you*, so `/users/<your-login>/...`
+> would otherwise resolve to your private data — but the authenticated-only subtrees
+> (`settings/billing`, `projectsV2`, `docker`, `copilot-spaces`, …) are classified as the un-floored
+> `user_private` category and stay denied unless you explicitly grant it; only the public third-person
+> feeds (`repos`, `keys`, `events`, …) are served. The same holds for GraphQL `user(login:)`,
+> `repositoryOwner(login:)`, and a `User` reached by navigation (an `author`/`owner` edge): your
+> private `email`/SECRET-gists/`savedReplies`/keys are gated on `user_private`/`gists`, never an
+> `[[org]]` rule.
+
 (A fully denied repo is redacted to `null` in the GraphQL response, so `gh repo list` shows it
 as a blank row rather than dropping it — its name and data never leave the proxy.)
 
