@@ -521,6 +521,41 @@ var gqlOrgFieldToResource = map[string]string{
 	"lifetimeReceivedSponsorshipValues": "sponsors", "sponsorshipsAsMaintainer": "sponsors",
 	"sponsorshipsAsSponsor": "sponsors", "sponsorshipNewsletters": "sponsors",
 	"sponsors": "sponsors", "sponsoring": "sponsors",
+	// The REMAINING org-admin-private content the round-37 fix did not cover (round-38 finding-5): ruleset
+	// config, custom-property definitions/values, the verified-domains list, the IP-allow-list (a security
+	// control), the org billing-email, the org announcement banner, and interaction limits. Each has a REST
+	// sibling segment a [org.permissions] carve-out gates (GET /orgs/{org}/rulesets → "rulesets",
+	// /properties/* → "properties", /interaction-limits → "interaction-limits", /settings/billing → "settings");
+	// over GraphQL they degraded to base org read. Gate on the REST segment so a carve-out is honored on both.
+	"rulesets": "rulesets", "ruleset": "rulesets",
+	"repositoryCustomProperties": "properties", "repositoryCustomProperty": "properties",
+	"interactionAbility":                            "interaction-limits",
+	"domains":                                       "settings",
+	"ipAllowListEntries":                            "settings",
+	"ipAllowListEnabledSetting":                     "settings",
+	"ipAllowListForInstalledAppsEnabledSetting":     "settings",
+	"announcementBanner":                            "settings",
+	"organizationBillingEmail":                      "settings",
+	"notificationDeliveryRestrictionEnabledSetting": "settings",
+}
+
+// gqlEnterpriseFieldToResource is the ENTERPRISE analogue of gqlOrgFieldToResource (round-38 finding-1/2): the
+// enterprise(slug:) GraphQL root scopes to {Org:slug} and, before this map, degraded EVERY field to base read
+// — so an [org.permissions] billing/settings/organizations="none" carve-out the REST /enterprises/{slug}/<seg>
+// path enforces (enterpriseResource = segments[2]) was bypassed over GraphQL, leaking the custodian enterprise's
+// billing financials / security-contact / private org inventory. Map each owner-private Enterprise field to the
+// REST segment its sibling endpoint uses. Public identity (name/slug/description/avatarUrl/url/location/…) and
+// viewer-relative booleans stay base-governed (Resource "" — the operator's base read is meant to grant them).
+var gqlEnterpriseFieldToResource = map[string]string{
+	"billingInfo": "billing", "billingEmail": "billing",
+	"securityContactEmail": "settings", "ownerInfo": "settings",
+	"announcementBanner": "settings", "readme": "settings", "readmeHTML": "settings",
+	"organizations":  "organizations",
+	"members":        "members",
+	"enterpriseTeam": "teams", "enterpriseTeams": "teams",
+	"rulesets": "rulesets", "ruleset": "rulesets",
+	"repositoryCustomProperties": "properties", "repositoryCustomProperty": "properties",
+	"userNamespaceRepositories": "members",
 }
 
 // gqlOrgResources returns each distinct org per-resource key an owner-root (organization/
@@ -529,10 +564,10 @@ var gqlOrgFieldToResource = map[string]string{
 // only name/description is gated on base org access exactly as before. It walks fragment boundaries
 // (so `... on Organization{ membersWithRole }` under a repositoryOwner root is caught) but not into a
 // field's own sub-selection, mirroring gqlRepoResources.
-func gqlOrgResources(orgField *ast.Field, fragments ast.FragmentDefinitionList, budget *int) []string {
+func gqlOrgResources(orgField *ast.Field, fragments ast.FragmentDefinitionList, budget *int, fieldMap map[string]string) []string {
 	set := map[string]struct{}{}
 	baseGoverned := false
-	collectOrgResources(orgField.SelectionSet, fragments, set, &baseGoverned, map[string]bool{}, 0, budget)
+	collectOrgResources(orgField.SelectionSet, fragments, set, &baseGoverned, map[string]bool{}, 0, budget, fieldMap)
 	out := make([]string, 0, len(set)+1)
 	for r := range set {
 		out = append(out, r)
@@ -637,7 +672,7 @@ func collectNamedChildFields(sels ast.SelectionSet, fragments ast.FragmentDefini
 	return out
 }
 
-func collectOrgResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, seenFrags map[string]bool, depth int, budget *int) {
+func collectOrgResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, seenFrags map[string]bool, depth int, budget *int, fieldMap map[string]string) {
 	if depth > maxGraphQLDepth {
 		*baseGoverned = true
 		return
@@ -649,20 +684,20 @@ func collectOrgResources(sels ast.SelectionSet, fragments ast.FragmentDefinition
 		}
 		switch s := sel.(type) {
 		case *ast.Field:
-			if r, ok := gqlOrgFieldToResource[s.Name]; ok {
+			if r, ok := fieldMap[s.Name]; ok {
 				set[r] = struct{}{}
 			} else if s.Name != "__typename" {
 				*baseGoverned = true // metadata or any unmapped field → base org access
 			}
 		case *ast.InlineFragment:
-			collectOrgResources(s.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1, budget)
+			collectOrgResources(s.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1, budget, fieldMap)
 		case *ast.FragmentSpread:
 			if seenFrags[s.Name] {
 				continue
 			}
 			if frag := fragments.ForName(s.Name); frag != nil {
 				seenFrags[s.Name] = true
-				collectOrgResources(frag.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1, budget)
+				collectOrgResources(frag.SelectionSet, fragments, set, baseGoverned, seenFrags, depth+1, budget, fieldMap)
 			} else {
 				*baseGoverned = true // unresolvable spread → require base
 			}
@@ -822,7 +857,7 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					// (round-23). Scope the owner sub-selection as an org exactly as the organization root does
 					// (gqlOrgResources reads gqlOrgFieldToResource), so the member-identity map gates it here too.
 					for _, ownerField := range collectNamedChildFields(s.SelectionSet, fragments, "owner", map[string]bool{}, depth+1, budget) {
-						for _, res := range gqlOrgResources(ownerField, fragments, budget) {
+						for _, res := range gqlOrgResources(ownerField, fragments, budget, gqlOrgFieldToResource) {
 							if res != "" { // base owner-metadata stays covered by the repo's own metadata scope
 								add(Scope{Org: owner, Resource: res})
 							}
@@ -842,7 +877,7 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					// "members", teams → "teams"), so a [org.permissions] carve-out is enforced over
 					// GraphQL too — not just the base org access (round-20). A pure-metadata selection
 					// yields a single "" (base) scope, unchanged.
-					for _, res := range gqlOrgResources(s, fragments, budget) {
+					for _, res := range gqlOrgResources(s, fragments, budget, gqlOrgFieldToResource) {
 						add(Scope{Org: login, Resource: res})
 					}
 					// user(login:)/repositoryOwner(login:) resolve to a USER node; when `login` is the
@@ -894,7 +929,16 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					slug = resolveStringArg(s.Arguments, "enterpriseSlug", vars)
 				}
 				if slug != "" {
-					add(Scope{Org: slug})
+					// Emit one enterprise scope per per-resource key the selection touches (billingInfo →
+					// "billing", organizations → "organizations", rulesets → "rulesets", …) so a
+					// [org.permissions] carve-out on the enterprise slug is enforced over GraphQL exactly as
+					// the REST /enterprises/{slug}/<seg>/… path is gated on its segment — the Enterprise twin of
+					// the round-37 org content fix. A pure-metadata/base selection yields a single "" scope,
+					// unchanged. (The invitation roots return non-Enterprise types whose fields are unmapped, so
+					// they collapse to one base scope as before.)
+					for _, res := range gqlOrgResources(s, fragments, budget, gqlEnterpriseFieldToResource) {
+						add(Scope{Org: slug, Resource: res})
+					}
 					scanCrossRepoNav(s.SelectionSet, fragments, gqlForkNavFields, escapes, map[string]bool{}, depth+1, tooComplex, budget)
 				} else {
 					add(Scope{UnscopedCategory: "meta"}) // no resolvable slug → deny via an unscoped category under default-deny

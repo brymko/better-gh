@@ -21,11 +21,18 @@ func TestR21_OrgMemberIdentityFieldsScoped(t *testing.T) {
 }
 
 // Round-21 MEDIUM: the GraphQL enterprise(slug:) root must emit an org scope (the slug) so an [[org]]
-// rule gates it, instead of emitting no scope and falling to Defaults.Mode.
+// rule gates it, instead of emitting no scope and falling to Defaults.Mode. Round-38: billingEmail now
+// maps to the "billing" per-resource key (the enterprise content-gating fix), so the scope is
+// {Org:acme-ent, Resource:"billing"} — still scoped to the enterprise org, now carve-out-able.
 func TestR21_EnterpriseRootScoped(t *testing.T) {
 	r := Classify("POST", "/graphql", []byte(`{"query":"{ enterprise(slug:\"acme-ent\"){ billingEmail } }"}`))
-	if !hasScope(r.AllScopes(), "", "", "acme-ent", "") {
-		t.Fatalf("enterprise(slug) must scope to org=acme-ent, got %+v", r.AllScopes())
+	if !hasScope(r.AllScopes(), "", "", "acme-ent", "billing") {
+		t.Fatalf("enterprise(slug){billingEmail} must scope to org=acme-ent resource=billing, got %+v", r.AllScopes())
+	}
+	// a pure-metadata selection still yields a base ("") scope.
+	r2 := Classify("POST", "/graphql", []byte(`{"query":"{ enterprise(slug:\"acme-ent\"){ name } }"}`))
+	if !hasScope(r2.AllScopes(), "", "", "acme-ent", "") {
+		t.Fatalf("enterprise(slug){name} must scope to org=acme-ent base, got %+v", r2.AllScopes())
 	}
 }
 
