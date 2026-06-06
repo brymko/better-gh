@@ -1005,6 +1005,18 @@ func splitNameWithOwner(nwo string) (owner, repo string, ok bool) {
 	return "", "", false
 }
 
+// pathOwnerForScan returns the owner login a Pass body-scan should use to qualify BARE repo names when
+// the classifier set neither Owner nor Org — the /users/{username}/… and /user-account–scoped paths,
+// where {username} is the custodian login and the bare names are its own repos (round-42 F6). It is only
+// a fallback for the body-scan's org-gated bare-name branch; it never widens authorization.
+func pathOwnerForScan(normPath string) string {
+	segs := strings.Split(strings.Trim(normPath, "/"), "/")
+	if len(segs) >= 2 && segs[0] == "users" && segs[1] != "" {
+		return segs[1]
+	}
+	return ""
+}
+
 func (h *Handler) upstreamBase() string {
 	if h.UpstreamURL != "" {
 		return h.UpstreamURL
@@ -1208,6 +1220,15 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 		scanOrg := classified.Org
 		if scanOrg == "" {
 			scanOrg = classified.Owner
+		}
+		if scanOrg == "" {
+			// A /users/{username}/… Pass op carries the custodian's OWN repos by BARE name (no owner) — e.g.
+			// /users/{username}/settings/billing/usage's usageItems[].repositoryName — but the classifier sets
+			// neither Owner nor Org for the user_private category, so scanForDeniedRepo's org-gated bare-name
+			// branch would be skipped and a denied custodian repo's name + usage metrics would stream through.
+			// {username} is the custodian login (the only login that returns a 200 here), and the bare names are
+			// its repos, so qualify them with it (the /orgs sibling already sets Org and is caught) — round-42 F6.
+			scanOrg = pathOwnerForScan(normPath)
 		}
 		denied, ok := restfilter.ContainsDeniedRepo(raw, scanOrg, passScan)
 		if !ok {

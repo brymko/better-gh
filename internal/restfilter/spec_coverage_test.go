@@ -300,6 +300,22 @@ func TestSpecCoverage_OpaqueRepoIDOps(t *testing.T) {
 				}
 			}
 		}
+		// plural `repository_ids` array of opaque numeric ids with NO name-array sibling — the org-ruleset
+		// conditions.repository_id.repository_ids shape (round-42 F2). Like the singular case, the body-scan
+		// cannot map a numeric id to owner/repo.
+		if p, ok := props["repository_ids"]; ok {
+			pm := deref(mapOf(p), depth)
+			if tp, _ := pm["type"].(string); tp == "array" {
+				items := deref(mapOf(pm["items"]), depth)
+				if it, _ := items["type"].(string); it == "integer" || it == "number" {
+					_, hasNames := props["repository_names"]
+					_, hasFullNames := props["repository_full_names"]
+					if !hasNames && !hasFullNames {
+						return true
+					}
+				}
+			}
+		}
 		for _, p := range props {
 			if declaresOpaqueRepoID(mapOf(p), depth+1) {
 				return true
@@ -307,6 +323,18 @@ func TestSpecCoverage_OpaqueRepoIDOps(t *testing.T) {
 		}
 		if items, ok := pm2(sch["items"]); ok && declaresOpaqueRepoID(items, depth+1) {
 			return true
+		}
+		// oneOf/anyOf/allOf union members — a repository_id can be buried in any branch (the org-ruleset
+		// rules[] are a 22-member oneOf, conditions an anyOf/oneOf/allOf). Traversing only properties/items
+		// missed them entirely (round-42 F2).
+		for _, comb := range [...]string{"oneOf", "anyOf", "allOf"} {
+			if arr, ok := sch[comb].([]any); ok {
+				for _, m := range arr {
+					if declaresOpaqueRepoID(mapOf(m), depth+1) {
+						return true
+					}
+				}
+			}
 		}
 		return false
 	}

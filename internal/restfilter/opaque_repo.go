@@ -44,6 +44,16 @@ var opaqueRepoIDOps = []string{
 	"/orgs/{org}/hooks/{hook_id}/deliveries/{delivery_id}",
 	"/orgs/{org}/attestations/{subject_digest}",
 	"/users/{username}/attestations/{subject_digest}",
+	// Org rulesets target repos by OPAQUE NUMERIC id in two combinator-buried shapes the body-scan cannot
+	// map: conditions.repository_id.repository_ids[] (a name-less id array) and a required-workflow rule's
+	// parameters.workflows[].repository_id (a name-less id) — see the rules[] 22-member oneOf. A token
+	// granted org rulesets=read with a per-repo `none` carve-out otherwise learns the denied repo's id +
+	// existence. Fail closed when not path-scoped (the numeric id carries no in-body owner to redact, and
+	// nulling every id would equally degrade the response); the repo-scoped /repos/{o}/{r}/rulesets sibling
+	// is gated by its path scope and never reaches here. Surfaced by the round-42-extended
+	// TestSpecCoverage_OpaqueRepoIDOps (now traversing oneOf/anyOf/allOf + the plural repository_ids array).
+	"/orgs/{org}/rulesets",
+	"/orgs/{org}/rulesets/{ruleset_id}",
 }
 
 var opaqueRepoIDTemplates []opTemplate

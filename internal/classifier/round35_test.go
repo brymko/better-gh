@@ -74,12 +74,12 @@ func classifierScopesOrgR35(r Result, org string) bool {
 }
 
 // r35ViewerRelativePublic are the viewerPrivateFieldCategory User fields intentionally NOT response-nulled on
-// a NAVIGATED User. Only sponsorsListing remains: it is the PUBLIC sponsor profile. (sponsorshipForViewerAs*
-// were here until round-40 F3/F4/F8 showed they leak the custodian's OWN tier price / payment source — they
-// are now in gqlfilter.userPrivateFields, gated on user_private on User AND Organization nav paths.)
-var r35ViewerRelativePublic = map[string]bool{
-	"sponsorsListing": true,
-}
+// a NAVIGATED User — now EMPTY. (sponsorshipForViewerAs* were here until round-40 F3/F4/F8 showed they leak
+// the custodian's OWN tier price / payment source; sponsorsListing was here until round-42 F1 showed the
+// OWNER's own listing exposes activeStripeConnectAccount/contactEmailAddress — both are now in
+// gqlfilter.userPrivateFields, gated on user_private on User AND Organization nav paths.) Kept as an
+// (empty) exemption hook so a future justified viewer-relative-public field has a documented home.
+var r35ViewerRelativePublic = map[string]bool{}
 
 // TestR35_UserPrivateFieldSetsCoupled is the cross-package coupling guard the round-31/34 work lacked: it
 // asserts that every field the classifier treats as owner-private at the viewer/user(login:) front gate

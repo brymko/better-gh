@@ -216,6 +216,14 @@ var userPrivateFields = map[string]bool{
 	// price, paymentSource, newsletters) — owner-private to the account (round-30).
 	"sponsorshipsAsMaintainer": true, "sponsorshipsAsSponsor": true, "sponsorshipNewsletters": true,
 	"sponsors": true, "sponsoring": true,
+	// sponsorsListing is the account's Sponsors LISTING — public for a third-person view, but for the
+	// OWNER's own listing (viewer==owner, e.g. repository(owner:"<custodian>").owner→...on User) it exposes
+	// activeStripeConnectAccount{accountId,stripeDashboardUrl}, contactEmailAddress and billingCountryOrRegion.
+	// The classifier already gates it user_private at the viewer/user root (viewerPrivateFieldCategory); a
+	// navigated owner edge bypassed that, leaking the custodian's payment data under a metadata-only grant.
+	// Same realization the round-40 sponsorshipForViewerAs* move made; remove from r35ViewerRelativePublic
+	// (round-42 F1).
+	"sponsorsListing": true,
 	// The custodian's private account collections/scalars (round-35) — the response-side parity of the
 	// classifier's viewer/user(login:) un-flooring. Reached via author/uploadedBy/owner/...on User edges.
 	"email": true, "gists": true, "gist": true, "gistComments": true, "savedReplies": true,
@@ -290,6 +298,17 @@ var ownerPublicFields = map[string]bool{
 	"url": true, "avatarUrl": true, "databaseId": true, "resourcePath": true,
 }
 
+// ownerContentPublicFields is the STRICTER keep-set for the per-TYPE owner-owned-content self-marker
+// fail-close (ProjectV2/Project/… reached with no marked owner ancestor or under a denied owner). Unlike
+// ownerPublicFields — used for a BASE-denied OWNER object, where url=https://github.com/<org> and
+// resourcePath=/<org> are harmless org identity — a content object's url/resourcePath embeds the OWNING
+// org's login AND the private item's number (…/orgs/<login>/projects/<number>), and databaseId IS that
+// number; keeping them would turn a fail-closed item into an owner+existence+number oracle (round-42 F5).
+// Keep only the opaque node identity (the object's structural presence is unavoidable field-by-field).
+var ownerContentPublicFields = map[string]bool{
+	"__typename": true, "id": true,
+}
+
 // OrgMemberFieldNames returns the Organization member-identity field names; a classifier test asserts it
 // equals the gqlOrgFieldToResource "members" keys so the request and response sides cannot drift.
 func OrgMemberFieldNames() []string {
@@ -341,7 +360,7 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 				res := resourceFromCode(code)
 				if ambientOwner != userOwnedAmbient && (ambientOwner == "" || denied(ambientOwner, res)) {
 					for fk := range val {
-						if !ownerPublicFields[fk] && !strings.HasPrefix(fk, "bgh") {
+						if !ownerContentPublicFields[fk] && !strings.HasPrefix(fk, "bgh") {
 							val[fk] = nil
 						}
 					}
@@ -366,12 +385,14 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 					ms = append(ms, marked{rest, "user_private"})
 				}
 			}
+			privateKeys := make(map[string]bool, len(ms))
 			for _, m := range ms {
 				if m.cat == "gists" {
 					delete(val, userGistMarkerPrefix+m.key)
 				} else {
 					delete(val, ownerMemberMarkerPrefix+m.key)
 				}
+				privateKeys[m.key] = true
 				if denied(userLogin, "") || categoryDenied(m.cat) {
 					if _, present := val[m.key]; present {
 						val[m.key] = nil
@@ -379,9 +400,17 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 				}
 			}
 			for k, c := range val {
-				// thread the user-owned sentinel so an owner-owned content type under this User (its own
-				// projectsV2/…) is NOT fail-closed by the ownerSelfMarker (gated by the User markers instead).
-				val[k] = redactOwnerPrivate(c, denied, categoryDenied, userOwnedAmbient)
+				// The user-owned sentinel suppresses the ownerSelfMarker fail-close ONLY for the user's OWN
+				// owner-owned content — its projectsV2/sponsors/… reached through a userPrivateField that the
+				// markers above already gate (user_private). Content reached through a NON-private User field
+				// (sponsorsListing) or a cross-owner edge (issues→…→project) is NOT the user's own and is gated
+				// by no User marker, so it keeps the inherited ambient and the self-marker fails it closed —
+				// blanket-threading the sentinel into every child leaked exactly those paths (round-42 F1/F3/F4).
+				child := ambientOwner
+				if privateKeys[k] {
+					child = userOwnedAmbient
+				}
+				val[k] = redactOwnerPrivate(c, denied, categoryDenied, child)
 			}
 			return val
 		}
