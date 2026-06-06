@@ -160,12 +160,14 @@ func Classify(method, path string, body []byte) Result {
 	}
 
 	if len(segments) >= 2 && segments[0] == "orgs" {
-		return Result{
-			Org:        segments[1],
-			Access:     access,
-			Resource:   orgResource(segments),
-			Additional: bodyNamedRepoScopes(method, segments, body),
+		res := Result{
+			Org:      segments[1],
+			Access:   access,
+			Resource: orgResource(segments),
 		}
+		res.Additional = append(res.Additional, bodyNamedRepoScopes(method, segments, body)...)
+		res.Additional = append(res.Additional, pathEmbeddedRepoScopes(segments)...)
+		return res
 	}
 
 	if len(segments) >= 2 && segments[0] == "users" {
@@ -176,11 +178,13 @@ func Classify(method, path string, body []byte) Result {
 		}
 	}
 
-	return Result{
+	res := Result{
 		Access:           access,
 		UnscopedCategory: restUnscopedCategory(segments),
-		Additional:       bodyNamedRepoScopes(method, segments, body), // /user/migrations names repos in its body
 	}
+	res.Additional = append(res.Additional, bodyNamedRepoScopes(method, segments, body)...) // /user/migrations names repos in its body
+	res.Additional = append(res.Additional, pathEmbeddedRepoScopes(segments)...)            // legacy /teams/{id}/repos/{owner}/{repo}
+	return res
 }
 
 func classifyGraphQL(body []byte) Result {
@@ -1182,6 +1186,27 @@ func bodyNamedRepoScopes(method string, segments []string, body []byte) []Scope 
 		}
 	}
 	return out
+}
+
+// pathEmbeddedRepoScopes scopes a repository named DEEPER in the path than the org/team prefix the
+// classifier otherwise scopes to — the team↔repo access endpoints (/orgs/{org}/teams/{slug}/repos/
+// {owner}/{repo} and the legacy /teams/{id}/repos/{owner}/{repo}) and the org migration repo-lock. PUT/
+// DELETE there WRITE the named repo's team access (and the response echoes its metadata) while only the
+// org `teams` permission authorizes it, so a client with org teams=rw could grant a team access to a
+// DENIED repo; GET likewise names a repo the org scope doesn't cover. Scope the embedded repo so the
+// policy must allow it too (round-23) — the path analogue of bodyNamedRepoScopes / compareForkScopes.
+func pathEmbeddedRepoScopes(segments []string) []Scope {
+	n := len(segments)
+	switch {
+	case n >= 7 && segments[0] == "orgs" && segments[2] == "teams" && segments[4] == "repos":
+		return []Scope{{Owner: segments[5], Repo: segments[6]}}
+	case n >= 5 && segments[0] == "teams" && segments[2] == "repos":
+		return []Scope{{Owner: segments[3], Repo: segments[4]}}
+	case n >= 6 && segments[0] == "orgs" && segments[2] == "migrations" && segments[4] == "repos":
+		// /orgs/{org}/migrations/{id}/repos/{repo_name}/lock — the repo lives in the migration's org.
+		return []Scope{{Owner: segments[1], Repo: segments[5]}}
+	}
+	return nil
 }
 
 func compareForkScopes(segments []string) []Scope {

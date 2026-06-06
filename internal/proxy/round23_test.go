@@ -84,6 +84,46 @@ func TestSec_R23_MigrationDeniedRepoBody(t *testing.T) {
 	}
 }
 
+// TestSec_R23_TeamRepoDeniedWrite: PUT/DELETE /orgs/{org}/teams/{slug}/repos/{owner}/{repo} (and the
+// legacy /teams/{id}/… form) WRITE the path-embedded repo's team access — a denied repo must be rejected,
+// not granted/revoked under the org `teams` grant alone (round-23 path-embedded-repo sibling).
+func TestSec_R23_TeamRepoDeniedWrite(t *testing.T) {
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny},
+		Org:      []policy.OrgRule{{Name: "acme", Access: policy.AccessReadWrite}},
+		Repo:     []policy.RepoRule{{Name: "victim/secret", Access: policy.AccessNone}},
+	}
+	var upstreamHit bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		io.WriteString(w, `{"full_name":"victim/secret","description":"SECRET_DESC"}`)
+	}))
+	t.Cleanup(upstream.Close)
+	srv := httptest.NewServer(r15Handler(t, pol, upstream.URL))
+	t.Cleanup(srv.Close)
+	for _, tc := range []struct{ method, path string }{
+		{"PUT", "/orgs/acme/teams/dev/repos/victim/secret"},
+		{"DELETE", "/orgs/acme/teams/dev/repos/victim/secret"},
+		{"GET", "/orgs/acme/teams/dev/repos/victim/secret"},
+		{"PUT", "/teams/42/repos/victim/secret"},
+	} {
+		upstreamHit = false
+		req, _ := http.NewRequest(tc.method, srv.URL+tc.path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s %s: denied-repo team access not blocked (status %d): %s", tc.method, tc.path, resp.StatusCode, b)
+		}
+		if upstreamHit || strings.Contains(string(b), "SECRET_DESC") {
+			t.Errorf("%s %s: denied repo reached upstream/leaked (hit=%v): %s", tc.method, tc.path, upstreamHit, b)
+		}
+	}
+}
+
 // TestSec_R23_VariantAnalysisContentScrub: a variant-analysis whose body uses repository_lists (which the
 // classifier cannot resolve offline) must still not echo a denied repo's identity — the response
 // scanned_repositories/skipped_repositories are content-scrubbed (round-23 M-1).

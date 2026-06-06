@@ -53,6 +53,32 @@ func TestR23_BodyNamedReposScoped(t *testing.T) {
 	}
 }
 
+// TestR23_PathEmbeddedRepoScoped pins the team↔repo path fix: a repo named DEEPER in an org/team path
+// (the team-repo access endpoints, the migration repo-lock) must become a scope, so a GET can't read and a
+// PUT/DELETE can't write a denied repo's team access under the org `teams` grant alone.
+func TestR23_PathEmbeddedRepoScoped(t *testing.T) {
+	for _, p := range []string{
+		"/orgs/acme/teams/dev/repos/victim/secret",
+		"/teams/42/repos/victim/secret",
+		"/orgs/acme/migrations/9/repos/secret/lock", // owner=acme, repo=secret
+	} {
+		got := false
+		want := "victim/secret"
+		if p == "/orgs/acme/migrations/9/repos/secret/lock" {
+			want = "acme/secret"
+		}
+		for _, m := range []string{"GET", "PUT", "DELETE"} {
+			r := Classify(m, p, nil)
+			if scopeNames(r.AllScopes(), want) {
+				got = true
+			}
+		}
+		if !got {
+			t.Errorf("%s: embedded repo %s must become a scope", p, want)
+		}
+	}
+}
+
 func scopeNames(scopes []Scope, ownerRepo string) bool {
 	for _, s := range scopes {
 		if s.Owner+"/"+s.Repo == ownerRepo {
