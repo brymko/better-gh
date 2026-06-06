@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/vektah/gqlparser/v2/ast"
 )
 
 // denied callback for the tests: acme = base read + members none; ent-none / noorg = base denied; others allow.
@@ -90,6 +92,82 @@ func TestR26_AugmentMarksOrgAndEnterprise(t *testing.T) {
 	for _, want := range []string{"bghOrgLoginZ9: login", "bghOrgLoginZ9: slug", "bghOrgMemZ9_roster", "bghOrgMemZ9_members"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("augmented query missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestR26_TeamMembersAttributedToOrg pins the structural fix: Team.members (the org's roster reached via
+// organization(){teams{nodes{members}}}) is attributed to its ambient owner org and nulled under that org's
+// members="none" — a non-owner type carrying owner-private member data.
+func TestR26_TeamMembersAttributedToOrg(t *testing.T) {
+	out := r26Redact(t, `{"bghOrgLoginZ9":"acme","teams":{"nodes":[{"bghOrgMemZ9_members":"Team",`+
+		`"members":{"nodes":[{"login":"team-secret"}]}}]}}`)
+	if s := mustJSON(out); strings.Contains(s, "team-secret") {
+		t.Fatalf("Team.members not attributed to its org / not redacted under members=none: %s", s)
+	}
+	// fail-closed: a member-bearing object with NO attributable owner ancestor must still be nulled.
+	out2 := r26Redact(t, `{"teams":{"nodes":[{"bghOrgMemZ9_members":"Team","members":{"nodes":[{"login":"orphan"}]}}]}}`)
+	if s := mustJSON(out2); strings.Contains(s, "orphan") {
+		t.Fatalf("member-bearing object with no owner ancestor must fail closed: %s", s)
+	}
+}
+
+// TestOwnerPrivateCoverage is the structural coverage invariant (the owner-private analogue of the
+// repo-coverage invariants that converged repo isolation): EVERY object type in the embedded schema that
+// exposes a member-identity field MUST be covered by the owner-private redaction — owner-marked
+// (Organization/Enterprise), ambient-attributed (memberBearingNonOwnerTypes), or a justified exception —
+// and every member field it declares must be in that type's marked set. A schema refresh that adds a new
+// member-bearing type/field fails the build instead of silently leaking members="none" data by navigation.
+func TestOwnerPrivateCoverage(t *testing.T) {
+	s, _ := Load()
+	memberIdentityFields := map[string]bool{
+		"membersWithRole": true, "members": true, "pendingMembers": true, "memberStatuses": true,
+		"mannequins": true, "enterpriseOwners": true, "samlIdentityProvider": true, "auditLog": true,
+		"administrators": true, "ownerInfo": true, "memberInvitations": true, "outsideCollaborators": true,
+		"failedInvitations": true, "invitations": true,
+	}
+	exceptions := map[string]string{
+		"EnterpriseOwnerInfo": "reached only via Enterprise.ownerInfo, a marked Enterprise member field " +
+			"nulled with the enterprise",
+	}
+	markedSetOf := func(typ string) map[string]bool {
+		switch typ {
+		case "Organization":
+			return orgMemberFieldNames
+		case "Enterprise":
+			return enterpriseMemberFieldNames
+		default:
+			return memberBearingNonOwnerTypes[typ]
+		}
+	}
+	for name, def := range s.schema.Types {
+		if def.Kind != ast.Object {
+			continue
+		}
+		var declared []string
+		for _, f := range def.Fields {
+			if memberIdentityFields[f.Name] {
+				declared = append(declared, f.Name)
+			}
+		}
+		if len(declared) == 0 {
+			continue
+		}
+		if _, ok := exceptions[name]; ok {
+			continue
+		}
+		marked := markedSetOf(name)
+		if marked == nil {
+			t.Errorf("type %q exposes member-identity fields %v but is NOT covered by owner-private redaction "+
+				"(not owner-marked, not in memberBearingNonOwnerTypes, not a justified exception) — navigation "+
+				"to it would leak members=\"none\" data; cover it or justify it", name, declared)
+			continue
+		}
+		for _, f := range declared {
+			if !marked[f] {
+				t.Errorf("type %q exposes member field %q its marked set omits — augment won't mark it, so it "+
+					"leaks under members=\"none\"", name, f)
+			}
 		}
 	}
 }

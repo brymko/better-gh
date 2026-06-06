@@ -47,6 +47,16 @@ var enterpriseMemberFieldNames = map[string]bool{
 	"members": true, "administrators": true, "ownerInfo": true, "memberInvitations": true,
 }
 
+// memberBearingNonOwnerTypes are object types that are NOT themselves an owner (Organization/Enterprise)
+// but expose their owning org's/enterprise's member identity — Team (members/memberStatuses/invitations),
+// reachable by navigation (organization(){teams{nodes{members}}}). They have no owner-id scalar, so the
+// filter attributes them to the nearest marked owner ANCESTOR and redacts them under that owner's "members"
+// carve-out (the owner analogue of repoOwnedNoPath ambient attribution). TestOwnerPrivateCoverage asserts
+// this set ∪ {Organization, Enterprise} ∪ the justified exceptions covers every member-bearing type.
+var memberBearingNonOwnerTypes = map[string]map[string]bool{
+	"Team": {"members": true, "memberStatuses": true, "invitations": true},
+}
+
 // ownerPublicFields are the only fields kept when an owner object is BASE-denied (the client has no
 // org/enterprise access at all); every other field — billing, IP allow-list, domains, 2FA, members, … —
 // is nulled. Keeping by exact key (an aliased public field is also nulled) is safe here precisely BECAUSE
@@ -79,41 +89,60 @@ func OrgMemberFieldNames() []string {
 // `denied(owner, resource)` reports whether the policy denies that owner's resource ("" = base). The owner
 // marker and all member markers are always stripped, denied or not.
 func RedactDeniedOwnerPrivate(v any, denied func(owner, resource string) bool) any {
+	return redactOwnerPrivate(v, denied, "")
+}
+
+// redactOwnerPrivate threads the ambientOwner — the login/slug of the nearest enclosing marked
+// Organization/Enterprise — so a member-bearing NON-owner object (Team) reached by navigation is attributed
+// to its owner and redacted under that owner's "members" carve-out (round-26 structural). An owner object
+// supplies its own owner (and becomes the ambient for its subtree); a member-bearing object with NO
+// attributable owner fails closed (its member fields are nulled).
+func redactOwnerPrivate(v any, denied func(owner, resource string) bool, ambientOwner string) any {
 	switch val := v.(type) {
 	case map[string]any:
-		if owner, ok := val[ownerMarkerAlias].(string); ok {
+		effectiveOwner := ambientOwner
+		isOwnerObj := false
+		if o, ok := val[ownerMarkerAlias].(string); ok {
+			effectiveOwner = o
+			isOwnerObj = true
 			delete(val, ownerMarkerAlias)
-			var memberKeys []string
+		}
+		var memberKeys []string
+		for k := range val {
+			if strings.HasPrefix(k, ownerMemberMarkerPrefix) {
+				memberKeys = append(memberKeys, strings.TrimPrefix(k, ownerMemberMarkerPrefix))
+			}
+		}
+		for _, key := range memberKeys {
+			delete(val, ownerMemberMarkerPrefix+key)
+		}
+		switch {
+		case isOwnerObj && denied(effectiveOwner, ""):
+			// base-denied owner → keep only public identity, null everything else (drift-proof).
 			for k := range val {
-				if strings.HasPrefix(k, ownerMemberMarkerPrefix) {
-					memberKeys = append(memberKeys, strings.TrimPrefix(k, ownerMemberMarkerPrefix))
+				if !ownerPublicFields[k] {
+					val[k] = nil
 				}
 			}
+		case len(memberKeys) > 0 && (effectiveOwner == "" || denied(effectiveOwner, "members")):
+			// member fields denied (or no attributable owner → fail closed) → null by marked response key.
 			for _, key := range memberKeys {
-				delete(val, ownerMemberMarkerPrefix+key)
-			}
-			switch {
-			case denied(owner, ""):
-				for k := range val {
-					if !ownerPublicFields[k] {
-						val[k] = nil
-					}
-				}
-			case denied(owner, "members"):
-				for _, key := range memberKeys {
-					if _, present := val[key]; present {
-						val[key] = nil
-					}
+				if _, present := val[key]; present {
+					val[key] = nil
 				}
 			}
 		}
+		nextAmbient := ambientOwner
+		if isOwnerObj {
+			nextAmbient = effectiveOwner
+		}
 		for k, c := range val {
-			val[k] = RedactDeniedOwnerPrivate(c, denied)
+			val[k] = redactOwnerPrivate(c, denied, nextAmbient)
 		}
 		return val
 	case []any:
 		for i, c := range val {
-			val[i] = RedactDeniedOwnerPrivate(c, denied)
+			val[i] = redactOwnerPrivate(c, denied, ambientOwner)
 		}
 		return val
 	}
@@ -419,6 +448,25 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 		}
 		*sels = append(*sels, &ast.Field{Alias: ownerMarkerAlias, Name: idField})
 		budget.count(1)
+		return
+	}
+	if memberFields := memberBearingNonOwnerTypes[typeName]; memberFields != nil {
+		// A non-owner type (Team) exposing its owner's member identity: inject ONLY the per-member-field
+		// response-key markers — no owner marker — so the filter redacts these fields under the nearest
+		// marked owner ANCESTOR's "members" carve-out (round-26 structural; the owner analogue of
+		// repoOwnedNoPath ambient attribution).
+		for _, sel := range *sels {
+			f, ok := sel.(*ast.Field)
+			if !ok || !memberFields[f.Name] {
+				continue
+			}
+			key := f.Alias
+			if key == "" {
+				key = f.Name
+			}
+			*sels = append(*sels, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
+			budget.count(1)
+		}
 		return
 	}
 	// Abstract type (interface/union): the runtime object is one of its concrete members.
