@@ -92,7 +92,16 @@ func TestR38_OwnerAdminContentCovered(t *testing.T) {
 		}
 		return rt
 	}
-	adminCats := map[string]bool{"orgs": true, "enterprise-admin": true}
+	// Categories whose element types correspond to a REST per-resource segment a [org.permissions] carve-out
+	// gates, so EVERY Org/Enterprise field returning one must be mapped (round-38 used only {orgs,
+	// enterprise-admin}; round-39 found packages/issues slipping the too-narrow set). "migrations" is
+	// intentionally NOT here: its org fields are mannequins (a member field → "members") and
+	// repositoryMigrations (redacted response-side by the round-21 RepositoryMigration repoIdentityScalar),
+	// so neither needs a front-gate per-resource mapping.
+	adminCats := map[string]bool{
+		"orgs": true, "enterprise-admin": true,
+		"packages": true, "issues": true,
+	}
 	check := func(typeName string, fieldMap map[string]string, exceptions map[string]bool) {
 		def := gqlfilter.SchemaType(s, typeName)
 		if def == nil {

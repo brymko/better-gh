@@ -537,6 +537,15 @@ var gqlOrgFieldToResource = map[string]string{
 	"announcementBanner":                            "settings",
 	"organizationBillingEmail":                      "settings",
 	"notificationDeliveryRestrictionEnabledSetting": "settings",
+	// Owner-private collections whose element @docsCategory is OUTSIDE {orgs,enterprise-admin} but which
+	// still have a REST per-resource gate (round-39): the org package inventory (GET /orgs/{org}/packages
+	// → "packages", incl. PRIVATE packages + their repository.full_name) and the org issue-type/field config
+	// (/orgs/{org}/issue-types|issue-fields). Each degraded to base org read over GraphQL while REST gated it.
+	// (repositoryMigrations is NOT mapped here — RepositoryMigration is already redacted response-side, round-21
+	// repoIdentityScalar, which fails it closed under an org ancestor; front-gate mapping would only over-deny.)
+	"packages":    "packages",
+	"issueTypes":  "issue-types",
+	"issueFields": "issue-fields",
 }
 
 // gqlEnterpriseFieldToResource is the ENTERPRISE analogue of gqlOrgFieldToResource (round-38 finding-1/2): the

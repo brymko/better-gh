@@ -31,6 +31,15 @@ func ContainsDeniedRepo(body []byte, org string, authorized func(ownerRepo strin
 
 func scanForDeniedRepo(v any, org string, authorized func(string) bool) bool {
 	switch t := v.(type) {
+	case string:
+		// VALUE-driven catch for a github.com WEB url naming a repo (html_url / clone_url /
+		// student_repository_url / …) — the shape the keyed checks miss (round-39 Classroom grades feed,
+		// whose student_repository_url is a bare-repo html_url). Conservative: github.com host only, a
+		// reserved-top-level-path denylist, so an ordinary github.com link does not over-fail the scan.
+		if r := repoFromWebURL(t); r != "" && !authorized(r) {
+			return true
+		}
+		return false
 	case map[string]any:
 		if s, ok := t["full_name"].(string); ok && strings.Count(s, "/") == 1 && !authorized(s) {
 			return true
@@ -89,6 +98,45 @@ func repoFromAPIURL(u string) string {
 		return ""
 	}
 	return parts[0] + "/" + parts[1]
+}
+
+// reservedWebFirstSegment are github.com top-level path segments that are NOT a repo owner, so a
+// github.com/<seg>/… URL must not be mis-parsed as owner/repo by the value-driven Pass body-scan.
+var reservedWebFirstSegment = map[string]bool{
+	"orgs": true, "organizations": true, "users": true, "settings": true, "sponsors": true,
+	"marketplace": true, "apps": true, "notifications": true, "new": true, "login": true,
+	"join": true, "about": true, "pricing": true, "features": true, "topics": true,
+	"collections": true, "trending": true, "events": true, "codespaces": true, "enterprises": true,
+	"account": true, "dashboard": true, "search": true, "explore": true, "stars": true,
+	"watching": true, "gist": true, "site": true, "contact": true, "security": true, "readme": true,
+}
+
+// repoFromWebURL extracts "owner/repo" from a GitHub WEB url (html_url / clone_url / *_repository_url),
+// e.g. "https://github.com/owner/repo", ".../owner/repo/issues/1", or ".../owner/repo.git". Returns "" for a
+// non-github.com host, a 1-segment profile url, or a reserved top-level path — the conservative form that
+// avoids false-positives in the fail-closed Pass body-scan (round-39).
+func repoFromWebURL(u string) string {
+	i := strings.Index(u, "://")
+	if i < 0 {
+		return ""
+	}
+	rest := u[i+3:]
+	j := strings.IndexByte(rest, '/')
+	if j < 0 {
+		return ""
+	}
+	if host := rest[:j]; host != "github.com" && host != "www.github.com" {
+		return "" // EXACTLY github.com — excludes api.github.com (".../repos/owner/repo" API links, keyed-checked elsewhere) and GHE hosts
+	}
+	parts := strings.SplitN(rest[j+1:], "/", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" || reservedWebFirstSegment[parts[0]] {
+		return ""
+	}
+	repo := strings.TrimSuffix(parts[1], ".git")
+	if repo == "" {
+		return ""
+	}
+	return parts[0] + "/" + repo
 }
 
 // isMinimalRepoObject reports whether m is the inline {id,name,url} repository shape GitHub uses in
