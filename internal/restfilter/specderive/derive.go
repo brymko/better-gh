@@ -22,6 +22,11 @@ var crossRefFields = map[string]bool{
 	"head_repository": true, "base_repository": true, "template_repository": true,
 }
 
+// IsCrossRefField reports whether name is a cross-ref field (head/base/parent/source/template_repository/…)
+// — a field under which a repo identity names a DIFFERENT repository than the entry's own. The spec-
+// coverage test uses it to assert every FOREIGN location a write response surfaces is matched by a scrub.
+func IsCrossRefField(name string) bool { return crossRefFields[name] }
+
 type doc struct {
 	Paths      map[string]map[string]operation `json:"paths"`
 	Components struct {
@@ -93,7 +98,11 @@ func (s *Spec) Ops() []Op {
 }
 
 func (o Op) respSchema() map[string]any {
-	for _, code := range []string{"200", "201"} {
+	// 202 Accepted is a success body for the async fork-create endpoints (/forks,
+	// /security-advisories/{ghsa}/forks) — which echo parent/source/template_repository — so the leak
+	// scan must inspect it; without 202 those ops returned a nil schema and were silently skipped
+	// (round-22). 200 stays first so a GET's primary response is unchanged.
+	for _, code := range []string{"200", "201", "202"} {
 		if r, ok := o.op.Responses[code]; ok {
 			if c, ok := r.Content["application/json"]; ok && len(c.Schema) > 0 {
 				var m map[string]any

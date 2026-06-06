@@ -133,12 +133,19 @@ func TestSpecCoverage_NoPathScopedLeak(t *testing.T) {
 		// WRITE: the write path runs ONLY the cross-ref / content scrub (no enum redact, no passScan), so
 		// a foreign/enumerated repo — OR a SUBJECT repo that is NOT the path repo (a non-path-scoped write
 		// whose response subject is a different repo, e.g. a projectsV2 item's linked content) — must be
-		// scrubbed/content-scrubbed.
-		if reach.Enum || reach.Foreign || (reach.Subject && !pathScoped) {
-			if len(WriteScrubLocations(path)) > 0 || len(ContentScrubFields(path)) > 0 {
-				continue
+		// scrubbed/content-scrubbed. PER-LOCATION (not boolean): every FOREIGN cross-ref location RepoReach
+		// finds must be covered EITHER by a write-scrub jsonpath naming its cross-ref field OR by a content-
+		// scrub field that wholesale-nulls an ancestor — so a PARTIAL scrub (parent/source present but
+		// template_repository absent — the /forks miss) is caught, not just a wholly-missing one (round-22).
+		writeScrub := strings.Join(WriteScrubLocations(path), " ")
+		contentFields := ContentScrubFields(path)
+		for _, field := range unscrubbedForeignFields(reach, writeScrub, contentFields) {
+			leaks = append(leaks, method+" "+o.Path+" [unscrubbed foreign cross-ref field: "+field+"]")
+		}
+		if reach.Enum || (reach.Subject && !pathScoped) {
+			if len(WriteScrubLocations(path)) == 0 && len(contentFields) == 0 {
+				leaks = append(leaks, method+" "+o.Path+leakWhy(reach, dec))
 			}
-			leaks = append(leaks, method+" "+o.Path+leakWhy(reach, dec))
 		}
 	}
 	if len(leaks) > 0 {
@@ -147,6 +154,46 @@ func TestSpecCoverage_NoPathScopedLeak(t *testing.T) {
 			"(a cross-repo leak — add a NeedsFilter location, a scrub entry, or — if genuinely safe — a "+
 			"justified pathScopedSafeExceptions entry):\n  %s", len(leaks), strings.Join(leaks, "\n  "))
 	}
+}
+
+// unscrubbedForeignFields returns the cross-ref field names of FOREIGN repo locations RepoReach found
+// that are NOT covered: a location is covered if its cross-ref field (parent/source/template_repository/
+// head/base/…) is named by a write-scrub jsonpath, OR a content-scrub field wholesale-nulls an ancestor
+// of the location (e.g. projectsV2 `content` nulls a nested PR head.repo). Uncovered names are leaks.
+func unscrubbedForeignFields(reach specderive.RepoReach, writeScrub string, contentFields []string) []string {
+	seen := map[string]bool{}
+	for _, p := range reach.Paths {
+		if !strings.HasPrefix(p, "FOREIGN:") {
+			continue
+		}
+		loc := strings.TrimPrefix(p, "FOREIGN:")
+		if coveredByContentField(loc, contentFields) {
+			continue
+		}
+		for _, seg := range strings.Split(loc, ".") {
+			seg = strings.TrimSuffix(seg, "[]")
+			if specderive.IsCrossRefField(seg) && !strings.Contains(writeScrub, seg) {
+				seen[seg] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for f := range seen {
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// coveredByContentField reports whether a top-level content-scrub field wholesale-nulls an ancestor of
+// loc (so any repo nested under it is dropped). loc is a "$.field.sub…" JSON path.
+func coveredByContentField(loc string, contentFields []string) bool {
+	for _, f := range contentFields {
+		if loc == "$."+f || strings.HasPrefix(loc, "$."+f+".") || strings.HasPrefix(loc, "$."+f+"[") {
+			return true
+		}
+	}
+	return false
 }
 
 func leakWhy(r specderive.RepoReach, dec Decision) string {

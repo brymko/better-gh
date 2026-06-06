@@ -34,8 +34,31 @@ func (s *Schema) Augment(query string) (string, error) {
 	// ever runs (the same crash the classifier guards — Augment is reached on the request path
 	// regardless of the classifier's verdict). A token-bounded pre-parse fails closed on such
 	// input, and any query that passes it is small enough that LoadQuery's re-parse is bounded too.
-	if _, perr := parser.ParseQueryWithTokenLimit(&ast.Source{Input: query}, maxAugmentTokens); perr != nil {
+	preDoc, perr := parser.ParseQueryWithTokenLimit(&ast.Source{Input: query}, maxAugmentTokens)
+	if perr != nil {
 		return "", fmt.Errorf("parsing query: %s", perr.Error())
+	}
+	// Bound the fragment graph BEFORE the validator's Walk. gqlparser's validator validates every
+	// operation AND every fragment DEFINITION as a separate root, each re-walking the fragment-spread
+	// subgraph it can reach, so a document of N mutually-/chain-referencing fragments costs ~O(N × edges)
+	// — tens of seconds of CPU for a few-hundred-KB body that still fits under maxAugmentTokens (measured:
+	// ~35s for 1500 fragments × 15 spreads, ~250KB). Augment runs on EVERY /graphql request before the
+	// policy verdict (proxy.go), and the injection/output caps below run only AFTER this Walk, so neither
+	// bounds it — a deny-all token could still pin a core for a minute (round-22). Cap the fragment count
+	// and the total spread-edge count of the parsed document; over either, fail closed (the caller treats
+	// it like an untypable query and the proxy denies). Real queries are orders of magnitude smaller.
+	if frags := len(preDoc.Fragments); frags > maxAugmentFragments {
+		return "", fmt.Errorf("query has too many fragment definitions (%d > %d)", frags, maxAugmentFragments)
+	}
+	edges := 0
+	for _, op := range preDoc.Operations {
+		edges += countFragmentSpreads(op.SelectionSet, 0)
+	}
+	for _, frag := range preDoc.Fragments {
+		edges += countFragmentSpreads(frag.SelectionSet, 0)
+	}
+	if edges > maxAugmentSpreadEdges {
+		return "", fmt.Errorf("query has too many fragment spreads (%d > %d)", edges, maxAugmentSpreadEdges)
 	}
 	// Validate with the default rules MINUS OverlappingFieldsCanBeMerged (an O(n^2)-per-response-name
 	// rule that is a CPU-DoS vector on the request path — see schema.go). The Walk still populates the
@@ -126,6 +149,36 @@ func (b *injectionBudget) count(n int) {
 // stack-overflow on a deeply nested query. Matches the classifier's maxGraphQLTokens — far above
 // any real query, far below the recursion depth that crashes the parser.
 const maxAugmentTokens = 100_000
+
+// maxAugmentFragments / maxAugmentSpreadEdges bound the fragment graph the validator's Walk re-traverses
+// per root (see Augment). Real documents have a few dozen fragments and a few hundred spreads; these
+// ceilings sit far above any legitimate query yet keep the worst-case Walk (~fragments × edges) in the
+// low-millions of steps (a few ms), closing the O(N²) fragment-graph CPU-DoS (round-22).
+const maxAugmentFragments = 1024
+const maxAugmentSpreadEdges = 8192
+
+// countFragmentSpreads counts the FragmentSpread nodes declared directly in a selection tree WITHOUT
+// following the spreads (that following is exactly what the validator does O(N²) times). It recurses
+// only into field and inline-fragment subselections, bounded by maxAugmentDepth — over the depth it
+// returns a fail-closed sentinel so a pathologically deep document trips the spread-edge cap rather than
+// slipping under it.
+func countFragmentSpreads(sels ast.SelectionSet, depth int) int {
+	if depth > maxAugmentDepth {
+		return maxAugmentSpreadEdges + 1
+	}
+	n := 0
+	for _, sel := range sels {
+		switch f := sel.(type) {
+		case *ast.FragmentSpread:
+			n++
+		case *ast.Field:
+			n += countFragmentSpreads(f.SelectionSet, depth+1)
+		case *ast.InlineFragment:
+			n += countFragmentSpreads(f.SelectionSet, depth+1)
+		}
+	}
+	return n
+}
 
 // usesReservedAlias reports whether any field in the selection tree uses markerAlias as
 // its response key (alias, or name when unaliased), or whether the tree exceeds
@@ -503,6 +556,13 @@ func filterValue(v any, authorize func(owner, repo, resource, typename string) D
 				return nil
 			}
 			shell = false // an authorized per-resource content object is readable in full
+			// A cross-repository event (CrossReferencedEvent) is attributed to its ambient (allowed) repo
+			// and kept, but its url/resourcePath URI scalars name the FOREIGN repo that referenced the
+			// allowed issue — a denied repo's identity/existence the marker-redaction of `source` does NOT
+			// cover (those scalars carry no marker). Null them when they name a repo policy denies (round-22).
+			if crossRepoURIScrubTypes[typename] {
+				scrubCrossRepoURIScalars(val, authorize, typename)
+			}
 		} else if shell {
 			// An UNMARKED intermediate inside a KeepShell container (e.g. a linked ProjectV2 /
 			// DraftIssue — @docsCategory "projects" is deliberately un-markered because projects
@@ -686,6 +746,140 @@ func (s *Schema) FilterResource(typename string) string {
 		return r
 	}
 	return "metadata"
+}
+
+// crossRepoURIScrubTypes are repoOwnedNoPath timeline-event types that are kept by ambient attribution
+// but ALSO expose url/resourcePath URI scalars naming a DIFFERENT (cross-repository) repo than their
+// ambient one — CrossReferencedEvent, whose url/resourcePath point at the FOREIGN issue/PR that
+// cross-referenced the allowed issue. The marked `source` content object is redacted normally, but these
+// sibling scalars would leak the foreign repo's identity/existence (round-22). TestCrossRepoURIScrubCoverage
+// asserts this equals the schema-derived set (repoOwnedNoPath ∩ has isCrossRepository ∩ has url|resourcePath).
+var crossRepoURIScrubTypes = map[string]bool{"CrossReferencedEvent": true}
+
+// scrubCrossRepoURIScalars nulls a kept cross-repository event's url/resourcePath scalars when they name
+// a repository policy DENIES. The event itself is authorized against its ambient (allowed) repo, but these
+// scalars point at the FOREIGN referencing issue/PR, so they must be checked against THAT repo. An
+// unparseable value fails closed (nulled); a same-repo reference parses to the allowed repo → Keep → kept.
+func scrubCrossRepoURIScalars(val map[string]any, authorize func(owner, repo, resource, typename string) Decision, typename string) {
+	for _, field := range []string{"url", "resourcePath"} {
+		s, ok := val[field].(string)
+		if !ok || s == "" {
+			continue
+		}
+		owner, repo, parsed := repoFromIssueOrPullRef(s)
+		if !parsed || authorize(owner, repo, typeResource(typename), typename) == Deny {
+			val[field] = nil
+		}
+	}
+}
+
+// repoFromIssueOrPullRef extracts (owner, repo) from a GitHub issue/PR web URL or resource path —
+// "https://github.com/{owner}/{repo}/issues/{n}", ".../pull/{n}", or the host-relative
+// "/{owner}/{repo}/issues/{n}" form. It returns ok=false for any other shape so the caller fails closed;
+// requiring a known repo subresource as the third path segment keeps the parse unambiguous (a non-repo
+// path like /orgs/{org}/... never mis-parses to an (owner, repo)).
+func repoFromIssueOrPullRef(s string) (owner, repo string, ok bool) {
+	if i := strings.Index(s, "://"); i >= 0 {
+		j := strings.IndexByte(s[i+3:], '/')
+		if j < 0 {
+			return "", "", false
+		}
+		s = s[i+3+j:] // drop scheme://host, keep the path
+	}
+	parts := strings.Split(strings.TrimPrefix(s, "/"), "/")
+	if len(parts) < 3 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	switch parts[2] {
+	case "issues", "pull", "pulls", "discussions", "commit", "commits":
+		return parts[0], parts[1], true
+	}
+	return "", "", false
+}
+
+// orgMemberIdentityScalars are the fields that, on a type reachable from an Organization connection,
+// expose a member's/owner's identity — the data a [org.permissions] members="none" carve-out hides.
+var orgMemberIdentityScalars = map[string]bool{
+	"login": true, "email": true, "actorLogin": true, "actorIp": true, "userLogin": true, "userName": true,
+}
+
+// OrgMemberIdentityFields returns every Organization field whose return type — followed one hop into a
+// connection's `nodes`/`edges.node` element and expanded through interface/union members — exposes a
+// member/owner identity scalar (login/email/IP). The classifier maps each of these to the "members"
+// per-resource key (or justifies it as public); a coverage test asserts that mapping stays complete, so a
+// schema refresh adding another member-identity org field (the round-21 mannequins / round-22 auditLog
+// class) cannot silently bypass members="none" over GraphQL. RETURNS them sorted.
+func (s *Schema) OrgMemberIdentityFields() []string {
+	org := s.schema.Types["Organization"]
+	if org == nil {
+		return nil
+	}
+	unwrap := func(t *ast.Type) string {
+		for t.Elem != nil {
+			t = t.Elem
+		}
+		return t.Name()
+	}
+	concretes := func(name string) []string {
+		def := s.schema.Types[name]
+		if def == nil {
+			return nil
+		}
+		if def.Kind == ast.Object {
+			return []string{name}
+		}
+		var cs []string
+		for _, pt := range s.schema.PossibleTypes[name] {
+			cs = append(cs, pt.Name)
+		}
+		return cs
+	}
+	exposesIdentity := func(typeName string) bool {
+		for _, c := range concretes(typeName) {
+			def := s.schema.Types[c]
+			if def == nil {
+				continue
+			}
+			for _, f := range def.Fields {
+				if orgMemberIdentityScalars[f.Name] {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	var out []string
+	for _, f := range org.Fields {
+		rt := unwrap(f.Type)
+		if rt == "Repository" || rt == "RepositoryConnection" {
+			continue // repo-scoped — governed by the response filter / repo scope, not member identity
+		}
+		elem := rt
+		if def := s.schema.Types[rt]; def != nil {
+			for _, ff := range def.Fields {
+				if ff.Name == "nodes" || ff.Name == "edges" {
+					et := unwrap(ff.Type)
+					if ff.Name == "edges" {
+						if ed := s.schema.Types[et]; ed != nil {
+							for _, ef := range ed.Fields {
+								if ef.Name == "node" {
+									et = unwrap(ef.Type)
+								}
+							}
+						}
+					}
+					if exposesIdentity(et) {
+						elem = et
+					}
+				}
+			}
+		}
+		if exposesIdentity(elem) {
+			out = append(out, f.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // IsKnownNodeObjectType reports whether typename is an OBJECT type implementing Node that this

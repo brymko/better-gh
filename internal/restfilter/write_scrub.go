@@ -18,8 +18,17 @@ var writeScrubOps = map[string][]string{
 	// PATCH /repos/{o}/{r} returns the repository object, which for a fork/generated repo embeds the
 	// upstream parent/source/template_repository (a different, possibly-denied repo).
 	"/repos/{owner}/{repo}": {"$.*parent.full_name", "$.*source.full_name", "$.*template_repository.full_name"},
-	// POST /repos/{o}/{r}/forks creates a fork whose response carries parent/source.
-	"/repos/{owner}/{repo}/forks": {"$.*parent.full_name", "$.*source.full_name"},
+	// POST /repos/{o}/{r}/forks creates a fork (HTTP 202) whose full-repository body carries
+	// parent/source AND template_repository — if the forked repo was itself generated from a private
+	// template the client can't read, template_repository names that denied repo. The round-20 scrub
+	// here covered only parent/source (the 202 response was invisible to the spec-coverage scan, which
+	// inspected 200/201 only); round-22 adds template_repository.
+	"/repos/{owner}/{repo}/forks": {"$.*parent.full_name", "$.*source.full_name", "$.*template_repository.full_name"},
+	// POST /repos/{o}/{r}/security-advisories/{ghsa_id}/forks creates a temporary private fork (HTTP 202)
+	// to fix an advisory; its full-repository body carries parent/source/template_repository just like
+	// /forks. It had NO scrub entry at all (so respFilter stayed nil and the whole body streamed), the
+	// other 202 sibling the spec-coverage scan was blind to (round-22).
+	"/repos/{owner}/{repo}/security-advisories/{ghsa_id}/forks": {"$.*parent.full_name", "$.*source.full_name", "$.*template_repository.full_name"},
 	// POST (create) and PATCH (update) a pull request return the PR with head.repo/base.repo as full
 	// Repository objects; head.repo of a fork-originated PR is a different, possibly-denied private repo.
 	"/repos/{owner}/{repo}/pulls":               {"$.head.*repo.full_name", "$.base.*repo.full_name"},

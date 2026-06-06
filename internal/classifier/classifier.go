@@ -462,6 +462,12 @@ var gqlOrgFieldToResource = map[string]string{
 	"mannequins":           "members",
 	"enterpriseOwners":     "members",
 	"samlIdentityProvider": "members",
+	// The org audit log enumerates every member's login + source IP + location + per-action activity (a
+	// strict SUPERSET of the roster members="none" hides). It returns OrganizationAuditEntryConnection,
+	// whose AuditEntry concrete types carry actorLogin/actorIp — owner-private member identity the repo-
+	// centric response filter never redacts (AuditEntry is @docsCategory "enterprise-admin"/"orgs", not a
+	// repo). Unmapped it degraded to base org read, bypassing members="none" (round-22). Gate on "members".
+	"auditLog": "members",
 }
 
 // gqlOrgResources returns each distinct org per-resource key an owner-root (organization/
