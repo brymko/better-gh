@@ -47,19 +47,29 @@ func TestR28_UserSponsorsPrivateRedacted(t *testing.T) {
 	}
 }
 
-// TestR28_UserPrivateFieldsCoverSponsorsFinancials is the anti-drift guard for the curated userPrivateFields
-// set: every Sponsorable financial field (name ends in "InCents") must be in it, so a schema refresh that
-// adds another sponsors-income scalar fails the build instead of leaking it for a denied user.
-func TestR28_UserPrivateFieldsCoverSponsorsFinancials(t *testing.T) {
+// sponsorablePublicFields are the Sponsorable fields that are NOT owner-private — public sponsor-listing
+// flags and VIEWER-relative relationship fields (about the requesting custodian, not the navigated owner).
+var sponsorablePublicFields = map[string]bool{
+	"hasSponsorsListing": true, "isSponsoredBy": true, "isSponsoringViewer": true, "sponsorsListing": true,
+	"sponsorshipForViewerAsSponsor": true, "sponsorshipForViewerAsSponsorable": true,
+	"viewerCanSponsor": true, "viewerIsSponsoring": true,
+}
+
+// TestR28_SponsorableFieldsClassified is the INVERTED anti-drift guard (round-30): rather than a name
+// heuristic ("ends in InCents", which missed sponsorshipsAsMaintainer/Newsletters/sponsors), assert EVERY
+// Sponsorable field is classified as either owner-private (userPrivateFields, nulled for a denied user) or
+// justified-public (sponsorablePublicFields). A schema refresh that adds an unclassified Sponsorable field
+// fails the build, forcing a triage instead of a silent leak.
+func TestR28_SponsorableFieldsClassified(t *testing.T) {
 	s, _ := Load()
 	sp := s.schema.Types["Sponsorable"]
 	if sp == nil {
 		t.Skip("no Sponsorable interface")
 	}
 	for _, f := range sp.Fields {
-		if strings.HasSuffix(f.Name, "InCents") && !userPrivateFields[f.Name] {
-			t.Errorf("Sponsorable financial field %q is not in userPrivateFields — it leaks for a denied user "+
-				"reached via an interface; add it", f.Name)
+		if !userPrivateFields[f.Name] && !sponsorablePublicFields[f.Name] {
+			t.Errorf("Sponsorable field %q is unclassified — add it to userPrivateFields (nulled for a denied "+
+				"user) or, if genuinely public, to sponsorablePublicFields", f.Name)
 		}
 	}
 }

@@ -44,22 +44,29 @@ func TestContainsDeniedRepo(t *testing.T) {
 	cases := []struct {
 		name      string
 		body      string
+		org       string
 		wantDeny  bool
 		wantParse bool
 	}{
-		{"denied full_name nested in array", `{"x":[{"full_name":"blocked/secret"}]}`, true, true},
-		{"allowed full_name only", `{"x":[{"full_name":"ok/keep"}]}`, false, true},
-		{"denied repository_url", `{"items":[{"repository_url":"https://api.github.com/repos/blocked/secret"}]}`, true, true},
-		{"allowed repository_url", `{"items":[{"repository_url":"https://api.github.com/repos/ok/keep/issues/1"}]}`, false, true},
-		{"denied minimal repo shape", `[{"repo":{"id":5,"name":"blocked/secret","url":"u"}}]`, true, true},
-		{"branch name with slash is NOT a repo (no id/url)", `{"ref":{"name":"release/v1"}}`, false, true},
-		{"empty body", ``, false, true},
-		{"non-JSON body", "not json at all", false, false},
-		{"no repo anywhere", `{"login":"someone","plan":{"name":"pro"}}`, false, true},
+		{"denied full_name nested in array", `{"x":[{"full_name":"blocked/secret"}]}`, "", true, true},
+		{"allowed full_name only", `{"x":[{"full_name":"ok/keep"}]}`, "", false, true},
+		{"denied repository_url", `{"items":[{"repository_url":"https://api.github.com/repos/blocked/secret"}]}`, "", true, true},
+		{"allowed repository_url", `{"items":[{"repository_url":"https://api.github.com/repos/ok/keep/issues/1"}]}`, "", false, true},
+		{"denied minimal repo shape", `[{"repo":{"id":5,"name":"blocked/secret","url":"u"}}]`, "", true, true},
+		{"branch name with slash is NOT a repo (no id/url)", `{"ref":{"name":"release/v1"}}`, "", false, true},
+		{"empty body", ``, "", false, true},
+		{"non-JSON body", "not json at all", "", false, false},
+		{"no repo anywhere", `{"login":"someone","plan":{"name":"pro"}}`, "", false, true},
+		// round-30: org rulesets/properties shapes
+		{"denied repository_full_name", `[{"repository_full_name":"blocked/secret","value":"x"}]`, "", true, true},
+		{"allowed repository_full_name", `[{"repository_full_name":"ok/keep"}]`, "", false, true},
+		{"denied bare repository_name+id qualified by org", `[{"repository_id":7,"repository_name":"secret","ref":"main"}]`, "blocked", true, true},
+		{"allowed bare repository_name+id qualified by org", `[{"repository_id":7,"repository_name":"keep"}]`, "ok", false, true},
+		{"bare repository_name+id but no org → cannot qualify (skip)", `[{"repository_id":7,"repository_name":"secret"}]`, "", false, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			denied, ok := ContainsDeniedRepo([]byte(c.body), auth)
+			denied, ok := ContainsDeniedRepo([]byte(c.body), c.org, auth)
 			if denied != c.wantDeny || ok != c.wantParse {
 				t.Fatalf("got (denied=%v, parsedOK=%v), want (%v, %v)", denied, ok, c.wantDeny, c.wantParse)
 			}

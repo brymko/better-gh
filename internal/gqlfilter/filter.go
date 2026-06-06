@@ -62,6 +62,12 @@ var userPrivateFields = map[string]bool{
 	"monthlyEstimatedSponsorsIncomeInCents": true, "estimatedNextSponsorsPayoutInCents": true,
 	"totalSponsorshipAmountAsSponsorInCents": true, "lifetimeReceivedSponsorshipValues": true,
 	"sponsorsActivities": true, "organizationVerifiedDomainEmails": true,
+	// incoming/outgoing sponsorship CONNECTIONS (include PRIVATE sponsorships: sponsor identity, tier
+	// price, paymentSource, newsletters) — owner-private to the account, not just the *InCents scalars
+	// (round-30). On Organization these are caught by the base-denied coarse redaction; on User only the
+	// userPrivateFields set is nulled, so they must be listed here.
+	"sponsorshipsAsMaintainer": true, "sponsorshipsAsSponsor": true, "sponsorshipNewsletters": true,
+	"sponsors": true, "sponsoring": true,
 }
 
 // memberBearingNonOwnerTypes are object types that are NOT themselves an owner (Organization/Enterprise)

@@ -1185,7 +1185,11 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 			jsonError(w, http.StatusBadGateway, "bgh: response too large to filter")
 			return
 		}
-		denied, ok := restfilter.ContainsDeniedRepo(raw, passScan)
+		scanOrg := classified.Org
+		if scanOrg == "" {
+			scanOrg = classified.Owner
+		}
+		denied, ok := restfilter.ContainsDeniedRepo(raw, scanOrg, passScan)
 		if !ok {
 			// JSON content-type but unparseable → anomalous for a repo-free op; fail closed.
 			slog.Warn("pass-response JSON unparseable; failing closed", "status", resp.StatusCode)

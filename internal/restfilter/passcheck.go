@@ -16,7 +16,7 @@ import (
 // link, and the minimal {id,name,url} event-repo shape — so anything the generator WOULD have
 // located is caught here too. Returns (containsDenied, parsedOK); a non-JSON body yields
 // parsedOK=false, and the caller (having already gated on a JSON content-type) fails closed.
-func ContainsDeniedRepo(body []byte, authorized func(ownerRepo string) bool) (denied, parsedOK bool) {
+func ContainsDeniedRepo(body []byte, org string, authorized func(ownerRepo string) bool) (denied, parsedOK bool) {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return false, true
 	}
@@ -26,18 +26,34 @@ func ContainsDeniedRepo(body []byte, authorized func(ownerRepo string) bool) (de
 	if dec.Decode(&root) != nil {
 		return false, false
 	}
-	return scanForDeniedRepo(root, authorized), true
+	return scanForDeniedRepo(root, org, authorized), true
 }
 
-func scanForDeniedRepo(v any, authorized func(string) bool) bool {
+func scanForDeniedRepo(v any, org string, authorized func(string) bool) bool {
 	switch t := v.(type) {
 	case map[string]any:
 		if s, ok := t["full_name"].(string); ok && strings.Count(s, "/") == 1 && !authorized(s) {
 			return true
 		}
+		// repository_full_name: a full "owner/repo" property (org rulesets/properties feeds) — round-30.
+		if s, ok := t["repository_full_name"].(string); ok && strings.Count(s, "/") == 1 && !authorized(s) {
+			return true
+		}
 		if u, ok := t["repository_url"].(string); ok {
 			if r := repoFromAPIURL(u); r != "" && !authorized(r) {
 				return true
+			}
+		}
+		// org-relative {repository_id, repository_name}: repository_name is a BARE repo name (no owner) on
+		// the org rule-suites feed; qualify it with the request's scoped org before authorizing (round-30).
+		if _, hasID := t["repository_id"]; hasID {
+			if name, ok := t["repository_name"].(string); ok && name != "" {
+				switch {
+				case strings.Count(name, "/") == 1 && !authorized(name):
+					return true
+				case !strings.Contains(name, "/") && org != "" && !authorized(org+"/"+name):
+					return true
+				}
 			}
 		}
 		// minimal {id,name,url} event/timeline repo shape: name == "owner/repo".
@@ -47,13 +63,13 @@ func scanForDeniedRepo(v any, authorized func(string) bool) bool {
 			}
 		}
 		for _, child := range t {
-			if scanForDeniedRepo(child, authorized) {
+			if scanForDeniedRepo(child, org, authorized) {
 				return true
 			}
 		}
 	case []any:
 		for _, child := range t {
-			if scanForDeniedRepo(child, authorized) {
+			if scanForDeniedRepo(child, org, authorized) {
 				return true
 			}
 		}

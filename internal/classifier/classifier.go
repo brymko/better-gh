@@ -1473,6 +1473,25 @@ func restUnscopedCategory(segments []string) string {
 	if len(segments) == 0 {
 		return "meta"
 	}
+	if segments[0] == "user" {
+		// The loginflow floors the "user" category to read so gh's post-login viewer{login} succeeds, but
+		// the WHOLE /user/* prefix must NOT inherit that floor: /user/{emails,orgs,keys,gpg_keys,migrations,
+		// installations,blocks,followers,…} are the custodian's OWNER-PRIVATE account collections that carry
+		// no repos for the REST filter to redact, so a mode=deny token read them ungateably (round-30). They
+		// get a distinct, UN-floored "user_private" category that default-deny denies. The repo-enumeration
+		// feeds (/user/repos|issues|starred|subscriptions) stay "user" — restfilter redacts them and they are
+		// what the floor exists to enable (gh repo list). Bare /user is short-circuited for GET (proxy) and
+		// is identity-only.
+		if len(segments) == 1 {
+			return "user"
+		}
+		switch segments[1] {
+		case "repos", "issues", "starred", "subscriptions":
+			return "user"
+		default:
+			return "user_private"
+		}
+	}
 	if c, ok := restUnscopedMap[segments[0]]; ok {
 		return c
 	}
