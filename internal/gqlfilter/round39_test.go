@@ -3,6 +3,8 @@ package gqlfilter
 import (
 	"strings"
 	"testing"
+
+	"github.com/vektah/gqlparser/v2/ast"
 )
 
 // TestR39_NavigatedOrgContentRedacted pins the round-39 finding-4/8 fix: a navigated Organization/Enterprise's
@@ -94,5 +96,91 @@ func TestR39_AugmentMarksOrgContent(t *testing.T) {
 	}
 	if !strings.Contains(out, ownerContentMarkerPrefix+resourceCode("settings")+"__organizationBillingEmail") {
 		t.Fatalf("organizationBillingEmail content marker (settings) not injected:\n%s", out)
+	}
+}
+
+// TestR40_AbstractCommonFieldContentMarked pins the round-39 mechanism gap: an owner-private CONTENT field
+// selected as an interface COMMON field (Sponsorable.monthlyEstimatedSponsorsIncomeInCents,
+// ProjectV2Owner.projectsV2, PackageOwner.packages …) resolves to an Organization/Enterprise with NO
+// `... on Organization` inline fragment, so augment's CONCRETE content-marking branch never saw the field —
+// only ownerMarkerFragment (the abstract round-27 owner marker) ran, and it injected ONLY member markers, not
+// content markers. Result: the owner got an owner marker (so it was NOT base-coarse-redacted under base-allowed
+// access) but its content field carried no content marker, so RedactDeniedOwnerPrivate left the per-resource
+// carve-out unenforced and the org sponsors-financials / private projects / packages LEAKED. The classifier
+// request gate does not scope this path either (it scopes only org/repositoryOwner/user/enterprise roots and
+// repository().owner). Now ownerMarkerFragment also injects a content marker for every selected content field.
+func TestR40_AbstractCommonFieldContentMarked(t *testing.T) {
+	s, _ := Load()
+	for _, c := range []struct{ q, marker string }{
+		// Sponsorable common field → org sponsors financials.
+		{`{ viewer { sponsorshipsAsSponsor(first:1){ nodes{ sponsorable { monthlyEstimatedSponsorsIncomeInCents } } } } }`,
+			ownerContentMarkerPrefix + resourceCode("sponsors") + "__monthlyEstimatedSponsorsIncomeInCents"},
+		// ProjectV2Owner common field (aliased) → org private projects.
+		{`{ node(id:"x"){ ... on ProjectV2 { owner { mine: projectsV2(first:1){ nodes{ title } } } } } }`,
+			ownerContentMarkerPrefix + resourceCode("projects") + "__mine"},
+	} {
+		out, err := s.Augment(c.q)
+		if err != nil {
+			t.Fatalf("augment %q: %v", c.q, err)
+		}
+		if !strings.Contains(out, c.marker) {
+			t.Fatalf("abstract-common-field content marker %q NOT injected for %q:\n%s", c.marker, c.q, out)
+		}
+	}
+
+	// E2E: org sponsors financials reached via Sponsorable common field, base-ALLOWED owner, sponsors DENIED.
+	sponsorsDenied := func(owner, resource string) bool { return owner == "acme" && resource == "sponsors" }
+	data := map[string]any{"viewer": map[string]any{"sponsorable": map[string]any{
+		ownerMarkerAlias: "acme",
+		ownerContentMarkerPrefix + resourceCode("sponsors") + "__monthlyEstimatedSponsorsIncomeInCents": "Organization",
+		"monthlyEstimatedSponsorsIncomeInCents":                                                         4242424,
+	}}}
+	red := RedactDeniedOwnerPrivate(data, sponsorsDenied, noUserFieldDenied)
+	if strings.Contains(mustJSON(red), "4242424") {
+		t.Fatalf("org sponsors financials leaked under sponsors-denied via Sponsorable common-field nav: %s", mustJSON(red))
+	}
+}
+
+// TestR40_AbstractContentMarkerCoverage is the build-time anti-drift guard for the round-39-mechanism gap:
+// it DERIVES every (interface/union → owner-private CONTENT common field) pair from the live schema —
+// exactly the paths where an Organization/Enterprise is reached without an inline fragment — and asserts
+// ownerMarkerFragment injects a content marker for each. A schema refresh adding a new interface-common
+// content field (or a new ownerContentResource entry) that ownerMarkerFragment forgets to mark fails the
+// build, instead of silently reintroducing the navigation-path content leak.
+func TestR40_AbstractContentMarkerCoverage(t *testing.T) {
+	s, _ := Load()
+	for name, def := range s.schema.Types {
+		if def.Kind != ast.Interface && def.Kind != ast.Union {
+			continue
+		}
+		hasOwner := false
+		for _, pt := range s.schema.PossibleTypes[name] {
+			if pt.Name == "Organization" || pt.Name == "Enterprise" {
+				hasOwner = true
+				break
+			}
+		}
+		if !hasOwner {
+			continue
+		}
+		for _, f := range def.Fields {
+			res, ok := ownerContentResource[f.Name]
+			if !ok {
+				continue
+			}
+			sibling := ast.SelectionSet{&ast.Field{Name: f.Name}}
+			frag := s.ownerMarkerFragment("Organization", sibling)
+			want := ownerContentMarkerPrefix + resourceCode(res) + "__" + f.Name
+			found := false
+			for _, sel := range frag.SelectionSet {
+				if af, ok := sel.(*ast.Field); ok && af.Alias == want {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("interface %s common content field %q (resource %q) is NOT content-marked by ownerMarkerFragment — "+
+					"abstract-navigation content leak", name, f.Name, res)
+			}
+		}
 	}
 }

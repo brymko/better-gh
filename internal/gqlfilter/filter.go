@@ -106,16 +106,45 @@ func resourceFromCode(code string) string { return strings.ReplaceAll(code, "X",
 // content analogue of memberBearingNonOwnerTypes (round-39 finding-5). The *SettingOrganizations suffix rule
 // auto-covers any future enterprise org-inventory field.
 func contentBearingNonOwnerResource(typeName, field string) string {
-	if typeName != "EnterpriseOwnerInfo" {
-		return ""
-	}
-	switch {
-	case strings.HasSuffix(field, "SettingOrganizations"):
-		return "organizations" // the enterprise's member-org inventory, partitioned by setting
-	case field == "admins" || field == "outsideCollaborators" || field == "affiliatedUsersWithTwoFactorDisabled":
-		return "members"
+	switch typeName {
+	case "EnterpriseOwnerInfo":
+		// EnterpriseOwnerInfo is the enterprise's ADMIN/SETTINGS object — only an enterprise owner sees it — so
+		// EVERY field is owner-private content: the member-org INVENTORY partitioned by setting
+		// (*SettingOrganizations → organizations), the admin/collaborator rosters + pending invitations →
+		// members, and everything else (verified domains, IP-allow-list, SAML config, 2FA enforcement, …) →
+		// settings (round-39 inventory; round-40 settings-class). The suffix rule auto-covers future
+		// *SettingOrganizations fields.
+		switch {
+		case strings.HasSuffix(field, "SettingOrganizations"):
+			return "organizations"
+		case field == "admins" || field == "outsideCollaborators" || field == "affiliatedUsersWithTwoFactorDisabled" ||
+			strings.HasPrefix(field, "pending") && strings.Contains(field, "nvitation"):
+			return "members"
+		case field == "id" || field == "__typename":
+			return ""
+		default:
+			return "settings"
+		}
+	case "Team":
+		// Team carries its owning ORG's CONTENT one hop below organization(){teams{nodes{…}}} — its project
+		// boards (projectsV2/projects/…). Member fields keep the round-26 member-marker mechanism (round-40).
+		if r, ok := ownerContentResource[field]; ok {
+			return r
+		}
+	case "EnterpriseUserAccount":
+		// An enterprise member account exposes the enterprise's per-member org-membership INVENTORY (round-40).
+		if field == "organizations" {
+			return "organizations"
+		}
 	}
 	return ""
+}
+
+// contentBearingNonOwnerTypes are the NON-owner types whose own augment branch must inject content markers
+// (Team is handled in the memberBearingNonOwnerTypes branch). TestR40_ContentBearingNonOwnerCovered derives
+// the complete set from the schema so a refresh that adds another such type fails the build.
+var contentBearingNonOwnerTypes = map[string]bool{
+	"EnterpriseOwnerInfo": true, "EnterpriseUserAccount": true,
 }
 
 // OwnerContentResource exposes the field→resource map so a cross-package guard can couple it to the classifier.
@@ -711,15 +740,31 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 			*sels = append(*sels, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
 			budget.count(1)
 		}
+		// Team also carries its owning org's CONTENT (projectsV2/projects) one hop down — content-mark those
+		// too so a projects="none" carve-out is enforced under the ambient org (round-40).
+		for _, sel := range *sels {
+			f, ok := sel.(*ast.Field)
+			if !ok {
+				continue
+			}
+			res := contentBearingNonOwnerResource(typeName, f.Name)
+			if res == "" {
+				continue
+			}
+			key := f.Alias
+			if key == "" {
+				key = f.Name
+			}
+			*sels = append(*sels, &ast.Field{Alias: ownerContentMarkerPrefix + resourceCode(res) + "__" + key, Name: "__typename"})
+			budget.count(1)
+		}
 		return
 	}
-	if typeName == "EnterpriseOwnerInfo" {
-		// EnterpriseOwnerInfo (reached one hop below enterprise(slug:) via `ownerInfo`) carries the enterprise's
-		// CONTENT — its member-org INVENTORY partitioned by setting (`*SettingOrganizations` → OrganizationConnection)
-		// and admin/outside-collaborator rosters — but is NOT itself an owner object, so it got no marker and the
-		// inner connection leaked the private org inventory under an `organizations="none"` carve-out (round-39
-		// finding-5). Content-mark each field with its resource, attributed to the ambient enterprise; the suffix
-		// rule auto-covers any future *SettingOrganizations field.
+	if contentBearingNonOwnerTypes[typeName] {
+		// A NON-owner type that carries its enclosing owner's CONTENT (EnterpriseOwnerInfo reached via
+		// enterprise(){ownerInfo}; EnterpriseUserAccount via enterprise(){members} → its org-membership
+		// inventory). Content-mark each field with its resource, attributed to the ambient owner — the content
+		// analogue of memberBearingNonOwnerTypes (round-39 EnterpriseOwnerInfo; round-40 the rest).
 		for _, sel := range *sels {
 			f, ok := sel.(*ast.Field)
 			if !ok {
@@ -880,9 +925,13 @@ func (s *Schema) ownerMembers(typeName string) []string {
 	return out
 }
 
-// ownerMarkerFragment builds `... on Organization { bghOrgLoginZ9: login <per-selected-member-field markers> }`
-// (or Enterprise/slug) for an owner reached through an abstract field via its COMMON fields with no inline
-// fragment, so the resolved owner self-identifies and RedactDeniedOwnerPrivate gates it (round-27).
+// ownerMarkerFragment builds `... on Organization { bghOrgLoginZ9: login <per-selected-member-field markers>
+// <per-selected-content-field markers> }` (or Enterprise/slug) for an owner reached through an abstract field
+// via its COMMON fields with no inline fragment, so the resolved owner self-identifies and RedactDeniedOwnerPrivate
+// gates it (round-27 member markers; round-39 content markers — an owner-private CONTENT field selected as an
+// interface COMMON field, e.g. Sponsorable.monthlyEstimatedSponsorsIncomeInCents / ProjectV2Owner.projectsV2,
+// resolved to an Organization with no `... on Organization` inline fragment, so the concrete content-marking
+// branch never saw it and the per-resource carve-out was bypassed response-side on the abstract path).
 func (s *Schema) ownerMarkerFragment(ownerType string, siblingSels ast.SelectionSet) *ast.InlineFragment {
 	idField := "login"
 	memberFields := orgMemberFieldNames
@@ -892,12 +941,19 @@ func (s *Schema) ownerMarkerFragment(ownerType string, siblingSels ast.Selection
 	}
 	sel := ast.SelectionSet{&ast.Field{Alias: ownerMarkerAlias, Name: idField}}
 	for _, ss := range siblingSels {
-		if f, ok := ss.(*ast.Field); ok && memberFields[f.Name] {
-			key := f.Alias
-			if key == "" {
-				key = f.Name
-			}
+		f, ok := ss.(*ast.Field)
+		if !ok {
+			continue
+		}
+		key := f.Alias
+		if key == "" {
+			key = f.Name
+		}
+		if memberFields[f.Name] {
 			sel = append(sel, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
+		}
+		if res, ok := ownerContentResource[f.Name]; ok {
+			sel = append(sel, &ast.Field{Alias: ownerContentMarkerPrefix + resourceCode(res) + "__" + key, Name: "__typename"})
 		}
 	}
 	return &ast.InlineFragment{TypeCondition: ownerType, SelectionSet: sel}
