@@ -53,15 +53,19 @@ func scanForDeniedRepo(v any, org string, authorized func(string) bool) bool {
 				return true
 			}
 		}
-		// a bare `repository` STRING — "owner/repo" or (org artifact storage/deployment records) a BARE repo
-		// name qualified by the request's scoped org (round-40). Distinct from a `repository` OBJECT (handled
-		// by the recursion + full_name/url checks); only a string value is a name.
-		if rep, ok := t["repository"].(string); ok && rep != "" {
-			switch {
-			case strings.Count(rep, "/") == 1 && !authorized(rep):
-				return true
-			case !strings.Contains(rep, "/") && org != "" && !authorized(org+"/"+rep):
-				return true
+		// a bare `repository`/`repositoryName` STRING — "owner/repo" or a BARE repo name qualified by the
+		// request's scoped org: org artifact storage/deployment records (`repository`, round-40) and the org
+		// billing usage report (`repositoryName` camelCase — distinct from the snake_case repository_name
+		// checked below, round-41). Only a string value is a name (a `repository` OBJECT is handled by the
+		// recursion + full_name/url checks).
+		for _, k := range [...]string{"repository", "repositoryName"} {
+			if rep, ok := t[k].(string); ok && rep != "" {
+				if strings.Count(rep, "/") == 1 && !authorized(rep) {
+					return true
+				}
+				if !strings.Contains(rep, "/") && org != "" && !authorized(org+"/"+rep) {
+					return true
+				}
 			}
 		}
 		// org-relative {repository_id, repository_name}: repository_name is a BARE repo name (no owner) on

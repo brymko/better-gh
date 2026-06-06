@@ -20,6 +20,7 @@ func TestR39_OwnerContentResourceInSync(t *testing.T) {
 	// exclude them from this request↔response per-resource coupling.
 	viewerPrivateSentinel := map[string]bool{
 		"sponsorshipForViewerAsSponsor": true, "sponsorshipForViewerAsSponsorable": true,
+		"viewerIsSponsoring": true, "isSponsoringViewer": true, "viewerCanSponsor": true,
 	}
 	for field, res := range gqlMap {
 		if viewerPrivateSentinel[field] {

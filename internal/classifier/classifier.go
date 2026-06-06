@@ -598,6 +598,7 @@ var viewerPrivateFieldCategory = map[string]string{
 	"gists": "gists", "gist": "gists", "gistComments": "gists", "gistComment": "gists",
 
 	"sponsorshipForViewerAsSponsor": "user_private", "sponsorshipForViewerAsSponsorable": "user_private",
+	"viewerIsSponsoring": "user_private", "isSponsoringViewer": "user_private", "viewerCanSponsor": "user_private",
 	"organizations": "user_private", "organization": "user_private", "enterprises": "user_private",
 	"projectsV2": "user_private", "projectV2": "user_private", "projects": "user_private",
 	"project": "user_private", "recentProjects": "user_private", "savedReplies": "user_private",
@@ -1188,14 +1189,15 @@ func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionLi
 		repoScopes = append(repoScopes, s)
 	}
 	tooComplex := false
+	budget := maxGraphQLVisits // ONE document-global budget shared across all ops (round-41 DoS bound)
 	for _, op := range ops {
 		// Only mutations carry per-resource writes; for a mutation the operation's direct
 		// (and top-level-fragment) fields are root mutation fields whose name maps to a
 		// resource. Reads pass atRoot=false so every node maps to "".
-		walkSelectionArgs(op.SelectionSet, fragments, vars, add, addScope, op.Operation == ast.Mutation, "", map[string]bool{}, 0, &tooComplex)
+		walkSelectionArgs(op.SelectionSet, fragments, vars, add, addScope, op.Operation == ast.Mutation, "", map[string]bool{}, 0, &tooComplex, &budget)
 	}
 	// Variables not bound to any walked argument: collected defensively with no resource.
-	walkVarsForIDs("", vars, func(id string) { add(id, "") }, addScope, 0, &tooComplex)
+	walkVarsForIDs("", vars, func(id string) { add(id, "") }, addScope, 0, &tooComplex, &budget)
 	if tooComplex {
 		return nil, nil, nil, false
 	}
@@ -1210,7 +1212,7 @@ func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionLi
 // would otherwise never be resolved or policy-checked. atRoot is true while iterating root
 // mutation fields (preserved across top-level fragments); a root field's name fixes the
 // resource for its whole subtree. The depth bound doubles as the cyclic-fragment guard.
-func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(id, resource string), addScope func(owner, repo, resource string), atRoot bool, resource string, seenFrags map[string]bool, depth int, tooComplex *bool) {
+func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, vars map[string]interface{}, add func(id, resource string), addScope func(owner, repo, resource string), atRoot bool, resource string, seenFrags map[string]bool, depth int, tooComplex *bool, budget *int) {
 	if *tooComplex {
 		return
 	}
@@ -1219,6 +1221,10 @@ func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionLi
 		return
 	}
 	for _, sel := range sels {
+		if visit(budget) { // document-global visit budget — a shared fragment re-expanded per op (seenFrags
+			*tooComplex = true // dedups only WITHIN one op's walk) made this O(ops × fields) → a pre-policy CPU
+			return             // DoS; bound it like the read-scope walk (round-41).
+		}
 		switch s := sel.(type) {
 		case *ast.Field:
 			res := resource
@@ -1226,20 +1232,20 @@ func walkSelectionArgs(sels ast.SelectionSet, fragments ast.FragmentDefinitionLi
 				res = gqlMutationResource(s.Name)
 			}
 			for _, arg := range s.Arguments {
-				walkArgValue(arg.Name, arg.Value, vars, add, addScope, res, depth+1, tooComplex)
+				walkArgValue(arg.Name, arg.Value, vars, add, addScope, res, depth+1, tooComplex, budget)
 			}
 			if len(s.SelectionSet) > 0 {
-				walkSelectionArgs(s.SelectionSet, fragments, vars, add, addScope, false, res, seenFrags, depth+1, tooComplex)
+				walkSelectionArgs(s.SelectionSet, fragments, vars, add, addScope, false, res, seenFrags, depth+1, tooComplex, budget)
 			}
 		case *ast.InlineFragment:
-			walkSelectionArgs(s.SelectionSet, fragments, vars, add, addScope, atRoot, resource, seenFrags, depth+1, tooComplex)
+			walkSelectionArgs(s.SelectionSet, fragments, vars, add, addScope, atRoot, resource, seenFrags, depth+1, tooComplex, budget)
 		case *ast.FragmentSpread:
 			if seenFrags[s.Name] {
 				continue // expand each fragment once per walk: node IDs are deduped
 			}
 			if frag := fragments.ForName(s.Name); frag != nil {
 				seenFrags[s.Name] = true
-				walkSelectionArgs(frag.SelectionSet, fragments, vars, add, addScope, atRoot, resource, seenFrags, depth+1, tooComplex)
+				walkSelectionArgs(frag.SelectionSet, fragments, vars, add, addScope, atRoot, resource, seenFrags, depth+1, tooComplex, budget)
 			}
 		}
 	}
@@ -1270,11 +1276,11 @@ func effectiveVariables(ops ast.OperationList, provided map[string]interface{}) 
 	return eff
 }
 
-func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add func(id, resource string), addScope func(owner, repo, resource string), resource string, depth int, tooComplex *bool) {
+func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add func(id, resource string), addScope func(owner, repo, resource string), resource string, depth int, tooComplex *bool, budget *int) {
 	if *tooComplex {
 		return
 	}
-	if depth > maxGraphQLDepth {
+	if depth > maxGraphQLDepth || visit(budget) {
 		*tooComplex = true
 		return
 	}
@@ -1327,20 +1333,20 @@ func walkArgValue(name string, v *ast.Value, vars map[string]interface{}, add fu
 			addScope(splitOwner, splitRepo, resource)
 		}
 		for _, child := range v.Children {
-			walkArgValue(child.Name, child.Value, vars, add, addScope, resource, depth+1, tooComplex)
+			walkArgValue(child.Name, child.Value, vars, add, addScope, resource, depth+1, tooComplex, budget)
 		}
 	case ast.ListValue:
 		for _, child := range v.Children {
-			walkArgValue(name, child.Value, vars, add, addScope, resource, depth+1, tooComplex)
+			walkArgValue(name, child.Value, vars, add, addScope, resource, depth+1, tooComplex, budget)
 		}
 	}
 }
 
-func walkVarsForIDs(key string, v interface{}, add func(string), addScope func(owner, repo, resource string), depth int, tooComplex *bool) {
+func walkVarsForIDs(key string, v interface{}, add func(string), addScope func(owner, repo, resource string), depth int, tooComplex *bool, budget *int) {
 	if *tooComplex {
 		return
 	}
-	if depth > maxGraphQLDepth {
+	if depth > maxGraphQLDepth || visit(budget) {
 		*tooComplex = true
 		return
 	}
@@ -1354,12 +1360,20 @@ func walkVarsForIDs(key string, v interface{}, add func(string), addScope func(o
 			add(val)
 		}
 	case map[string]interface{}:
+		// SPLIT string repo target supplied as a WHOLE-OBJECT variable (createSponsorsTier input bound to a
+		// variable): the ObjectValue split detector in walkArgValue never sees it, so detect the
+		// repositoryOwnerLogin+repositoryName pair here too (round-41 sibling of round-40 finding-6).
+		if o, _ := val["repositoryOwnerLogin"].(string); o != "" {
+			if r, _ := val["repositoryName"].(string); r != "" && !strings.Contains(r, "/") {
+				addScope(o, r, "")
+			}
+		}
 		for k, child := range val {
-			walkVarsForIDs(k, child, add, addScope, depth+1, tooComplex)
+			walkVarsForIDs(k, child, add, addScope, depth+1, tooComplex, budget)
 		}
 	case []interface{}:
 		for _, child := range val {
-			walkVarsForIDs(key, child, add, addScope, depth+1, tooComplex)
+			walkVarsForIDs(key, child, add, addScope, depth+1, tooComplex, budget)
 		}
 	}
 }

@@ -79,8 +79,16 @@ const ownerContentMarkerPrefix = "bghOwnerCZ9_"
 const viewerPrivateContentResource = "viewerprivateZZ"
 
 var ownerContentResource = map[string]string{
-	// viewer-private-on-owner (gated on the user_private category via the sentinel)
+	// viewer-private-on-owner (gated on the user_private category via the sentinel): the custodian's own
+	// sponsorship financials AND the existence bits revealing whether the custodian sponsors / is sponsored
+	// by this navigated account (round-40 sponsorshipForViewerAs*; round-41 the viewer* booleans).
 	"sponsorshipForViewerAsSponsor": viewerPrivateContentResource, "sponsorshipForViewerAsSponsorable": viewerPrivateContentResource,
+	"viewerIsSponsoring": viewerPrivateContentResource, "isSponsoringViewer": viewerPrivateContentResource,
+	"viewerCanSponsor": viewerPrivateContentResource,
+	// the org/enterprise PRIVATE team inventory (names/slugs/privacy) — a teams="none" carve-out the REST
+	// GET /orgs/{org}/teams and the organization(){teams} root both gate was bypassed response-side on a
+	// navigation path (round-41 finding-5).
+	"team": "teams", "teams": "teams", "enterpriseTeam": "teams", "enterpriseTeams": "teams",
 	// Organization
 	"projectsV2": "projects", "projectV2": "projects", "projects": "projects",
 	"project": "projects", "recentProjects": "projects",
@@ -205,9 +213,11 @@ var userPrivateFields = map[string]bool{
 	// when the gists category is denied (round-36).
 	"pinnableItems": true, "pinnedItems": true, "itemShowcase": true,
 	// sponsorshipForViewerAs* return the CUSTODIAN's own (viewer-relative) private sponsorship — tier price,
-	// payment source, privacy level — relative to this navigated user; gated on user_private so a navigated
-	// User edge cannot leak the custodian's financials (round-40 F3/F4/F8, correcting r35ViewerRelativePublic).
+	// payment source, privacy level — relative to this navigated user; viewerIsSponsoring/isSponsoringViewer/
+	// viewerCanSponsor are the existence bits. Gated on user_private so a navigated User edge cannot leak the
+	// custodian's sponsorship relationships (round-40 F3/F4/F8 + round-41 F2, correcting r35ViewerRelativePublic).
 	"sponsorshipForViewerAsSponsor": true, "sponsorshipForViewerAsSponsorable": true,
+	"viewerIsSponsoring": true, "isSponsoringViewer": true, "viewerCanSponsor": true,
 }
 
 // userGistFields are the userPrivateFields whose policy category is "gists" (parity with REST /gists and

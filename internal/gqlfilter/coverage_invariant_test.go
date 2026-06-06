@@ -135,6 +135,7 @@ func TestR20_RepoOwnedCategoryResourceMapping(t *testing.T) {
 		"discussions":      "no `discussions` policy key (documented residual)",
 		"dependency-graph": "no `dependency-graph` policy key (dep/SBOM data gated by base/metadata)",
 		"repos":            "the repository container/metadata itself",
+		"reactions":        "no `reactions` policy key — a reaction is gated by its ambient repo's base/metadata access (round-41)",
 	}
 	for cat := range repoOwnedCategories {
 		_, mapped := docsCategoryResource[cat]

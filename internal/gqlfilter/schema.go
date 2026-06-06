@@ -59,6 +59,9 @@ var repoOwnedCategories = map[string]bool{
 	"deployments": true, "actions": true, "checks": true, "releases": true,
 	"git": true, "deploy-keys": true, "discussions": true,
 	"dependency-graph": true, "repos": true,
+	// a Reaction lives on a repo's issue/PR/comment/discussion — single-repo-owned, so a node(id:Reaction)
+	// of a denied repo must fail closed and a navigated Reaction is attributed to its ambient repo (round-41).
+	"reactions": true,
 }
 
 // deriveRepoOwnedNoPath returns the concrete OBJECT types whose @docsCategory marks them as
