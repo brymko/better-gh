@@ -517,6 +517,60 @@ func gqlOrgResources(orgField *ast.Field, fragments ast.FragmentDefinitionList, 
 	return out
 }
 
+// viewerPrivateFieldCategory maps an owner-PRIVATE viewer (custodian) sub-field to the unscoped policy
+// category that gates it: `gists` to the "gists" category (parity with REST /gists and node(id:Gist)),
+// every other private collection to the un-floored "user_private" so default-deny denies it (round-31).
+// Identity and repo-scoped viewer fields are NOT listed — they keep the floored "user" category (repo-scoped
+// ones are redacted by the response filter). A schema refresh adding a private viewer field is caught by
+// TestR31_ViewerPrivateFieldCoverage.
+var viewerPrivateFieldCategory = map[string]string{
+	"gists": "gists", "gist": "gists",
+
+	"sponsorshipForViewerAsSponsor": "user_private", "sponsorshipForViewerAsSponsorable": "user_private",
+	"organizations": "user_private", "organization": "user_private", "enterprises": "user_private",
+	"projectsV2": "user_private", "projectV2": "user_private", "projects": "user_private",
+	"project": "user_private", "recentProjects": "user_private", "savedReplies": "user_private",
+	"sponsorshipsAsMaintainer": "user_private", "sponsorshipsAsSponsor": "user_private",
+	"sponsors": "user_private", "sponsoring": "user_private", "sponsorshipNewsletters": "user_private",
+	"email": "user_private", "organizationVerifiedDomainEmails": "user_private",
+	"publicKeys": "user_private", "gpgKeys": "user_private", "sshSigningKeys": "user_private",
+	"socialAccounts": "user_private", "interactionAbility": "user_private", "twoFactorEnabled": "user_private",
+	"sponsorsActivities": "user_private", "monthlyEstimatedSponsorsIncomeInCents": "user_private",
+	"estimatedNextSponsorsPayoutInCents": "user_private", "totalSponsorshipAmountAsSponsorInCents": "user_private",
+	"lifetimeReceivedSponsorshipValues": "user_private", "sponsorsListing": "user_private",
+}
+
+// collectViewerPrivateCategories walks a viewer selection (through inline fragments and fragment spreads)
+// and returns the policy categories of every owner-private sub-field it selects, so the front gate denies
+// the custodian's private data under default-deny (round-31).
+func collectViewerPrivateCategories(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, seenFrags map[string]bool, depth int, budget *int) []string {
+	if depth > maxGraphQLDepth {
+		return []string{"user_private"} // too deep to scan → fail closed
+	}
+	var out []string
+	for _, sel := range sels {
+		if visit(budget) {
+			return append(out, "user_private")
+		}
+		switch s := sel.(type) {
+		case *ast.Field:
+			if cat, ok := viewerPrivateFieldCategory[s.Name]; ok {
+				out = append(out, cat)
+			}
+		case *ast.InlineFragment:
+			out = append(out, collectViewerPrivateCategories(s.SelectionSet, fragments, seenFrags, depth+1, budget)...)
+		case *ast.FragmentSpread:
+			if !seenFrags[s.Name] {
+				seenFrags[s.Name] = true
+				if frag := fragments.ForName(s.Name); frag != nil {
+					out = append(out, collectViewerPrivateCategories(frag.SelectionSet, fragments, seenFrags, depth+1, budget)...)
+				}
+			}
+		}
+	}
+	return out
+}
+
 // collectNamedChildFields returns the direct child fields named `name` in a selection set, descending
 // through inline fragments and fragment spreads (so `... on Repository { owner {…} }` and a spread are
 // found) but NOT into other fields' own sub-selections. Used to reach a repository root's `owner`
@@ -798,7 +852,17 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 				}
 				continue
 			case "viewer":
+				// viewer is the CUSTODIAN's own account: identity (login) is floored to "user" for gh's
+				// post-login {viewer{login}}, but its owner-PRIVATE sub-resources must NOT inherit that floor
+				// — the GraphQL parallel of the REST /user/* split (round-31). gists map to the same "gists"
+				// category REST /gists + node(id:Gist) enforce; the other private collections (organizations/
+				// enterprises/projectsV2/savedReplies/sponsorships/email/keys/…) map to the un-floored
+				// "user_private" category that default-deny denies. Identity + repo-scoped viewer fields keep
+				// "user" (repo-scoped ones are redacted by the response filter).
 				add(Scope{UnscopedCategory: "user"})
+				for _, cat := range collectViewerPrivateCategories(s.SelectionSet, fragments, map[string]bool{}, depth+1, budget) {
+					add(Scope{UnscopedCategory: cat})
+				}
 				continue
 			case "rateLimit":
 				add(Scope{UnscopedCategory: "meta"})

@@ -1294,3 +1294,7 @@ func findNameWithOwner(v any) string {
 	}
 	return ""
 }
+
+// SchemaType exposes a named type definition from the embedded schema (for cross-package coverage tests
+// like the classifier's viewer-private-field guard). Returns nil if the type is unknown.
+func SchemaType(s *Schema, name string) *ast.Definition { return s.schema.Types[name] }
