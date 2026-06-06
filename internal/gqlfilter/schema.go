@@ -575,3 +575,20 @@ func renderPathSelection(alias string, path []pathStep) string {
 	b.WriteString(strings.Repeat("}", closers))
 	return b.String()
 }
+
+// IsOwnerPrivateType reports whether typeName's @docsCategory marks it as owner-private (org/user/
+// enterprise/gists/projects/migrations/sponsors/…) — categories whose data is not repo-attributable and
+// must be policy-gated. The classifier's viewer coverage guard uses it to DERIVE (not hand-list) which
+// viewer sub-fields expose owner-private data, so a schema refresh adding one fails the build.
+func IsOwnerPrivateType(s *Schema, typeName string) bool {
+	def := s.schema.Types[typeName]
+	if def == nil {
+		return false
+	}
+	if d := def.Directives.ForName("docsCategory"); d != nil {
+		if arg := d.Arguments.ForName("name"); arg != nil && arg.Value != nil {
+			return ownerOwnedNodeCategories[arg.Value.Raw]
+		}
+	}
+	return false
+}

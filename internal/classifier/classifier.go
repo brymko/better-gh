@@ -524,7 +524,7 @@ func gqlOrgResources(orgField *ast.Field, fragments ast.FragmentDefinitionList, 
 // ones are redacted by the response filter). A schema refresh adding a private viewer field is caught by
 // TestR31_ViewerPrivateFieldCoverage.
 var viewerPrivateFieldCategory = map[string]string{
-	"gists": "gists", "gist": "gists",
+	"gists": "gists", "gist": "gists", "gistComments": "gists", "gistComment": "gists",
 
 	"sponsorshipForViewerAsSponsor": "user_private", "sponsorshipForViewerAsSponsorable": "user_private",
 	"organizations": "user_private", "organization": "user_private", "enterprises": "user_private",

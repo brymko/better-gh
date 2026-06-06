@@ -38,16 +38,19 @@ func TestR31_ViewerPrivateGated(t *testing.T) {
 	}
 }
 
-// TestR31_ViewerPrivateFieldCoverage is the derived drift guard: every User field whose return element is
-// an owner-private type (Gist/ProjectV2/SavedReply/Sponsorship/SponsorsActivity) must be in
-// viewerPrivateFieldCategory, so a schema refresh adding a new private viewer collection fails the build.
+// ownerPrivateDocsCategories are the @docsCategory names whose User-reachable element types carry
+// owner-PRIVATE data (the custodian's gists, sponsors, orgs, enterprise admin, projects, migrations).
+// The coverage guard derives the owner-private element set from this category set rather than a
+// hand-listed type allowlist, so a schema refresh adding ANY new private element type (e.g. a new
+// gists-category connection like gistComments, round-32) is caught without editing a type list.
+// TestR31_ViewerPrivateFieldCoverage is the derived drift guard: every User field whose return element
+// carries an owner-private @docsCategory must be in viewerPrivateFieldCategory, so a schema refresh adding
+// a new private viewer collection fails the build (round-31; round-32 re-based on @docsCategory after the
+// hand-listed type set missed GistComment).
 func TestR31_ViewerPrivateFieldCoverage(t *testing.T) {
 	s, err := gqlfilter.Load()
 	if err != nil {
 		t.Fatal(err)
-	}
-	ownerPrivateElem := map[string]bool{
-		"Gist": true, "ProjectV2": true, "SavedReply": true, "Sponsorship": true, "SponsorsActivity": true,
 	}
 	def := gqlfilter.SchemaType(s, "User")
 	if def == nil {
@@ -59,6 +62,26 @@ func TestR31_ViewerPrivateFieldCoverage(t *testing.T) {
 		}
 		return tp.Name()
 	}
+	// Owner-private-CONTENT @docsCategory names (correct schema spellings). The node-id "users" category is
+	// deliberately EXCLUDED: it is MIXED — owner-private (SavedReply/email/keys, hand-listed in
+	// viewerPrivateFieldCategory) AND public profile (UserStatus/PinnableItem/followers/contributionsCollection,
+	// correctly NOT gated). The unambiguously-private content categories below ARE all type-derivable.
+	ownerPrivateContentCategories := map[string]bool{
+		"gists": true, "sponsors": true, "orgs": true, "enterprise-admin": true,
+		"projects": true, "projects-classic": true, "migrations": true,
+	}
+	docsCategoryOf := func(typeName string) string {
+		d := gqlfilter.SchemaType(s, typeName)
+		if d == nil {
+			return ""
+		}
+		if dir := d.Directives.ForName("docsCategory"); dir != nil {
+			if a := dir.Arguments.ForName("name"); a != nil && a.Value != nil {
+				return a.Value.Raw
+			}
+		}
+		return ""
+	}
 	for _, f := range def.Fields {
 		rt := unwrap(f.Type)
 		elem := rt
@@ -69,9 +92,28 @@ func TestR31_ViewerPrivateFieldCoverage(t *testing.T) {
 				}
 			}
 		}
-		if ownerPrivateElem[elem] && viewerPrivateFieldCategory[f.Name] == "" {
-			t.Errorf("viewer/User field %q returns owner-private %q but is not in viewerPrivateFieldCategory "+
-				"— it leaks the custodian's private data; gate it", f.Name, elem)
+		if ownerPrivateContentCategories[docsCategoryOf(elem)] && viewerPrivateFieldCategory[f.Name] == "" {
+			t.Errorf("viewer/User field %q returns owner-private %q (@docsCategory %q) but is not in "+
+				"viewerPrivateFieldCategory — it leaks the custodian's private data; gate it", f.Name, elem, docsCategoryOf(elem))
 		}
+	}
+}
+
+// TestR32_GistCommentsGated pins the round-32 fix: viewer{gistComments} (a gists-category connection
+// returning GistComment) is gated to "gists" like viewer{gists}, so a default-deny token with no gists
+// grant cannot read the custodian's gist-comment bodies — including comments on SECRET gists.
+func TestR32_GistCommentsGated(t *testing.T) {
+	has := func(scopes []Scope, cat string) bool {
+		for _, s := range scopes {
+			if s.UnscopedCategory == cat {
+				return true
+			}
+		}
+		return false
+	}
+	q := `{ viewer { gistComments(first:50){ nodes{ body bodyText author{login} gist{ name description isPublic } } } } }`
+	r := Classify("POST", "/graphql", []byte(`{"query":`+jsonStr(q)+`}`))
+	if !has(r.AllScopes(), "gists") {
+		t.Fatalf("viewer{gistComments} not gated to gists category: %+v", r.AllScopes())
 	}
 }
