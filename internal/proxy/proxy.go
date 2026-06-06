@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -596,11 +597,69 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 		}
 		return gqlfilter.Deny
 	})
+	// GitHub returns partial-failure errors and warnings in PARALLEL top-level arrays the data-side
+	// marker filter never touches: errors[].message / extensions.* are free-form strings with NO marker,
+	// so a "no permission to view pull requests in secretcorp/private-upstream" message (a fork's denied
+	// private parent, a navigated repo, …) rides out unredacted right beside the data the filter correctly
+	// nulled (round-25). Scrub any string in those channels that names a repository the policy cannot read
+	// in any way, replacing it wholesale (fail-closed) so a denied repo's identity/existence does not leak.
+	deniedRepo := func(ownerRepo string) bool {
+		i := strings.IndexByte(ownerRepo, '/')
+		if i <= 0 || i >= len(ownerRepo)-1 {
+			return false
+		}
+		return !pol.CanReadAnything(ownerRepo, ownerRepo[:i])
+	}
+	if errs, ok := filtered["errors"]; ok {
+		filtered["errors"] = scrubDeniedRepoStrings(errs, deniedRepo)
+	}
+	if ext, ok := filtered["extensions"]; ok {
+		filtered["extensions"] = scrubDeniedRepoStrings(ext, deniedRepo)
+	}
+	// Enforce [org.permissions] members="none" on member-identity fields reached by ANY navigation path
+	// (not just an org/user root the classifier scopes): null a members-denied org's member fields using
+	// the org login the augmenter injected (round-25).
+	membersDenied := func(orgLogin string) bool {
+		return orgLogin != "" && !pol.Evaluate("", orgLogin, classifier.Read, "members", "").Allowed
+	}
+	filtered = gqlfilter.RedactDeniedOrgMembers(filtered, membersDenied).(map[string]any)
 	out, err := json.Marshal(filtered)
 	if err != nil {
 		return nil, false
 	}
 	return out, true
+}
+
+const redactedErrorMessage = "redacted by bgh: this response referenced a resource the policy denies"
+
+// repoNameToken matches an owner/repo-shaped substring in free-form error text (GitHub's permission
+// messages embed the full name, e.g. "... in secretcorp/private-upstream.").
+var repoNameToken = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]+`)
+
+// scrubDeniedRepoStrings recursively replaces any string in a GraphQL errors[]/extensions subtree that
+// names a repository `denied` reports unreadable, with a generic message. Fail-closed: a name-bearing
+// string is replaced WHOLESALE rather than partially patched, so a denied repo's name cannot survive.
+func scrubDeniedRepoStrings(v any, denied func(ownerRepo string) bool) any {
+	switch val := v.(type) {
+	case string:
+		for _, tok := range repoNameToken.FindAllString(val, -1) {
+			if denied(tok) {
+				return redactedErrorMessage
+			}
+		}
+		return val
+	case map[string]any:
+		for k, c := range val {
+			val[k] = scrubDeniedRepoStrings(c, denied)
+		}
+		return val
+	case []any:
+		for i, c := range val {
+			val[i] = scrubDeniedRepoStrings(c, denied)
+		}
+		return val
+	}
+	return v
 }
 
 // evaluateScopes allows a request only if EVERY scope it touches is allowed. A
@@ -701,34 +760,45 @@ func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceB
 			resources = []string{""}
 		}
 		for _, res := range resources {
-			scopes = append(scopes, classifier.Scope{Owner: r.owner, Repo: r.repo, Resource: h.nodeResource(access, r.typename, res)})
+			for _, key := range h.nodeResourceKeys(access, r.typename, res) {
+				scopes = append(scopes, classifier.Scope{Owner: r.owner, Repo: r.repo, Resource: key})
+			}
 		}
 	}
 	return scopes, true
 }
 
-// nodeResource picks the per-resource key for a resolved node. For a WRITE it prefers the key
-// derived from the node's REAL type (PullRequest→pulls, Issue→issues, …) over the mutation
-// field-name guess (resourceByID): a PR node is "pulls" no matter what the mutation is called,
-// so addComment/addReaction/addLabels on a PR can no longer dodge a pulls restriction by having
-// a name gqlMutationResource doesn't recognize. When the node's type maps to no specific
-// resource (e.g. a Repository node targeted by mergeBranch/createRef), it falls back to the
-// name guess. Reads keep the name/primary-resource behavior (the response filter redacts).
-func (h *Handler) nodeResource(access classifier.AccessLevel, typename, nameGuess string) string {
-	// The type-derived key only OVERRIDES when the mutation name yielded no resource (""): that is
-	// the case the override exists for (addComment/addReaction/addLabels on a PR → "" → "pulls" from
-	// the PullRequest node). When the name DID map to a concrete resource, keep it — it reflects
-	// what the OPERATION does, which can differ from the target object's type: createCommitOnBranch
-	// writes file CONTENT but targets a Ref (type→branches); honoring the type there would let it
-	// dodge contents="none" via the Ref-id addressing form (round-15). A wrongly-permissive concrete
-	// name is not a concern: every concrete gqlMutationResource result names the resource the
-	// mutation actually touches.
-	if access == classifier.Write && nameGuess == "" && h.GQLFilter != nil {
-		if tr := h.GQLFilter.ResourceForType(typename); tr != "" {
-			return tr
+// nodeResourceKeys returns the per-resource key(s) a resolved node must satisfy. For a WRITE it emits
+// the UNION of the mutation field-name guess AND the node's REAL type-derived resource, requiring the
+// policy to allow BOTH (every scope is ANDed). This closes two symmetric dodges:
+//   - name="" addressing a typed node (addComment on a PR → "" → "pulls"): the type supplies the key.
+//   - a name that maps to a MORE-PERMISSIVE-or-DIFFERENT resource than the node's type — the
+//     IssueOrPullRequest-input mutations: unmarkIssueAsDuplicate ("issues") on a PullRequest node
+//     ("pulls"), or createLinkedBranch ("branches") on an Issue node ("issues") — would otherwise ride
+//     under the permitted key while the denied one (the node's true resource) is never checked (round-25).
+//
+// Requiring both is fail-closed (an extra scope can only deny) and is also the correct stricter behavior
+// for createCommitOnBranch (name "contents" on a Ref node → "branches"): a commit that advances a branch
+// tip legitimately needs BOTH contents and branches, preserving the round-15 contents="none" gate while
+// no longer permitting it under branches="none". Reads keep the single name-guess (the response filter
+// enforces per-resource on the redaction side).
+func (h *Handler) nodeResourceKeys(access classifier.AccessLevel, typename, nameGuess string) []string {
+	if access != classifier.Write {
+		return []string{nameGuess}
+	}
+	keys := make([]string, 0, 2)
+	if nameGuess != "" {
+		keys = append(keys, nameGuess)
+	}
+	if h.GQLFilter != nil {
+		if tr := h.GQLFilter.ResourceForType(typename); tr != "" && tr != nameGuess {
+			keys = append(keys, tr)
 		}
 	}
-	return nameGuess
+	if len(keys) == 0 {
+		return []string{""} // base access (e.g. a Repository node + a mutation name with no resource)
+	}
+	return keys
 }
 
 // resolveQuery is the static fallback used only when no schema is loaded (GQLFilter nil).

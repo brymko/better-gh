@@ -24,6 +24,63 @@ const markerAlias = "bghRepoTagZ9"
 // repo-only marker cannot do (it is repo-granular). Stripped from the response like markerAlias.
 const markerTypeAlias = "bghRepoTypeZ9"
 
+// orgLoginMarkerAlias is injected as `bghOrgLoginZ9: login` onto every Organization object so the
+// response filter can enforce [org.permissions] members="none" on member-identity fields reached by ANY
+// navigation path, not just an org/user ROOT (round-25). Reserved like the repo markers so a client cannot
+// pre-declare it to forge/suppress redaction.
+const orgLoginMarkerAlias = "bghOrgLoginZ9"
+
+// orgMemberResponseFields are the Organization fields that expose owner-private member identity (the
+// GraphQL counterparts of the classifier's gqlOrgFieldToResource "members" keys); RedactDeniedOrgMembers
+// nulls them on an org whose members carve-out is denied. Keep in sync with gqlOrgFieldToResource.
+var orgMemberResponseFields = map[string]bool{
+	"membersWithRole": true, "members": true, "pendingMembers": true, "memberStatuses": true,
+	"mannequins": true, "enterpriseOwners": true, "samlIdentityProvider": true, "auditLog": true,
+}
+
+// OrgMemberResponseFields returns the Organization member-identity field names the response filter nulls
+// for a members-denied org. A classifier test asserts this equals the gqlOrgFieldToResource "members"
+// keys, so the request-side scope set and the response-side redaction set cannot drift apart.
+func OrgMemberResponseFields() []string {
+	out := make([]string, 0, len(orgMemberResponseFields))
+	for f := range orgMemberResponseFields {
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// RedactDeniedOrgMembers strips the injected org-login marker from every Organization object in a GraphQL
+// response and, when membersDenied reports that org's members carve-out is denied, NULLS its
+// member-identity fields. This is the response-side enforcement of org members="none" over GraphQL,
+// covering member data reached by navigation that the request-side classifier scope (org ROOT only) and
+// the repo-centric marker filter both miss (round-25). Always strips the marker, denied or not.
+func RedactDeniedOrgMembers(v any, membersDenied func(orgLogin string) bool) any {
+	switch val := v.(type) {
+	case map[string]any:
+		if login, ok := val[orgLoginMarkerAlias].(string); ok {
+			delete(val, orgLoginMarkerAlias)
+			if membersDenied(login) {
+				for f := range orgMemberResponseFields {
+					if _, present := val[f]; present {
+						val[f] = nil
+					}
+				}
+			}
+		}
+		for k, c := range val {
+			val[k] = RedactDeniedOrgMembers(c, membersDenied)
+		}
+		return val
+	case []any:
+		for i, c := range val {
+			val[i] = RedactDeniedOrgMembers(c, membersDenied)
+		}
+		return val
+	}
+	return v
+}
+
 // Augment validates a read query against the GitHub schema and injects, into every
 // repo-scoped selection set, a hidden field revealing that object's repository. It
 // returns the rewritten query. An invalid/untypable query yields an error so the
@@ -195,10 +252,10 @@ func usesReservedAlias(sels ast.SelectionSet, depth int) bool {
 			if key == "" {
 				key = f.Name
 			}
-			if strings.HasPrefix(key, markerAlias) || strings.HasPrefix(key, markerTypeAlias) {
+			if strings.HasPrefix(key, markerAlias) || strings.HasPrefix(key, markerTypeAlias) || strings.HasPrefix(key, orgLoginMarkerAlias) {
 				// Reserve the whole marker namespace (exact aliases AND the per-member
-				// "markerAlias_Type" suffixes augment injects), so a client cannot pre-declare a
-				// look-alike key to spoof/suppress a repository tag and defeat redaction.
+				// "markerAlias_Type" suffixes augment injects, plus the org-login marker), so a client
+				// cannot pre-declare a look-alike key to spoof/suppress a tag and defeat redaction.
 				return true
 			}
 			if usesReservedAlias(f.SelectionSet, depth+1) {
@@ -292,6 +349,19 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 			*sels = append(*sels, typenameMarker())
 			budget.count(1)
 		}
+		return
+	}
+	if typeName == "Organization" {
+		// An Organization object is owner-private but NOT repo-scoped, so it carries no repo marker and
+		// the response filter never redacts its member-identity fields (membersWithRole/mannequins/
+		// auditLog/…). The classifier enforces [org.permissions] members="none" only when such a field is a
+		// DIRECT child of an org/repositoryOwner/user ROOT — a field reached by navigation
+		// (organization(){teams{nodes{organization{membersWithRole}}}}, user(){organizations{nodes{…}}})
+		// bypassed it (round-25). Inject the org login so RedactDeniedOrgMembers can null the member fields
+		// of any members-denied org REGARDLESS of the navigation path that reached it — the response-side
+		// backstop the repo-centric filter could not provide. Concrete type → no abstract member fanout.
+		*sels = append(*sels, &ast.Field{Alias: orgLoginMarkerAlias, Name: "login"})
+		budget.count(1)
 		return
 	}
 	// Abstract type (interface/union): the runtime object is one of its concrete members.
