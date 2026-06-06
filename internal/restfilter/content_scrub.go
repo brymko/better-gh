@@ -79,18 +79,32 @@ func ScrubDeniedContent(body []byte, fields []string, authorized func(ownerRepo 
 	if dec.Decode(&root) != nil {
 		return nil, false
 	}
-	if m, ok := root.(map[string]any); ok {
-		for _, f := range fields {
-			if v, present := m[f]; present && v != nil {
-				if denied, _ := scanMarkedRepos(v, authorized); denied {
-					m[f] = nil
-				}
-			}
-		}
-	}
+	scrubContentRoots(root, fields, authorized)
 	out, err := json.Marshal(root)
 	if err != nil {
 		return nil, false
 	}
 	return out, true
+}
+
+// scrubContentRoots nulls each named field of every OBJECT at the top level of the response — whether the
+// response is a single object OR an ARRAY of objects. A projectsV2 `.../items` LIST returns a JSON array,
+// which the object-only descent silently skipped, leaking the denied repo's linked Issue/PR content — and
+// because the op is registered in contentRepoScrubOps the Pass body-scan backstop never ran (round-36). It
+// descends array nesting but NOT an object's own children (the scrub fields are top-level on each item).
+func scrubContentRoots(v any, fields []string, authorized func(string) bool) {
+	switch t := v.(type) {
+	case map[string]any:
+		for _, f := range fields {
+			if val, present := t[f]; present && val != nil {
+				if denied, _ := scanMarkedRepos(val, authorized); denied {
+					t[f] = nil
+				}
+			}
+		}
+	case []any:
+		for _, el := range t {
+			scrubContentRoots(el, fields, authorized)
+		}
+	}
 }

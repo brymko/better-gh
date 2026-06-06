@@ -552,6 +552,13 @@ var viewerPrivateFieldCategory = map[string]string{
 	"sponsorsActivities": "user_private", "monthlyEstimatedSponsorsIncomeInCents": "user_private",
 	"estimatedNextSponsorsPayoutInCents": "user_private", "totalSponsorshipAmountAsSponsorInCents": "user_private",
 	"lifetimeReceivedSponsorshipValues": "user_private", "sponsorsListing": "user_private",
+	// pinnableItems/pinnedItems/itemShowcase return a PinnableItem (Gist | Repository) union — for the
+	// custodian's own profile the Gist member includes SECRET gists (name/description/file contents), so a
+	// default-deny token reading viewer{pinnableItems(types:[GIST]){nodes{...on Gist{files{text}}}}} leaked
+	// them past the gists gate (the union member is one structural hop past the round-31 coverage guard's
+	// single-nodes unwrap). Gate on "gists" (parity with viewer{gists}); the Repository member is repo-scoped
+	// and over-restricting it on a gists-denied token costs only availability (round-36).
+	"pinnableItems": "gists", "pinnedItems": "gists", "itemShowcase": "gists",
 }
 
 // collectViewerPrivateCategories walks a viewer selection (through inline fragments and fragment spreads)

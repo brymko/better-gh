@@ -82,6 +82,24 @@ func TestR31_ViewerPrivateFieldCoverage(t *testing.T) {
 		}
 		return ""
 	}
+	// privateCat reports the owner-private content @docsCategory of a type, OR — if the type is a union/
+	// interface — of any of its concrete members. A private element can sit one structural hop deep inside a
+	// union/interface member of a "users"-category container field (pinnableItems → PinnableItem(union) →
+	// Gist), which the single-nodes unwrap alone misses (round-36: the viewer{pinnableItems}{...on Gist}
+	// SECRET-gist leak). Descending union members forces such a field into the gate.
+	privateCat := func(typeName string) string {
+		if ownerPrivateContentCategories[docsCategoryOf(typeName)] {
+			return docsCategoryOf(typeName)
+		}
+		if d := gqlfilter.SchemaType(s, typeName); d != nil && (d.Kind == ast.Union || d.Kind == ast.Interface) {
+			for _, m := range gqlfilter.TypeMembers(s, typeName) {
+				if ownerPrivateContentCategories[docsCategoryOf(m)] {
+					return docsCategoryOf(m)
+				}
+			}
+		}
+		return ""
+	}
 	for _, f := range def.Fields {
 		rt := unwrap(f.Type)
 		elem := rt
@@ -92,9 +110,10 @@ func TestR31_ViewerPrivateFieldCoverage(t *testing.T) {
 				}
 			}
 		}
-		if ownerPrivateContentCategories[docsCategoryOf(elem)] && viewerPrivateFieldCategory[f.Name] == "" {
-			t.Errorf("viewer/User field %q returns owner-private %q (@docsCategory %q) but is not in "+
-				"viewerPrivateFieldCategory — it leaks the custodian's private data; gate it", f.Name, elem, docsCategoryOf(elem))
+		if cat := privateCat(elem); cat != "" && viewerPrivateFieldCategory[f.Name] == "" {
+			t.Errorf("viewer/User field %q returns owner-private %q (@docsCategory %q, possibly via a union/"+
+				"interface member) but is not in viewerPrivateFieldCategory — it leaks the custodian's private "+
+				"data; gate it", f.Name, elem, cat)
 		}
 	}
 }

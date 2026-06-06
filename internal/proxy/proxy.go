@@ -634,19 +634,16 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 	ownerDenied := func(owner, resource string) bool {
 		return owner != "" && !pol.Evaluate("", owner, classifier.Read, resource, "").Allowed
 	}
-	// A navigated User's owner-private field is gated on its POLICY CATEGORY (gists for gist
-	// fields, user_private otherwise) — the response-side parity of the classifier's viewer/
-	// user(login:) front gate — so a token holding only an `[[org]] name="<login>"` repo-enumeration
-	// grant (which satisfies ownerDenied for that login) still cannot read the resolved user's private
-	// email/gists/keys via an author/uploadedBy/owner edge (round-35).
-	userFieldDenied := func(field string) bool {
-		cat := "user_private"
-		if gqlfilter.UserGistField(field) {
-			cat = "gists"
-		}
-		return !pol.Evaluate("", "", classifier.Read, "", cat).Allowed
+	// A navigated User's owner-private field is gated on its POLICY CATEGORY (gists for gist fields,
+	// user_private otherwise) — the response-side parity of the classifier's viewer/user(login:) front
+	// gate — so a token holding only an `[[org]] name="<login>"` repo-enumeration grant (which satisfies
+	// ownerDenied for that login) still cannot read the resolved user's private email/gists/keys via an
+	// author/uploadedBy/owner edge (round-35). The category is supplied by the marker prefix the augmenter
+	// set from the schema field NAME, so a client alias cannot downgrade it (round-36).
+	categoryDenied := func(category string) bool {
+		return !pol.Evaluate("", "", classifier.Read, "", category).Allowed
 	}
-	filtered = gqlfilter.RedactDeniedOwnerPrivate(filtered, ownerDenied, userFieldDenied).(map[string]any)
+	filtered = gqlfilter.RedactDeniedOwnerPrivate(filtered, ownerDenied, categoryDenied).(map[string]any)
 	out, err := json.Marshal(filtered)
 	if err != nil {
 		return nil, false

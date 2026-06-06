@@ -18,7 +18,7 @@ func TestR35_NavigatedUserPrivateMarked(t *testing.T) {
 	if !strings.Contains(out, userMarkerAlias) {
 		t.Fatalf("navigated User with private fields not marked:\n%s", out)
 	}
-	for _, want := range []string{ownerMemberMarkerPrefix + "email", ownerMemberMarkerPrefix + "savedReplies", ownerMemberMarkerPrefix + "gists"} {
+	for _, want := range []string{ownerMemberMarkerPrefix + "email", ownerMemberMarkerPrefix + "savedReplies", userGistMarkerPrefix + "gists"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing per-field marker %q:\n%s", want, out)
 		}
@@ -47,7 +47,7 @@ func TestR35_NavigatedUserPrivateRedactedByCategory(t *testing.T) {
 		return map[string]any{"author": map[string]any{
 			userMarkerAlias:                          "octocat",
 			ownerMemberMarkerPrefix + "email":        "User",
-			ownerMemberMarkerPrefix + "gists":        "User",
+			userGistMarkerPrefix + "gists":           "User",
 			ownerMemberMarkerPrefix + "savedReplies": "User",
 			"email":                                  "secret@custodian.example",
 			"gists":                                  map[string]any{"nodes": []any{map[string]any{"name": "AWS_KEYS", "files": []any{map[string]any{"text": "AWS_SECRET=AKIA..."}}}}},
@@ -82,11 +82,11 @@ func TestR35_NavigatedUserPrivateRedactedByCategory(t *testing.T) {
 // category specifically: with user_private granted but gists denied, gists are nulled; email is kept.
 func TestR35_GistFieldGatedOnGistsCategory(t *testing.T) {
 	ownerAllowed := func(string, string) bool { return false }
-	// only gists denied; user_private allowed.
-	gistsDenied := func(field string) bool { return UserGistField(field) }
+	// only the gists CATEGORY denied; user_private allowed.
+	gistsDenied := func(cat string) bool { return cat == "gists" }
 	red := RedactDeniedOwnerPrivate(map[string]any{"author": map[string]any{
 		userMarkerAlias:                   "octocat",
-		ownerMemberMarkerPrefix + "gists": "User",
+		userGistMarkerPrefix + "gists":    "User",
 		ownerMemberMarkerPrefix + "email": "User",
 		"gists":                           map[string]any{"nodes": []any{map[string]any{"name": "SECRET_GIST"}}},
 		"email":                           "pub@example.com",

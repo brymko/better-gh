@@ -36,6 +36,14 @@ const ownerMarkerAlias = "bghOrgLoginZ9"
 // round-25 null-by-field-name). The suffix is the response key, which is a valid GraphQL name.
 const ownerMemberMarkerPrefix = "bghOrgMemZ9_"
 
+// userGistMarkerPrefix marks a navigated User's GIST-category private field (gists/gist/gistComments) so the
+// response filter gates it on the "gists" policy category rather than "user_private". The marker prefix —
+// not the response key — carries the category, because the key is the client ALIAS (a `mine: gists` alias),
+// and deriving the category from the alias (UserGistField is keyed by field NAME) downgraded gists→user_private
+// and leaked the custodian's SECRET gists past a gists-denied grant (round-36). Non-gist private User fields
+// keep ownerMemberMarkerPrefix (category "user_private"). The suffix is the response key (for nulling).
+const userGistMarkerPrefix = "bghUGstZ9_"
+
 // orgMemberFieldNames are Organization member-identity fields (synced with the classifier's
 // gqlOrgFieldToResource "members" keys); enterpriseMemberFieldNames are the Enterprise counterparts.
 // A member field is nulled when the owner's "members" carve-out is denied but base IS readable.
@@ -80,12 +88,17 @@ var userPrivateFields = map[string]bool{
 	"gpgKeys": true, "sshSigningKeys": true, "socialAccounts": true, "projectsV2": true,
 	"projectV2": true, "projects": true, "project": true, "recentProjects": true,
 	"interactionAbility": true,
+	// pinnableItems/pinnedItems/itemShowcase surface the custodian's SECRET gists via the PinnableItem
+	// (Gist|Repository) union — gated on "gists" so a navigated author's pinned secret gists are nulled
+	// when the gists category is denied (round-36).
+	"pinnableItems": true, "pinnedItems": true, "itemShowcase": true,
 }
 
 // userGistFields are the userPrivateFields whose policy category is "gists" (parity with REST /gists and
 // node(id:Gist)) rather than "user_private", so the response-side redaction gates them on the gists grant.
 var userGistFields = map[string]bool{
 	"gists": true, "gist": true, "gistComments": true,
+	"pinnableItems": true, "pinnedItems": true, "itemShowcase": true,
 }
 
 // UserPrivateFields returns the owner-private User field names (sorted), so a cross-package guard can
@@ -102,6 +115,18 @@ func UserPrivateFields() []string {
 
 // UserGistField reports whether an owner-private User field is gated on the "gists" policy category.
 func UserGistField(field string) bool { return userGistFields[field] }
+
+// userPrivateMarkerPrefix returns the response-side marker prefix that encodes a navigated User-private
+// field's policy CATEGORY by its schema field NAME (not the client alias): gist-category fields get
+// userGistMarkerPrefix ("gists"), all others ownerMemberMarkerPrefix ("user_private"). The category must be
+// fixed here, at augment time, because at redaction time only the marker survives and its suffix is the
+// client ALIAS — deriving the category from that alias downgraded gists→user_private (round-36).
+func userPrivateMarkerPrefix(fieldName string) string {
+	if userGistFields[fieldName] {
+		return userGistMarkerPrefix
+	}
+	return ownerMemberMarkerPrefix
+}
 
 // memberBearingNonOwnerTypes are object types that are NOT themselves an owner (Organization/Enterprise)
 // but expose their owning org's/enterprise's member identity — Team (members/memberStatuses/invitations),
@@ -146,13 +171,14 @@ func OrgMemberFieldNames() []string {
 // `denied(owner, resource)` reports whether the policy denies that owner's resource ("" = base). The owner
 // marker and all member markers are always stripped, denied or not.
 //
-// `userFieldDenied(field)` reports whether the policy denies a navigated User's owner-private field by its
-// POLICY CATEGORY (gists for gist fields, user_private otherwise) — independent of the user's login, so a
+// `categoryDenied(category)` reports whether the policy denies a navigated User's owner-private field by its
+// POLICY CATEGORY ("gists" for gist fields, "user_private" otherwise) — independent of the user's login, so a
 // token that merely holds an `[[org]] name="<login>"` repo-enumeration grant (which would satisfy the
 // org-login `denied` gate) still cannot read the resolved user's private email/gists/keys via navigation,
-// matching the classifier's viewer/user(login:) front gate (round-35).
-func RedactDeniedOwnerPrivate(v any, denied func(owner, resource string) bool, userFieldDenied func(field string) bool) any {
-	return redactOwnerPrivate(v, denied, userFieldDenied, "")
+// matching the classifier's viewer/user(login:) front gate (round-35). The category is carried by the marker
+// PREFIX (set from the schema field name at augment time), not the aliasable response key (round-36).
+func RedactDeniedOwnerPrivate(v any, denied func(owner, resource string) bool, categoryDenied func(category string) bool) any {
+	return redactOwnerPrivate(v, denied, categoryDenied, "")
 }
 
 // redactOwnerPrivate threads the ambientOwner — the login/slug of the nearest enclosing marked
@@ -160,7 +186,7 @@ func RedactDeniedOwnerPrivate(v any, denied func(owner, resource string) bool, u
 // to its owner and redacted under that owner's "members" carve-out (round-26 structural). An owner object
 // supplies its own owner (and becomes the ambient for its subtree); a member-bearing object with NO
 // attributable owner fails closed (its member fields are nulled).
-func redactOwnerPrivate(v any, denied func(owner, resource string) bool, userFieldDenied func(field string) bool, ambientOwner string) any {
+func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categoryDenied func(category string) bool, ambientOwner string) any {
 	switch val := v.(type) {
 	case map[string]any:
 		// A User is marked ONLY for its own owner-private fields and is NEVER coarse-redacted: null exactly
@@ -168,22 +194,32 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, userFie
 		// (user_private/gists) is denied, keeping all its public data (round-28; category gate round-35).
 		if userLogin, ok := val[userMarkerAlias].(string); ok {
 			delete(val, userMarkerAlias)
-			var keys []string
+			// Each per-field marker carries the field's policy CATEGORY in its PREFIX (set at augment time
+			// from the schema field NAME), so a client ALIAS on the field cannot downgrade gists→user_private
+			// (round-36). The suffix is the response key, used to null the field.
+			type marked struct{ key, cat string }
+			var ms []marked
 			for k := range val {
-				if strings.HasPrefix(k, ownerMemberMarkerPrefix) {
-					keys = append(keys, strings.TrimPrefix(k, ownerMemberMarkerPrefix))
+				if rest, isGist := strings.CutPrefix(k, userGistMarkerPrefix); isGist {
+					ms = append(ms, marked{rest, "gists"})
+				} else if rest, ok := strings.CutPrefix(k, ownerMemberMarkerPrefix); ok {
+					ms = append(ms, marked{rest, "user_private"})
 				}
 			}
-			for _, key := range keys {
-				delete(val, ownerMemberMarkerPrefix+key)
-				if denied(userLogin, "") || userFieldDenied(key) {
-					if _, present := val[key]; present {
-						val[key] = nil
+			for _, m := range ms {
+				if m.cat == "gists" {
+					delete(val, userGistMarkerPrefix+m.key)
+				} else {
+					delete(val, ownerMemberMarkerPrefix+m.key)
+				}
+				if denied(userLogin, "") || categoryDenied(m.cat) {
+					if _, present := val[m.key]; present {
+						val[m.key] = nil
 					}
 				}
 			}
 			for k, c := range val {
-				val[k] = redactOwnerPrivate(c, denied, userFieldDenied, ambientOwner)
+				val[k] = redactOwnerPrivate(c, denied, categoryDenied, ambientOwner)
 			}
 			return val
 		}
@@ -224,12 +260,12 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, userFie
 			nextAmbient = effectiveOwner
 		}
 		for k, c := range val {
-			val[k] = redactOwnerPrivate(c, denied, userFieldDenied, nextAmbient)
+			val[k] = redactOwnerPrivate(c, denied, categoryDenied, nextAmbient)
 		}
 		return val
 	case []any:
 		for i, c := range val {
-			val[i] = redactOwnerPrivate(c, denied, userFieldDenied, ambientOwner)
+			val[i] = redactOwnerPrivate(c, denied, categoryDenied, ambientOwner)
 		}
 		return val
 	}
@@ -576,7 +612,7 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 			if key == "" {
 				key = f.Name
 			}
-			*sels = append(*sels, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
+			*sels = append(*sels, &ast.Field{Alias: userPrivateMarkerPrefix(f.Name) + key, Name: "__typename"})
 			budget.count(1)
 			injected = true
 		}
@@ -672,7 +708,7 @@ func (s *Schema) userMarkerFragment(siblingSels ast.SelectionSet) *ast.InlineFra
 			if key == "" {
 				key = f.Name
 			}
-			sel = append(sel, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
+			sel = append(sel, &ast.Field{Alias: userPrivateMarkerPrefix(f.Name) + key, Name: "__typename"})
 			any = true
 		}
 	}
@@ -1337,3 +1373,16 @@ func findNameWithOwner(v any) string {
 // SchemaType exposes a named type definition from the embedded schema (for cross-package coverage tests
 // like the classifier's viewer-private-field guard). Returns nil if the type is unknown.
 func SchemaType(s *Schema, name string) *ast.Definition { return s.schema.Types[name] }
+
+// TypeMembers returns the concrete possible-type names of an interface or union (the members a selection
+// against it could resolve to), or nil for a concrete type. Used by the viewer-private coverage guard to
+// descend a union/interface element (e.g. PinnableItem = Gist | Repository) into its members so a private
+// member one structural hop deep is still forced into the front gate (round-36).
+func TypeMembers(s *Schema, name string) []string {
+	var out []string
+	for _, pt := range s.schema.PossibleTypes[name] {
+		out = append(out, pt.Name)
+	}
+	sort.Strings(out)
+	return out
+}
