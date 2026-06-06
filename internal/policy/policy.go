@@ -232,6 +232,32 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 	}
 }
 
+// AnyRepoDeniesWriteUnderOrg reports whether the policy has a per-repo rule under `org` that DENIES a write
+// to `resource`. The proxy uses it to fail closed a write that names its target repos ONLY by an unmappable
+// numeric id (the org `selected_repository_ids[]` bodies): if some repo under the org is write-denied for
+// the resource, the id could be that repo and the proxy cannot prove otherwise (round-45 F5). It mirrors
+// how Evaluate gates a single repo — a per-resource key wins over base; an unknown/empty resource falls to
+// base access. A token with NO repo carve-out under the org is unaffected (every repo is writable, so any
+// id is safe), so the common org-admin case is not over-restricted.
+func (p *Policy) AnyRepoDeniesWriteUnderOrg(org, resource string) bool {
+	for _, r := range p.Repo {
+		slash := strings.IndexByte(r.Name, '/')
+		if slash <= 0 || !strings.EqualFold(r.Name[:slash], org) {
+			continue
+		}
+		acc := r.Access
+		if r.Permissions != nil && resource != "" && resource != classifier.ResourceUnknown {
+			if pa, ok := lookupResource(r.Permissions, resource); ok {
+				acc = pa
+			}
+		}
+		if !permits(acc, classifier.Write) {
+			return true
+		}
+	}
+	return false
+}
+
 // AllowsAnyWrite reports whether the policy could permit a write to anything. The
 // proxy uses it to skip the upstream node-resolution call for tokens that can never
 // write, so such a token cannot burn the real token's rate limit with doomed mutations.

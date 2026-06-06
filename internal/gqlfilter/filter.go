@@ -272,8 +272,14 @@ var userGistFields = map[string]bool{
 // (classic `projects`/`project` are deliberately ABSENT: their type Project is repo-attributable, handled by
 // the repo filter — not the owner self-marker — so they need no sentinel; TestR44_UserOwnContentFieldsCoupled
 // enforces that every member resolves to a self-marked owner-owned content type.)
+// `recentProjects` is ALSO deliberately ABSENT (round-45 F2): although it returns a self-marked ProjectV2, the
+// schema documents it as "projects this user has recently modified IN THE CONTEXT OF THE OWNER" — i.e. it can
+// be a FOREIGN org's board, not the user's own, so the user-owned sentinel would keep it past that org's
+// `projects="none"`. The coupling guard cannot see cross-owner-ness (it is in the field's prose), so a field
+// added here MUST be own-only by inspection; `recentProjects` fails closed (the user reads its own boards via
+// `projectsV2`).
 var userOwnContentFields = map[string]bool{
-	"projectsV2": true, "projectV2": true, "recentProjects": true, "sponsorsListing": true,
+	"projectsV2": true, "projectV2": true, "sponsorsListing": true,
 }
 
 // UserPrivateFields returns the owner-private User field names (sorted), so a cross-package guard can
@@ -689,7 +695,11 @@ func countFragmentSpreads(sels ast.SelectionSet, depth int) int {
 		case *ast.Field:
 			n += countFragmentSpreads(f.SelectionSet, depth+1)
 		case *ast.InlineFragment:
-			n += countFragmentSpreads(f.SelectionSet, depth+1)
+			// Count the inline fragment itself, not just its sub-spreads (round-45 F3): an inline fragment on a
+			// broad interface is the unit the validator's possibleTypes² cost is paid per, so an attacker who
+			// packed 12k inline fragments under the spread budget (which ignored them) drove a multi-second
+			// validator Walk. Counting them caps that input below maxAugmentSpreadEdges.
+			n += 1 + countFragmentSpreads(f.SelectionSet, depth+1)
 		}
 	}
 	return n

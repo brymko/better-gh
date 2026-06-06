@@ -271,6 +271,12 @@ var typeResourceOverride = map[string]string{
 	// correct if a future schema adds a non-branches path to it (round-20). Guarded by the extended
 	// repoOwnedNoPath resource invariant below.
 	"RefUpdateRule": "branches",
+	// CommitComment is @docsCategory "commits" but the REST surface gates a commit comment as the
+	// "comments" resource (POST /repos/{o}/{r}/comments/{id}/reactions → comments). Without this override a
+	// GraphQL addReaction/minimizeComment on a CommitComment node was gated as "commits", so a
+	// `commits=read-write, comments=none` token could react/minimize past the comments carve-out the REST
+	// twin enforces (round-45 F7). Align GraphQL to the REST axis.
+	"CommitComment": "comments",
 }
 
 // deriveTypeResources builds the object-type → per-resource-key map from the embedded schema's
@@ -399,8 +405,16 @@ func Load() (*Schema, error) {
 	// returns an error response the filter handles. Dropping the rule removes the quadratic at its
 	// source; the Walk still populates field.Definition (which augment needs) regardless of rules, and
 	// every other default rule (unknown field/argument/type, fragment cycles, …) still runs.
+	// PossibleFragmentSpreads is dropped for the same reason (round-45 F3): it costs
+	// len(possibleTypes(fragType)) × len(possibleTypes(parentType)) per inline/named fragment, unmemoized and
+	// with no early-out for disjoint sets, so a ~0.5 MB query of inline fragments on a BROAD interface (a
+	// `...on RuleParameters` inside a `fragment on Node` — 17 × 276 comparisons each) drove the validator Walk
+	// to 35-40s of CPU before the policy verdict. The proxy needs no fragment-applicability diagnostics —
+	// GitHub re-validates upstream and the filter handles the error response — and the Walk still types the
+	// document without it. (countFragmentSpreads also now counts inline fragments against the spread budget.)
 	vr := rules.NewDefaultRules()
 	vr.RemoveRule("OverlappingFieldsCanBeMerged")
+	vr.RemoveRule("PossibleFragmentSpreads")
 	sch.validationRules = vr
 	q := sch.buildNodeResolveQuery()
 	if _, gerr := gqlparser.LoadQuery(s, q); gerr != nil {

@@ -1,5 +1,28 @@
 package restfilter
 
+import (
+	"bytes"
+	"encoding/json"
+)
+
+// BodyHasOpaqueRepoIDs reports whether a state-changing request body names its target repositories ONLY by
+// opaque NUMERIC ids the proxy cannot map to owner/repo — the org `selected_repository_ids[]` bodies (the
+// actions/dependabot/codespaces/agents secrets+variables visibility lists, runner-groups, code-security
+// attach, copilot coding-agent permissions, immutable-releases, …). A write that names a repo this way
+// cannot be proven to avoid a per-repo-DENIED repo, so the proxy fails it closed when a carve-out is in
+// effect (round-45 F5). The field is always at the body's top level for these ops.
+func BodyHasOpaqueRepoIDs(body []byte) bool {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return false
+	}
+	var root map[string]any
+	if json.Unmarshal(body, &root) != nil {
+		return false
+	}
+	arr, ok := root["selected_repository_ids"].([]any)
+	return ok && len(arr) > 0
+}
+
 // opaqueRepoIDOps are Pass GET ops whose response identifies its repository ONLY by an opaque
 // NUMERIC id (no full_name, no repository_url, not the {id,name,url} minimal-repo shape), so neither
 // the OpenAPI generator (which locates full_name/minimal-repo) nor the ContainsDeniedRepo body-scan
@@ -54,6 +77,13 @@ var opaqueRepoIDOps = []string{
 	// TestSpecCoverage_OpaqueRepoIDOps (now traversing oneOf/anyOf/allOf + the plural repository_ids array).
 	"/orgs/{org}/rulesets",
 	"/orgs/{org}/rulesets/{ruleset_id}",
+	// The ruleset HISTORY-version reads embed the same opaque numeric repo ids (the prior ruleset state's
+	// conditions.repository_id.repository_ids[] + repository_name patterns), but inside a FREEFORM `state`
+	// object the spec types as `{type:object}` — so neither the body-scan nor the declaresOpaqueRepoID guard
+	// (which needs a typed `repository_id` property) can see them. Hand-registered as the round-42 sibling the
+	// guard cannot derive (the freeform-`state` blind spot, like the additionalProperties note above) — round-45 F6.
+	"/orgs/{org}/rulesets/{ruleset_id}/history",
+	"/orgs/{org}/rulesets/{ruleset_id}/history/{version_id}",
 }
 
 var opaqueRepoIDTemplates []opTemplate

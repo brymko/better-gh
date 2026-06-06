@@ -465,6 +465,49 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A non-path-scoped WRITE (POST/PUT/PATCH to an org/user op, !HasRepo) can echo a denied repo's identity
+	// in its RESPONSE just like the GET twin — a copilot-space's opaque metadata.repository_id, a storage-
+	// record's bare `repository` string — but the GET/HEAD-gated Pass machinery above (the opaque-id
+	// fail-close + the Pass body-scan) never ran on writes, so the write response streamed unredacted
+	// (round-45 F1). Apply the same opaque-id fail-close / redactable-shape filter / Pass body-scan to a
+	// write whose response the static table believed repo-free.
+	if respFilter == nil && passScan == nil && result.Allowed && !classified.HasRepo() &&
+		r.Method != http.MethodGet && r.Method != http.MethodHead {
+		// Pass (the static table located no repo) OR Unknown (a WRITE-only/off-spec path absent from the
+		// GET-derived table, e.g. POST /orgs/{org}/artifacts/metadata/storage-record): the response body can
+		// still carry a denied repo. Body-scan it (fail closed only if a denied repo is actually present, so a
+		// legitimate off-spec write is not broken) and honor the opaque-id / redactable-shape handlers.
+		if dec, _ := restfilter.Lookup(norm); dec == restfilter.Pass || dec == restfilter.Unknown {
+			owner := classified.Org
+			if owner == "" {
+				owner = classified.Owner
+			}
+			canRead := canReadFor(classified.Resource)
+			switch {
+			case restfilter.HasOpaqueRepoID(norm) && !restfilter.IsOrgNamedRepoArray(norm) && !restfilter.IsNestedBareNameRepoOp(norm):
+				result = policy.Result{Reason: "write response identifies repositories only by opaque id; cannot be repo-filtered (fail closed)"}
+			case restfilter.IsOrgNamedRepoArray(norm):
+				respFilter = func(resp []byte) ([]byte, bool) { return restfilter.RedactOrgNamedRepos(resp, owner, canRead) }
+			case restfilter.IsNestedBareNameRepoOp(norm):
+				respFilter = func(resp []byte) ([]byte, bool) { return restfilter.RedactNestedBareNameRepos(resp, owner, canRead) }
+			case restfilter.IsRepoKeyedMap(norm):
+				respFilter = func(resp []byte) ([]byte, bool) { return restfilter.RedactRepoKeyedMap(resp, owner, canRead) }
+			default:
+				passScan = canRead
+			}
+		}
+	}
+
+	// A WRITE that names its target repos ONLY by an opaque numeric id (the org `selected_repository_ids[]`
+	// secrets/variables/runner-group/security-config/immutable-release bodies) cannot be checked against a
+	// per-repo carve-out — the proxy can't map the id to owner/repo — so the custodian would attach the org
+	// resource to a DENIED repo. Fail it closed when the policy denies SOME repo's write to this resource
+	// under the org; a token with no repo carve-out under the org is unaffected (round-45 F5).
+	if result.Allowed && classified.Org != "" && r.Method != http.MethodGet && r.Method != http.MethodHead &&
+		restfilter.BodyHasOpaqueRepoIDs(body) && pol.AnyRepoDeniesWriteUnderOrg(classified.Org, classified.Resource) {
+		result = policy.Result{Reason: "write names target repos only by opaque numeric id under a per-repo carve-out (fail closed)"}
+	}
+
 	// Fallback when the filter is DISABLED entirely (GQLFilter == nil, e.g. tests): rely on
 	// the classifier's cross-repo-nav denylist to deny navigating requests.
 	if result.Allowed && classified.NavEscapes && respFilter == nil {

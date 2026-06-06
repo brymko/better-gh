@@ -1433,6 +1433,12 @@ func bodyNamedRepoScopes(method string, segments []string, body []byte) []Scope 
 		// "foreign repo named in a request must become a scope" class via a third body field name).
 		resource = "properties"
 		bareNameOrg = segments[1]
+	case len(segments) == 3 && segments[0] == "orgs" && segments[2] == "teams":
+		// POST /orgs/{org}/teams grants the new team access to the FULL-name repos in repo_names[]; a client
+		// with org `teams` write could otherwise have the custodian grant a team access to a DENIED repo and
+		// then add itself to the team (round-45 F4 — the body-field analogue of the round-23 path-form
+		// /orgs/{org}/teams/{slug}/repos/{owner}/{repo} fix).
+		resource = "teams"
 	default:
 		return nil
 	}
@@ -1440,12 +1446,13 @@ func bodyNamedRepoScopes(method string, segments []string, body []byte) []Scope 
 		Repositories     []string `json:"repositories"`
 		RepositoryOwners []string `json:"repository_owners"`
 		RepositoryNames  []string `json:"repository_names"`
+		RepoNames        []string `json:"repo_names"` // team-create full "owner/repo" names
 	}
 	if json.Unmarshal(body, &b) != nil {
 		return nil // a body GitHub itself rejects (400) runs no migration/scan/write, so it discloses nothing
 	}
 	var out []Scope
-	for _, full := range b.Repositories {
+	for _, full := range append(b.Repositories, b.RepoNames...) {
 		if o, r, ok := splitOwnerRepo(full); ok {
 			out = append(out, Scope{Owner: o, Repo: r, Resource: resource})
 		}

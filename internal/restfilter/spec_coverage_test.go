@@ -82,7 +82,8 @@ func TestSpecCoverage_RequestBodyNamedRepos(t *testing.T) {
 			}
 			sch := deref(op.RequestBody.Content["application/json"].Schema, 0)
 			props, _ := sch["properties"].(map[string]any)
-			hasFullRepos := stringArrayField(props, "repositories") || stringArrayField(props, "repository_owners")
+			// full "owner/repo" name arrays: repositories/repository_owners (round-23) + repo_names (team-create, round-45 F4)
+			hasFullRepos := stringArrayField(props, "repositories") || stringArrayField(props, "repository_owners") || stringArrayField(props, "repo_names")
 			hasBareNames := stringArrayField(props, "repository_names") // BARE names qualified by the path org (round-44 F3)
 			if props == nil || (!hasFullRepos && !hasBareNames) {
 				continue
@@ -94,9 +95,9 @@ func TestSpecCoverage_RequestBodyNamedRepos(t *testing.T) {
 			// The classifier must turn a body-named foreign repo into a scope.
 			cp := concretePath(path)
 			if hasFullRepos {
-				r := classifier.Classify(strings.ToUpper(method), cp, []byte(`{"repositories":["foreign-denied/secret"],"repository_owners":["foreign-denied"]}`))
+				r := classifier.Classify(strings.ToUpper(method), cp, []byte(`{"repositories":["foreign-denied/secret"],"repository_owners":["foreign-denied"],"repo_names":["foreign-denied/secret"]}`))
 				if !classifierScopesRepo(r, "foreign-denied", "secret") && !classifierScopesOrg(r, "foreign-denied") {
-					leaks = append(leaks, key+" (repositories/repository_owners)")
+					leaks = append(leaks, key+" (repositories/repository_owners/repo_names)")
 				}
 			}
 			if hasBareNames {
@@ -363,38 +364,48 @@ func TestSpecCoverage_OpaqueRepoIDOps(t *testing.T) {
 	}
 	var missing []string
 	for path, methods := range spec.Paths {
-		rawOp, ok := methods["get"]
-		if !ok {
-			continue
-		}
-		var op struct {
-			Responses map[string]struct {
-				Content map[string]struct {
-					Schema map[string]any `json:"schema"`
-				} `json:"content"`
-			} `json:"responses"`
-		}
-		if json.Unmarshal(rawOp, &op) != nil {
-			continue
-		}
-		sch := op.Responses["200"].Content["application/json"].Schema
-		if sch == nil || !declaresOpaqueRepoID(sch, 0) {
-			continue
-		}
-		if detectable["GET "+path] {
-			continue // the generator/body-scan CAN map this op's repo (full_name/minimal-repo present too)
-		}
-		cl := classifier.Classify("GET", concretePath(path), nil)
-		if cl.HasRepo() {
-			continue // path-scoped ({owner}/{repo}) — the repo scope already gates it
-		}
-		if !registered[path] {
-			missing = append(missing, "GET "+path)
+		// Iterate GET *and* the write methods: a WRITE response can echo the same opaque numeric repo id, and
+		// the GET/HEAD-gated Pass machinery did not run on writes until round-45 F1 — so a write-only opaque op
+		// must also be registered (fail closed) on the write path.
+		for method, rawOp := range methods {
+			if method != "get" && method != "post" && method != "put" && method != "patch" {
+				continue
+			}
+			var op struct {
+				Responses map[string]struct {
+					Content map[string]struct {
+						Schema map[string]any `json:"schema"`
+					} `json:"content"`
+				} `json:"responses"`
+			}
+			if json.Unmarshal(rawOp, &op) != nil {
+				continue
+			}
+			declares := false
+			for code, resp := range op.Responses {
+				if strings.HasPrefix(code, "2") && declaresOpaqueRepoID(resp.Content["application/json"].Schema, 0) {
+					declares = true
+				}
+			}
+			if !declares {
+				continue
+			}
+			M := strings.ToUpper(method)
+			if detectable[M+" "+path] {
+				continue // the generator/body-scan CAN map this op's repo (full_name/minimal-repo present too)
+			}
+			cl := classifier.Classify(M, concretePath(path), nil)
+			if cl.HasRepo() {
+				continue // path-scoped ({owner}/{repo}) — the repo scope already gates it
+			}
+			if !registered[path] {
+				missing = append(missing, M+" "+path)
+			}
 		}
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
-		t.Fatalf("%d Pass GET op(s) declare a numeric repository_id the generator/body-scan cannot map but are "+
+		t.Fatalf("%d Pass op(s) declare a numeric repository_id the generator/body-scan cannot map but are "+
 			"NOT in opaqueRepoIDOps — they leak a denied repo's id/existence; add them (fail closed):\n  %s",
 			len(missing), strings.Join(missing, "\n  "))
 	}
