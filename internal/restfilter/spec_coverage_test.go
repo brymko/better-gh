@@ -1,6 +1,7 @@
 package restfilter
 
 import (
+	"encoding/json"
 	"os"
 	"reflect"
 	"sort"
@@ -10,6 +11,119 @@ import (
 	"better-gh/internal/classifier"
 	"better-gh/internal/restfilter/specderive"
 )
+
+// requestBodyRepoSafeExceptions are string-`repositories` request-body ops the CUSTODIAN token cannot
+// reach, so naming a denied repo there discloses nothing — kept EXPLICIT so a NEW reachable body-naming op
+// is flagged by TestSpecCoverage_RequestBodyNamedRepos instead of silently fail-open (the round-23 class).
+var requestBodyRepoSafeExceptions = map[string]string{
+	"POST /app/installations/{installation_id}/access_tokens": "requires a GitHub App JWT the user-token custodian lacks; GitHub denies",
+	"POST /applications/{client_id}/token/scoped":             "requires the OAuth app's client_id:client_secret basic auth the custodian lacks; GitHub denies",
+}
+
+// TestSpecCoverage_RequestBodyNamedRepos is the REQUEST-side analogue of NoPathScopedLeak and the build-time
+// guard for the recurring "a repo named in the request must become a scope" class (round-15/16/23): it
+// derives from the embedded spec every POST/PUT/PATCH whose JSON body has a string-array `repositories`/
+// `repository_owners` field, and asserts the classifier turns a body-named FOREIGN repo into a scope (so the
+// policy can deny it) — unless the op is a justified unreachable exception. A new such op fails the build.
+func TestSpecCoverage_RequestBodyNamedRepos(t *testing.T) {
+	raw, err := os.ReadFile("testdata/api.github.com.json")
+	if err != nil {
+		t.Fatalf("read embedded spec: %v", err)
+	}
+	var spec struct {
+		Paths      map[string]map[string]json.RawMessage `json:"paths"`
+		Components struct {
+			Schemas map[string]json.RawMessage `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	var deref func(m map[string]any, depth int) map[string]any
+	deref = func(m map[string]any, depth int) map[string]any {
+		if m == nil || depth > 6 {
+			return m
+		}
+		if ref, ok := m["$ref"].(string); ok {
+			name := ref[strings.LastIndex(ref, "/")+1:]
+			var sub map[string]any
+			if json.Unmarshal(spec.Components.Schemas[name], &sub) == nil {
+				return deref(sub, depth+1)
+			}
+		}
+		return m
+	}
+	// a string-array property whose items are typed "string"
+	stringArrayField := func(props map[string]any, name string) bool {
+		f, _ := props[name].(map[string]any)
+		f = deref(f, 0)
+		if f == nil {
+			return false
+		}
+		items, _ := deref(mapOf(f["items"]), 0)["type"].(string)
+		return items == "string"
+	}
+
+	var leaks []string
+	for path, methods := range spec.Paths {
+		for method, rawOp := range methods {
+			if method != "post" && method != "put" && method != "patch" {
+				continue
+			}
+			var op struct {
+				RequestBody struct {
+					Content map[string]struct {
+						Schema map[string]any `json:"schema"`
+					} `json:"content"`
+				} `json:"requestBody"`
+			}
+			if json.Unmarshal(rawOp, &op) != nil {
+				continue
+			}
+			sch := deref(op.RequestBody.Content["application/json"].Schema, 0)
+			props, _ := sch["properties"].(map[string]any)
+			if props == nil || (!stringArrayField(props, "repositories") && !stringArrayField(props, "repository_owners")) {
+				continue
+			}
+			key := strings.ToUpper(method) + " " + path
+			if _, ok := requestBodyRepoSafeExceptions[key]; ok {
+				continue
+			}
+			// The classifier must turn a body-named foreign repo into a scope.
+			cp := concretePath(path)
+			r := classifier.Classify(strings.ToUpper(method), cp, []byte(`{"repositories":["foreign-denied/secret"],"repository_owners":["foreign-denied"]}`))
+			if !classifierScopesRepo(r, "foreign-denied", "secret") && !classifierScopesOrg(r, "foreign-denied") {
+				leaks = append(leaks, key)
+			}
+		}
+	}
+	if len(leaks) > 0 {
+		sort.Strings(leaks)
+		t.Fatalf("%d request-body op(s) name a repository the classifier does NOT scope (a denied repo could be "+
+			"migrated/scanned/granted by the custodian — round-23 class): add it to bodyNamedRepoScopes, or, if "+
+			"the custodian cannot reach it, to requestBodyRepoSafeExceptions:\n  %s", len(leaks), strings.Join(leaks, "\n  "))
+	}
+}
+
+func mapOf(v any) map[string]any { m, _ := v.(map[string]any); return m }
+
+func classifierScopesRepo(r classifier.Result, owner, repo string) bool {
+	for _, s := range r.AllScopes() {
+		if s.Owner == owner && s.Repo == repo {
+			return true
+		}
+	}
+	return false
+}
+
+func classifierScopesOrg(r classifier.Result, org string) bool {
+	for _, s := range r.AllScopes() {
+		if s.Org == org {
+			return true
+		}
+	}
+	return false
+}
 
 func loadSpec(t *testing.T) *specderive.Spec {
 	t.Helper()
