@@ -1,6 +1,46 @@
 package classifier
 
-import "testing"
+import (
+	"testing"
+
+	"better-gh/internal/gqlfilter"
+)
+
+// TestR39_OwnerContentResourceInSync couples the RESPONSE-side owner-content map (gqlfilter.ownerContentResource,
+// round-39: nulls a navigated org/enterprise content field when its resource is denied) to the REQUEST-side
+// classifier maps, so the two sides cannot drift. (1) Every gqlfilter content field must map to the SAME
+// resource in gqlOrgFieldToResource or gqlEnterpriseFieldToResource. (2) Every classifier CONTENT field (not a
+// member/team key, not a member-mechanism field) must be present response-side — otherwise a carve-out is
+// enforced at the request gate but bypassed on a navigation path the request scope cannot reach.
+func TestR39_OwnerContentResourceInSync(t *testing.T) {
+	gqlMap := gqlfilter.OwnerContentResource()
+	// (1) forward: gqlfilter ⊆ classifier, same resource.
+	for field, res := range gqlMap {
+		if gqlOrgFieldToResource[field] != res && gqlEnterpriseFieldToResource[field] != res {
+			t.Errorf("gqlfilter.ownerContentResource[%q]=%q but classifier maps it to org=%q/ent=%q — request/response drift",
+				field, res, gqlOrgFieldToResource[field], gqlEnterpriseFieldToResource[field])
+		}
+	}
+	// member-mechanism fields (handled by the ownerMember marker, not the content marker) are excluded.
+	memberHandled := map[string]bool{
+		"members": true, "administrators": true, "ownerInfo": true, "memberInvitations": true,
+		"membersWithRole": true, "pendingMembers": true, "memberStatuses": true, "mannequins": true,
+		"enterpriseOwners": true, "samlIdentityProvider": true, "auditLog": true,
+		"enterpriseTeam": true, "enterpriseTeams": true, "team": true, "teams": true,
+	}
+	// (2) reverse: every classifier content field is enforced response-side.
+	for _, m := range []map[string]string{gqlOrgFieldToResource, gqlEnterpriseFieldToResource} {
+		for field, res := range m {
+			if res == "members" || res == "teams" || memberHandled[field] {
+				continue
+			}
+			if gqlMap[field] == "" {
+				t.Errorf("classifier content field %q (resource %q) is missing from gqlfilter.ownerContentResource — "+
+					"a carve-out is enforced at the request gate but bypassed on a navigation path", field, res)
+			}
+		}
+	}
+}
 
 // TestR39_OrgPackagesIssuesGated pins the round-39 finding-1/2/6 front-gate fix: org packages and
 // issue-type/field config (whose element @docsCategory is packages/issues — outside the round-38

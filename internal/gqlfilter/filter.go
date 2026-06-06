@@ -55,6 +55,78 @@ var enterpriseMemberFieldNames = map[string]bool{
 	"members": true, "administrators": true, "ownerInfo": true, "memberInvitations": true,
 }
 
+// ownerContentMarkerPrefix marks a navigated Organization/Enterprise's owner-private CONTENT field with the
+// per-resource policy key that gates it, so RedactDeniedOwnerPrivate nulls it when that resource is denied —
+// the response-side enforcement the round-37/38 REQUEST-side mapping lacked, which navigation (Team.organization,
+// User.organization, deep repository().owner, EnterpriseOwnerInfo) bypassed (round-39). The marker alias is
+// `ownerContentMarkerPrefix + resourceCode + "__" + responseKey`: resourceCode (the resource with '-'→'X',
+// alias-safe) carries the resource alias-immune (round-36 lesson), the response KEY (after the FIRST "__")
+// addresses the field to null alias-proof (round-26 lesson). This is the member-field mechanism generalized
+// from one hardcoded "members" resource to every owner-private content resource.
+const ownerContentMarkerPrefix = "bghOwnerCZ9_"
+
+// ownerContentResource maps an owner-private CONTENT field (NOT a member/team roster field — those keep the
+// ownerMemberMarkerPrefix mechanism) to its per-resource policy key, mirroring the classifier's
+// gqlOrgFieldToResource + gqlEnterpriseFieldToResource. TestR39_OwnerContentResourceInSync couples it to the
+// classifier so the request and response sides cannot drift.
+var ownerContentResource = map[string]string{
+	// Organization
+	"projectsV2": "projects", "projectV2": "projects", "projects": "projects",
+	"project": "projects", "recentProjects": "projects",
+	"sponsorsActivities": "sponsors", "monthlyEstimatedSponsorsIncomeInCents": "sponsors",
+	"estimatedNextSponsorsPayoutInCents": "sponsors", "totalSponsorshipAmountAsSponsorInCents": "sponsors",
+	"lifetimeReceivedSponsorshipValues": "sponsors", "sponsorshipsAsMaintainer": "sponsors",
+	"sponsorshipsAsSponsor": "sponsors", "sponsorshipNewsletters": "sponsors",
+	"sponsors": "sponsors", "sponsoring": "sponsors",
+	"rulesets": "rulesets", "ruleset": "rulesets",
+	"repositoryCustomProperties": "properties", "repositoryCustomProperty": "properties",
+	"interactionAbility": "interaction-limits",
+	"domains":            "settings", "ipAllowListEntries": "settings",
+	"ipAllowListEnabledSetting": "settings", "ipAllowListForInstalledAppsEnabledSetting": "settings",
+	"announcementBanner": "settings", "organizationBillingEmail": "settings",
+	"notificationDeliveryRestrictionEnabledSetting": "settings",
+	"packages":    "packages",
+	"issueTypes":  "issue-types",
+	"issueFields": "issue-fields",
+	// Enterprise (member/team fields ownerInfo/members/enterpriseTeam(s) keep the member mechanism)
+	"billingInfo": "billing", "billingEmail": "billing",
+	"securityContactEmail": "settings", "readme": "settings", "readmeHTML": "settings",
+	"organizations":             "organizations",
+	"userNamespaceRepositories": "members",
+}
+
+// resourceCode encodes a per-resource key into an alias-safe marker token ('-'→'X'; no resource key contains
+// 'X' or '_'); resourceFromCode reverses it.
+func resourceCode(resource string) string { return strings.ReplaceAll(resource, "-", "X") }
+func resourceFromCode(code string) string { return strings.ReplaceAll(code, "X", "-") }
+
+// contentBearingNonOwnerResource returns the per-resource key for an owner-private CONTENT field on a NON-owner
+// type that carries its enclosing owner's data (EnterpriseOwnerInfo's org-inventory / roster connections,
+// reached one hop below enterprise(slug:) via ownerInfo) — nulled under the ambient owner's carve-out, the
+// content analogue of memberBearingNonOwnerTypes (round-39 finding-5). The *SettingOrganizations suffix rule
+// auto-covers any future enterprise org-inventory field.
+func contentBearingNonOwnerResource(typeName, field string) string {
+	if typeName != "EnterpriseOwnerInfo" {
+		return ""
+	}
+	switch {
+	case strings.HasSuffix(field, "SettingOrganizations"):
+		return "organizations" // the enterprise's member-org inventory, partitioned by setting
+	case field == "admins" || field == "outsideCollaborators" || field == "affiliatedUsersWithTwoFactorDisabled":
+		return "members"
+	}
+	return ""
+}
+
+// OwnerContentResource exposes the field→resource map so a cross-package guard can couple it to the classifier.
+func OwnerContentResource() map[string]string {
+	out := make(map[string]string, len(ownerContentResource))
+	for k, v := range ownerContentResource {
+		out[k] = v
+	}
+	return out
+}
+
 // userMarkerAlias marks a User reached as an interface/union possible type (Sponsorable/ProfileOwner/…)
 // when an owner-PRIVATE User field is selected, so RedactDeniedOwnerPrivate can null those fields for a
 // DENIED user. A User is NOT coarse-redacted like an Organization (it is reached everywhere as an
@@ -239,19 +311,46 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 		for _, key := range memberKeys {
 			delete(val, ownerMemberMarkerPrefix+key)
 		}
+		// CONTENT markers (round-39): `ownerContentMarkerPrefix + resourceCode + "__" + responseKey` — the
+		// resource is carried by the code (alias-immune), the response key (after the FIRST "__") addresses
+		// the field. Null each content field when its per-resource key is denied for this owner.
+		type contentMark struct{ resource, key string }
+		var contentMarks []contentMark
+		for k := range val {
+			if rest, ok := strings.CutPrefix(k, ownerContentMarkerPrefix); ok {
+				if code, key, found := strings.Cut(rest, "__"); found {
+					contentMarks = append(contentMarks, contentMark{resourceFromCode(code), key})
+				}
+			}
+		}
+		for _, cm := range contentMarks {
+			delete(val, ownerContentMarkerPrefix+resourceCode(cm.resource)+"__"+cm.key)
+		}
 		switch {
 		case isOwnerObj && denied(effectiveOwner, ""):
-			// base-denied owner → keep only public identity, null everything else (drift-proof).
+			// base-denied owner → keep only public identity, null everything else (drift-proof; covers all
+			// member + content fields).
 			for k := range val {
 				if !ownerPublicFields[k] {
 					val[k] = nil
 				}
 			}
-		case len(memberKeys) > 0 && (effectiveOwner == "" || denied(effectiveOwner, "members")):
-			// member fields denied (or no attributable owner → fail closed) → null by marked response key.
-			for _, key := range memberKeys {
-				if _, present := val[key]; present {
-					val[key] = nil
+		default:
+			// base-allowed owner (or member/content-bearing non-owner attributed to its ambient owner): null
+			// each marked field whose per-resource key is denied (members for member markers, the marker's
+			// resource for content markers). A field with no attributable owner (effectiveOwner=="") fails closed.
+			if len(memberKeys) > 0 && (effectiveOwner == "" || denied(effectiveOwner, "members")) {
+				for _, key := range memberKeys {
+					if _, present := val[key]; present {
+						val[key] = nil
+					}
+				}
+			}
+			for _, cm := range contentMarks {
+				if effectiveOwner == "" || denied(effectiveOwner, cm.resource) {
+					if _, present := val[cm.key]; present {
+						val[cm.key] = nil
+					}
 				}
 			}
 		}
@@ -445,7 +544,8 @@ func usesReservedAlias(sels ast.SelectionSet, depth int) bool {
 			}
 			if strings.HasPrefix(key, markerAlias) || strings.HasPrefix(key, markerTypeAlias) ||
 				strings.HasPrefix(key, ownerMarkerAlias) || strings.HasPrefix(key, ownerMemberMarkerPrefix) ||
-				strings.HasPrefix(key, userMarkerAlias) {
+				strings.HasPrefix(key, userMarkerAlias) || strings.HasPrefix(key, userGistMarkerPrefix) ||
+				strings.HasPrefix(key, ownerContentMarkerPrefix) {
 				// Reserve the whole marker namespace (exact aliases AND the per-member
 				// "markerAlias_Type" suffixes augment injects, plus the owner + per-member-field markers),
 				// so a client cannot pre-declare a look-alike key to spoof/suppress a tag and defeat redaction.
@@ -570,6 +670,26 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 			*sels = append(*sels, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
 			budget.count(1)
 		}
+		// Owner-private CONTENT fields (rulesets/settings/billing/projects/sponsors/…): mark each with its
+		// per-resource key so RedactDeniedOwnerPrivate nulls it when that resource is denied, regardless of the
+		// navigation path the org/enterprise was reached by — the response-side enforcement the round-37/38
+		// request-side scope missed (round-39).
+		for _, sel := range *sels {
+			f, ok := sel.(*ast.Field)
+			if !ok {
+				continue
+			}
+			res, ok := ownerContentResource[f.Name]
+			if !ok {
+				continue
+			}
+			key := f.Alias
+			if key == "" {
+				key = f.Name
+			}
+			*sels = append(*sels, &ast.Field{Alias: ownerContentMarkerPrefix + resourceCode(res) + "__" + key, Name: "__typename"})
+			budget.count(1)
+		}
 		*sels = append(*sels, &ast.Field{Alias: ownerMarkerAlias, Name: idField})
 		budget.count(1)
 		return
@@ -589,6 +709,31 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 				key = f.Name
 			}
 			*sels = append(*sels, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
+			budget.count(1)
+		}
+		return
+	}
+	if typeName == "EnterpriseOwnerInfo" {
+		// EnterpriseOwnerInfo (reached one hop below enterprise(slug:) via `ownerInfo`) carries the enterprise's
+		// CONTENT — its member-org INVENTORY partitioned by setting (`*SettingOrganizations` → OrganizationConnection)
+		// and admin/outside-collaborator rosters — but is NOT itself an owner object, so it got no marker and the
+		// inner connection leaked the private org inventory under an `organizations="none"` carve-out (round-39
+		// finding-5). Content-mark each field with its resource, attributed to the ambient enterprise; the suffix
+		// rule auto-covers any future *SettingOrganizations field.
+		for _, sel := range *sels {
+			f, ok := sel.(*ast.Field)
+			if !ok {
+				continue
+			}
+			res := contentBearingNonOwnerResource(typeName, f.Name)
+			if res == "" {
+				continue
+			}
+			key := f.Alias
+			if key == "" {
+				key = f.Name
+			}
+			*sels = append(*sels, &ast.Field{Alias: ownerContentMarkerPrefix + resourceCode(res) + "__" + key, Name: "__typename"})
 			budget.count(1)
 		}
 		return
