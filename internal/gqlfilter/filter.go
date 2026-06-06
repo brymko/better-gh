@@ -65,6 +65,21 @@ var enterpriseMemberFieldNames = map[string]bool{
 // from one hardcoded "members" resource to every owner-private content resource.
 const ownerContentMarkerPrefix = "bghOwnerCZ9_"
 
+// ownerSelfMarkerPrefix marks an owner-OWNED content TYPE (ProjectV2 @docsCategory "projects", classic Project,
+// a Sponsorship/SponsorsTier, …) reached by NAVIGATION (issue.projectItems.project — not via node(id:) which
+// already fails closed, nor via the content-marked organization(){projectsV2} field). The marker carries the
+// resource (in the prefix suffix, alias-safe); RedactDeniedOwnerPrivate nulls the object's content when there
+// is NO marked owner ancestor to attribute it to (fail closed) or that ambient owner's resource is denied —
+// the owner analogue of the repoOwnedNoPath ambient attribution (round-41).
+const ownerSelfMarkerPrefix = "bghOwnerSZ9_"
+
+// userOwnedAmbient is the ambientOwner value threaded through a navigated User's subtree, so an owner-owned
+// content type reached UNDER a User (viewer/user(login:){projectsV2} → the custodian's own projects, gated on
+// the user_private category by the User field markers, NOT the org "projects" resource) is NOT fail-closed by
+// the ownerSelfMarker. It is an internal sentinel (never a real owner login), distinct from "" (no owner
+// ancestor → fail closed) and from a real org/enterprise login (round-41).
+const userOwnedAmbient = "\x00user"
+
 // ownerContentResource maps an owner-private CONTENT field (NOT a member/team roster field — those keep the
 // ownerMemberMarkerPrefix mechanism) to its per-resource policy key, mirroring the classifier's
 // gqlOrgFieldToResource + gqlEnterpriseFieldToResource. TestR39_OwnerContentResourceInSync couples it to the
@@ -315,6 +330,25 @@ func RedactDeniedOwnerPrivate(v any, denied func(owner, resource string) bool, c
 func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categoryDenied func(category string) bool, ambientOwner string) any {
 	switch val := v.(type) {
 	case map[string]any:
+		// owner-OWNED content TYPE reached by navigation (ProjectV2 etc., bghOwnerSZ9_<resource>): fail closed —
+		// null its content when there is NO marked owner ancestor to attribute it to (e.g. reached under a repo,
+		// the round-41 finding-1 issue.projectItems.project leak) or that ambient owner's resource is denied.
+		for k := range val {
+			if code, ok := strings.CutPrefix(k, ownerSelfMarkerPrefix); ok {
+				delete(val, k)
+				// userOwnedAmbient → reached under a User; its content is gated by the User field markers
+				// (user_private), not this org-resource self-marker — keep. "" → no owner ancestor → fail closed.
+				res := resourceFromCode(code)
+				if ambientOwner != userOwnedAmbient && (ambientOwner == "" || denied(ambientOwner, res)) {
+					for fk := range val {
+						if !ownerPublicFields[fk] && !strings.HasPrefix(fk, "bgh") {
+							val[fk] = nil
+						}
+					}
+				}
+				break
+			}
+		}
 		// A User is marked ONLY for its own owner-private fields and is NEVER coarse-redacted: null exactly
 		// the per-field-marked private fields when THIS user is base-denied OR the field's policy category
 		// (user_private/gists) is denied, keeping all its public data (round-28; category gate round-35).
@@ -345,7 +379,9 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 				}
 			}
 			for k, c := range val {
-				val[k] = redactOwnerPrivate(c, denied, categoryDenied, ambientOwner)
+				// thread the user-owned sentinel so an owner-owned content type under this User (its own
+				// projectsV2/…) is NOT fail-closed by the ownerSelfMarker (gated by the User markers instead).
+				val[k] = redactOwnerPrivate(c, denied, categoryDenied, userOwnedAmbient)
 			}
 			return val
 		}
@@ -605,7 +641,7 @@ func usesReservedAlias(sels ast.SelectionSet, depth int) bool {
 			if strings.HasPrefix(key, markerAlias) || strings.HasPrefix(key, markerTypeAlias) ||
 				strings.HasPrefix(key, ownerMarkerAlias) || strings.HasPrefix(key, ownerMemberMarkerPrefix) ||
 				strings.HasPrefix(key, userMarkerAlias) || strings.HasPrefix(key, userGistMarkerPrefix) ||
-				strings.HasPrefix(key, ownerContentMarkerPrefix) {
+				strings.HasPrefix(key, ownerContentMarkerPrefix) || strings.HasPrefix(key, ownerSelfMarkerPrefix) {
 				// Reserve the whole marker namespace (exact aliases AND the per-member
 				// "markerAlias_Type" suffixes augment injects, plus the owner + per-member-field markers),
 				// so a client cannot pre-declare a look-alike key to spoof/suppress a tag and defeat redaction.
@@ -812,6 +848,15 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 			*sels = append(*sels, &ast.Field{Alias: ownerContentMarkerPrefix + resourceCode(res) + "__" + key, Name: "__typename"})
 			budget.count(1)
 		}
+		return
+	}
+	if res := s.ownerOwnedContentResource[typeName]; res != "" {
+		// An owner-OWNED content TYPE (ProjectV2/classic Project/…) reached by navigation (issue.projectItems.
+		// project) — NOT via node(id:) (already fail-closed) nor via the content-marked organization(){projectsV2}
+		// field. Self-mark it with its resource; RedactDeniedOwnerPrivate fails it closed when there is no marked
+		// owner ancestor (e.g. reached under a repo) or that owner's resource is denied (round-41 finding-1).
+		*sels = append(*sels, &ast.Field{Alias: ownerSelfMarkerPrefix + resourceCode(res), Name: "__typename"})
+		budget.count(1)
 		return
 	}
 	if typeName == "User" {

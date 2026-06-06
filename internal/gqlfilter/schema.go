@@ -31,17 +31,18 @@ type pathStep struct {
 
 // Schema wraps GitHub's GraphQL schema plus the derived repo-scoped type paths.
 type Schema struct {
-	schema             *ast.Schema
-	repoScoped         map[string]bool       // type name -> has a marker/resolve path to a single repository
-	repoPath           map[string][]pathStep // type name -> no-arg field path to its repo's nameWithOwner
-	nodeResolveQuery   string                // nodes(ids:) query covering every repo-scoped Node type
-	typeRes            map[string]string     // object type -> per-resource policy key (derived from @docsCategory + overrides)
-	nodeTypes          map[string]bool       // object types implementing Node (recognized by this snapshot)
-	repoOwnedNoPath    map[string]bool       // concrete OBJECT types (Node or not) that belong to a repo (by @docsCategory) but have NO derivable repoPath
-	repoIdentityNoPath map[string]bool       // Node types exposing a repo-identity scalar (nameWithOwner) but neither repoScoped nor repoOwnedNoPath
-	repoIdentityScalar map[string]string     // repoIdentityNoPath type -> its repo-identity scalar field ("nameWithOwner" preferred; else "repositoryName")
-	ownerOwnedNode     map[string]bool       // Node object types owned by an org/user/enterprise (not a repo, not public) — node(id:) reads fail closed
-	validationRules    *rules.Rules          // default validation rules MINUS the O(n^2) OverlappingFieldsCanBeMerged (see Augment)
+	schema                    *ast.Schema
+	repoScoped                map[string]bool       // type name -> has a marker/resolve path to a single repository
+	repoPath                  map[string][]pathStep // type name -> no-arg field path to its repo's nameWithOwner
+	nodeResolveQuery          string                // nodes(ids:) query covering every repo-scoped Node type
+	typeRes                   map[string]string     // object type -> per-resource policy key (derived from @docsCategory + overrides)
+	nodeTypes                 map[string]bool       // object types implementing Node (recognized by this snapshot)
+	repoOwnedNoPath           map[string]bool       // concrete OBJECT types (Node or not) that belong to a repo (by @docsCategory) but have NO derivable repoPath
+	repoIdentityNoPath        map[string]bool       // Node types exposing a repo-identity scalar (nameWithOwner) but neither repoScoped nor repoOwnedNoPath
+	repoIdentityScalar        map[string]string     // repoIdentityNoPath type -> its repo-identity scalar field ("nameWithOwner" preferred; else "repositoryName")
+	ownerOwnedNode            map[string]bool       // Node object types owned by an org/user/enterprise (not a repo, not public) — node(id:) reads fail closed
+	ownerOwnedContentResource map[string]string     // owner-owned content Node type -> its per-resource key, for navigation fail-closed (round-41)
+	validationRules           *rules.Rules          // default validation rules MINUS the O(n^2) OverlappingFieldsCanBeMerged (see Augment)
 }
 
 // repoOwnedCategories are @docsCategory values whose objects belong to exactly ONE repository. A
@@ -138,6 +139,37 @@ func deriveOwnerOwnedNodes(schema *ast.Schema, repoScoped, repoOwnedNoPath map[s
 		if d := def.Directives.ForName("docsCategory"); d != nil {
 			if arg := d.Arguments.ForName("name"); arg != nil && arg.Value != nil && ownerOwnedNodeCategories[arg.Value.Raw] {
 				out[name] = true
+			}
+		}
+	}
+	return out
+}
+
+// ownerOwnedCategoryResource maps an owner-private @docsCategory to the per-resource policy key its CONTENT
+// node types are gated on, so an owner-owned content type (ProjectV2 @docsCategory "projects") reached by
+// NAVIGATION from a repo (issue.projectItems.project) — not just via node(id:) — is attributed to its owner
+// ancestor and gated, failing closed when there is no owner ancestor (round-41 finding-1). gists/users are
+// excluded: those are user-private, gated by the User-branch / node resolver, not the owner content mechanism.
+var ownerOwnedCategoryResource = map[string]string{
+	"projects": "projects", "projects-classic": "projects", "sponsors": "sponsors",
+	"teams": "teams", "migrations": "migrations", "orgs": "members", "enterprise-admin": "settings",
+}
+
+// deriveOwnerOwnedContentResource maps each owner-owned Node type to the per-resource key its @docsCategory
+// implies (for the content categories), so the augmenter can self-mark it and RedactDeniedOwnerPrivate can
+// gate it on a navigation path.
+func deriveOwnerOwnedContentResource(schema *ast.Schema, ownerOwnedNode map[string]bool) map[string]string {
+	out := map[string]string{}
+	for name := range ownerOwnedNode {
+		def := schema.Types[name]
+		if def == nil {
+			continue
+		}
+		if d := def.Directives.ForName("docsCategory"); d != nil {
+			if arg := d.Arguments.ForName("name"); arg != nil && arg.Value != nil {
+				if res := ownerOwnedCategoryResource[arg.Value.Raw]; res != "" {
+					out[name] = res
+				}
 			}
 		}
 	}
@@ -356,6 +388,7 @@ func Load() (*Schema, error) {
 		sch.repoIdentityNoPath[name] = true
 	}
 	sch.ownerOwnedNode = deriveOwnerOwnedNodes(s, rs, sch.repoOwnedNoPath)
+	sch.ownerOwnedContentResource = deriveOwnerOwnedContentResource(s, sch.ownerOwnedNode)
 	// Build the validation rule set Augment uses ONCE: the default rules minus
 	// OverlappingFieldsCanBeMerged. That rule is O(n^2) in the number of fields sharing a response
 	// name within a selection set (it compares every pair and recurses into their sub-selections with

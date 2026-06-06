@@ -41,3 +41,44 @@ func TestR41_TeamsAndSponsorBooleansGated(t *testing.T) {
 		t.Fatalf("viewerIsSponsoring not nulled under user_private-denied: %s", js)
 	}
 }
+
+// TestR41_OwnerOwnedContentSelfMarked pins the round-41 finding-1 fix: an owner-owned content TYPE (ProjectV2)
+// reached by repo NAVIGATION (issue.projectItems.project) is self-marked and fails closed when there is no
+// marked owner ancestor; gated under an org ancestor; and NOT over-redacted under a User (its own projects).
+func TestR41_OwnerOwnedContentSelfMarked(t *testing.T) {
+	s, _ := Load()
+	out, err := s.Augment(`{ repository(owner:"a",name:"r"){ issues(first:1){ nodes{ projectItems(first:1){ nodes{ project{ title } } } } } } }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, ownerSelfMarkerPrefix+resourceCode("projects")) {
+		t.Fatalf("ProjectV2 reached via repo nav not self-marked:\n%s", out)
+	}
+
+	proj := func() map[string]any {
+		return map[string]any{ownerSelfMarkerPrefix + resourceCode("projects"): "ProjectV2", "title": "SECRET_BOARD", "id": "PV_1"}
+	}
+	allow := func(string, string) bool { return false }
+	noUP := noUserFieldDenied
+
+	// (1) no owner ancestor (repo nav) → fail closed.
+	if js := mustJSON(RedactDeniedOwnerPrivate(proj(), allow, noUP)); strings.Contains(js, "SECRET_BOARD") {
+		t.Fatalf("ProjectV2 with no owner ancestor not fail-closed: %s", js)
+	}
+	// (2) under org ancestor, projects DENIED → nulled.
+	projDenied := func(owner, resource string) bool { return owner == "acme" && resource == "projects" }
+	underOrgDenied := map[string]any{ownerMarkerAlias: "acme", "p": proj()}
+	if js := mustJSON(RedactDeniedOwnerPrivate(underOrgDenied, projDenied, noUP)); strings.Contains(js, "SECRET_BOARD") {
+		t.Fatalf("ProjectV2 under org with projects=none not nulled: %s", js)
+	}
+	// (3) under org ancestor, projects ALLOWED → kept.
+	underOrgAllowed := map[string]any{ownerMarkerAlias: "acme", "p": proj()}
+	if js := mustJSON(RedactDeniedOwnerPrivate(underOrgAllowed, allow, noUP)); !strings.Contains(js, "SECRET_BOARD") {
+		t.Fatalf("ProjectV2 under org with projects allowed wrongly nulled: %s", js)
+	}
+	// (4) under a User (the custodian's own projects), user_private ALLOWED → kept (no over-redaction).
+	underUser := map[string]any{userMarkerAlias: "octocat", "p": proj()}
+	if js := mustJSON(RedactDeniedOwnerPrivate(underUser, allow, noUP)); !strings.Contains(js, "SECRET_BOARD") {
+		t.Fatalf("ProjectV2 under a User wrongly fail-closed (over-redaction): %s", js)
+	}
+}
