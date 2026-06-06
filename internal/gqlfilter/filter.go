@@ -512,6 +512,35 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 		}
 		return
 	}
+	if typeName == "User" {
+		// A User reached by CONCRETE navigation (ReleaseAsset.uploadedBy, Release.author,
+		// RepositoryCollaboratorEdge.node, *.user, …) or an `... on User { … }` inline fragment (augment
+		// recurses into it as concrete User) carrying an owner-PRIVATE field. Mark it (and those fields)
+		// ONLY when such a field is selected — so the ubiquitous Actor/author User reached as plain {login}
+		// is NOT marked (no coarse over-redaction), but a DENIED user's sponsors financials / verified-domain
+		// emails are nulled. This is the concrete/inline-fragment sibling of round-28's interface-only fix
+		// (round-29). The round-28 abstract userMarkerFragment still covers a private field selected as an
+		// interface COMMON field with no inline fragment.
+		injected := false
+		for _, sel := range *sels {
+			f, ok := sel.(*ast.Field)
+			if !ok || !userPrivateFields[f.Name] {
+				continue
+			}
+			key := f.Alias
+			if key == "" {
+				key = f.Name
+			}
+			*sels = append(*sels, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
+			budget.count(1)
+			injected = true
+		}
+		if injected {
+			*sels = append(*sels, &ast.Field{Alias: userMarkerAlias, Name: "login"})
+			budget.count(1)
+		}
+		return
+	}
 	// Abstract type (interface/union): the runtime object is one of its concrete members.
 	// Interfaces/unions are NEVER themselves repo-scoped (deriveRepoPaths only pathes concrete
 	// types), so a selection written against the abstract type — `... on Comment { body }`,
