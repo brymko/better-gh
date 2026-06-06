@@ -416,6 +416,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				respFilter = func(resp []byte) ([]byte, bool) {
 					return restfilter.RedactNestedBareNameRepos(resp, owner, canRead)
 				}
+			case restfilter.IsRepoKeyedMap(norm):
+				// the response is a JSON object KEYED by repo name (the org Copilot content_exclusion map);
+				// the body-scan only reads values, so drop the denied-repo KEYS instead (round-43 F5).
+				owner := classified.Org
+				if owner == "" {
+					owner = classified.Owner
+				}
+				respFilter = func(resp []byte) ([]byte, bool) {
+					return restfilter.RedactRepoKeyedMap(resp, owner, canRead)
+				}
 			default:
 				passScan = canRead
 			}
@@ -654,8 +664,11 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 const redactedErrorMessage = "redacted by bgh: this response referenced a resource the policy denies"
 
 // repoNameToken matches an owner/repo-shaped substring in free-form error text (GitHub's permission
-// messages embed the full name, e.g. "... in secretcorp/private-upstream.").
-var repoNameToken = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]+`)
+// messages embed the full name, e.g. "... in secretcorp/private-upstream."). The repo segment is 1+ chars
+// (a single-char repo must match) and the match is greedy so it may grab trailing sentence punctuation —
+// scrubDeniedRepoStrings strips that before the policy check (round-43 F6: the prior `+` missed single-char
+// repos AND a trailing '.' made the dotted token miss the carve-out's exact name).
+var repoNameToken = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*`)
 
 // scrubDeniedRepoStrings recursively replaces any string in a GraphQL errors[]/extensions subtree that
 // names a repository `denied` reports unreadable, with a generic message. Fail-closed: a name-bearing
@@ -664,7 +677,11 @@ func scrubDeniedRepoStrings(v any, denied func(ownerRepo string) bool) any {
 	switch val := v.(type) {
 	case string:
 		for _, tok := range repoNameToken.FindAllString(val, -1) {
-			if denied(tok) {
+			// Check the raw token AND the token with trailing name-punctuation stripped: GitHub's permission
+			// sentences end the repo name with a '.'/',' the greedy regex captures, which would miss the
+			// carve-out's exact "owner/repo" name (round-43 F6). Both are tested so a repo legitimately ending
+			// in '.'/'-'/'_' (raw token) and a sentence-terminated name (trimmed) both fail closed.
+			if denied(tok) || denied(strings.TrimRight(tok, "._-")) {
 				return redactedErrorMessage
 			}
 		}
@@ -1300,9 +1317,13 @@ var strippedResponseHeaders = map[string]bool{
 	"Content-Encoding":        true,
 	"X-Oauth-Scopes":          true,
 	"X-Accepted-Oauth-Scopes": true,
-	"X-Oauth-Client-Id":       true,
-	"X-Github-Sso":            true,
-	"Set-Cookie":              true,
+	// X-Accepted-Github-Permissions discloses the endpoint's required fine-grained permission set AND, by its
+	// presence, that the custodian is a fine-grained PAT / GitHub-App user token (the loginflow-minted class) —
+	// the same custodian-property disclosure class as the OAuth-scopes headers; strip it (round-43 F7).
+	"X-Accepted-Github-Permissions": true,
+	"X-Oauth-Client-Id":             true,
+	"X-Github-Sso":                  true,
+	"Set-Cookie":                    true,
 	// Github-Authentication-Token-Expiration discloses the CUSTODIAN token's expiry timestamp (and,
 	// by its presence, that the custodian is an expiring OAuth/user-to-server or fine-grained token —
 	// exactly what loginflow mints). The value isn't the token, but a property of the custodian's

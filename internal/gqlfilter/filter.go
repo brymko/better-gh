@@ -298,17 +298,6 @@ var ownerPublicFields = map[string]bool{
 	"url": true, "avatarUrl": true, "databaseId": true, "resourcePath": true,
 }
 
-// ownerContentPublicFields is the STRICTER keep-set for the per-TYPE owner-owned-content self-marker
-// fail-close (ProjectV2/Project/… reached with no marked owner ancestor or under a denied owner). Unlike
-// ownerPublicFields — used for a BASE-denied OWNER object, where url=https://github.com/<org> and
-// resourcePath=/<org> are harmless org identity — a content object's url/resourcePath embeds the OWNING
-// org's login AND the private item's number (…/orgs/<login>/projects/<number>), and databaseId IS that
-// number; keeping them would turn a fail-closed item into an owner+existence+number oracle (round-42 F5).
-// Keep only the opaque node identity (the object's structural presence is unavoidable field-by-field).
-var ownerContentPublicFields = map[string]bool{
-	"__typename": true, "id": true,
-}
-
 // OrgMemberFieldNames returns the Organization member-identity field names; a classifier test asserts it
 // equals the gqlOrgFieldToResource "members" keys so the request and response sides cannot drift.
 func OrgMemberFieldNames() []string {
@@ -352,15 +341,27 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 		// owner-OWNED content TYPE reached by navigation (ProjectV2 etc., bghOwnerSZ9_<resource>): fail closed —
 		// null its content when there is NO marked owner ancestor to attribute it to (e.g. reached under a repo,
 		// the round-41 finding-1 issue.projectItems.project leak) or that ambient owner's resource is denied.
+		selfMarkedUserOwned := false
 		for k := range val {
 			if code, ok := strings.CutPrefix(k, ownerSelfMarkerPrefix); ok {
 				delete(val, k)
-				// userOwnedAmbient → reached under a User; its content is gated by the User field markers
-				// (user_private), not this org-resource self-marker — keep. "" → no owner ancestor → fail closed.
 				res := resourceFromCode(code)
-				if ambientOwner != userOwnedAmbient && (ambientOwner == "" || denied(ambientOwner, res)) {
+				if ambientOwner == userOwnedAmbient {
+					// userOwnedAmbient → this is the user's OWN owner-owned content (its projectsV2/sponsorsListing
+					// reached DIRECTLY through a userPrivateField the User markers already gate on user_private) —
+					// KEEP it. But the sentinel is NON-TRANSITIVE (round-43 F1/F2): it must NOT reach this node's
+					// children, because a NESTED self-marked owner-owned object is a SEPARATE owner's content (a
+					// cross-owner ProjectV2 via issue.projectItems.project, the sponsorable's tier.sponsorsListing)
+					// that must fail closed on its own. The reset to "" happens at the generic recursion below.
+					selfMarkedUserOwned = true
+				} else if ambientOwner == "" || denied(ambientOwner, res) {
+					// No marked owner ancestor (reached under a repo) or that owner's resource is denied → fail
+					// closed. Null EVERY non-marker field by RESPONSE KEY: a former {__typename,id} keep-set was
+					// alias-bypassable (a client `id: <secret-scalar>` aliased the secret to a kept key and
+					// dodged the null), so keep NOTHING — the object's structural presence is unavoidable but
+					// carries no data (round-43 F3; the keep-by-key was the round-42 F5 mechanism's residual).
 					for fk := range val {
-						if !ownerContentPublicFields[fk] && !strings.HasPrefix(fk, "bgh") {
+						if !strings.HasPrefix(fk, "bgh") {
 							val[fk] = nil
 						}
 					}
@@ -482,6 +483,10 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 		nextAmbient := ambientOwner
 		if isOwnerObj {
 			nextAmbient = effectiveOwner
+		} else if selfMarkedUserOwned {
+			// non-transitive user-owned sentinel: the keep applied to THIS node only; its children start fresh
+			// with no owner ancestor, so a nested self-marked owner-owned object fails closed (round-43 F1/F2).
+			nextAmbient = ""
 		}
 		for k, c := range val {
 			val[k] = redactOwnerPrivate(c, denied, categoryDenied, nextAmbient)

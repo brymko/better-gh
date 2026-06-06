@@ -54,26 +54,42 @@ func TestR42_UserOwnedAmbientNarrowed(t *testing.T) {
 	}
 }
 
-// TestR42_SelfMarkerFailCloseStrictKeepSet pins the round-42 F5 fix: the owner-owned-content self-marker
-// fail-close keeps only the opaque node identity (__typename/id) — url/resourcePath embed the OWNING org's
-// login AND the private item's number, and databaseId IS that number, so they must be nulled (they survived
-// under the owner-object keep-list shared with the base-denied-OWNER coarse redaction).
-func TestR42_SelfMarkerFailCloseStrictKeepSet(t *testing.T) {
+// TestR42_SelfMarkerFailCloseNullsEverything pins the round-42 F5 fix AS HARDENED by round-43 F3: the
+// owner-owned-content self-marker fail-close nulls EVERY non-marker field by response key — the former
+// {__typename,id} keep-set was alias-bypassable (`id: <secret-scalar>` aliased a secret to a kept key), so
+// url/resourcePath/databaseId/title AND id are all nulled; a fail-closed item carries no data.
+func TestR42_SelfMarkerFailCloseNullsEverything(t *testing.T) {
 	proj := map[string]any{
 		ownerSelfMarkerPrefix + resourceCode("projects"): "ProjectV2",
 		"title":        "SECRET_BOARD",
 		"url":          "https://github.com/orgs/acme/projects/42",
 		"resourcePath": "/orgs/acme/projects/42",
 		"databaseId":   42,
-		"id":           "PVT_keepme",
+		"id":           "PVT_secret",
 	}
 	js := mustJSON(RedactDeniedOwnerPrivate(proj, func(string, string) bool { return false }, noUserFieldDenied))
-	for _, leaked := range []string{"github.com", "acme", "projects/42", "SECRET_BOARD"} {
+	for _, leaked := range []string{"github.com", "acme", "projects/42", "SECRET_BOARD", "PVT_secret"} {
 		if strings.Contains(js, leaked) {
-			t.Fatalf("F5: fail-closed ProjectV2 leaked %q (url/resourcePath/databaseId/title must be nulled): %s", leaked, js)
+			t.Fatalf("F5/F3: fail-closed ProjectV2 leaked %q (every field must be nulled by key): %s", leaked, js)
 		}
 	}
-	if !strings.Contains(js, "PVT_keepme") {
-		t.Fatalf("F5: opaque node id wrongly nulled (kept-set should retain id/__typename): %s", js)
+}
+
+// TestR43_SelfMarkerKeepSetAliasImmune pins round-43 F3: a client aliasing a SECRET scalar to a former
+// keep-set key (`id: title`) must NOT survive the self-marker fail-close — nulling is by response KEY, and
+// there is no keep-set, so the aliased secret is nulled like any other field.
+func TestR43_SelfMarkerKeepSetAliasImmune(t *testing.T) {
+	// response shape of `project { id: title  __typename: shortDescription }` reaching the fail-close with no
+	// owner ancestor: the response keys are id/__typename, the VALUES are the secret board scalars.
+	proj := map[string]any{
+		ownerSelfMarkerPrefix + resourceCode("projects"): "ProjectV2",
+		"id":         "SECRET_TITLE_ALIASED_TO_ID",
+		"__typename": "SECRET_DESC_ALIASED_TO_TYPENAME",
+	}
+	js := mustJSON(RedactDeniedOwnerPrivate(proj, func(string, string) bool { return false }, noUserFieldDenied))
+	for _, leaked := range []string{"SECRET_TITLE_ALIASED_TO_ID", "SECRET_DESC_ALIASED_TO_TYPENAME"} {
+		if strings.Contains(js, leaked) {
+			t.Fatalf("F3: alias to a former keep-set key dodged the fail-close null: %s", js)
+		}
 	}
 }

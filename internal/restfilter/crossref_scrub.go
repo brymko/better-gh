@@ -67,6 +67,24 @@ var repoScrubOps = map[string][]string{
 	"GET /repos/{owner}/{repo}/check-suites/{check_suite_id}/check-runs": {"$.check_runs[].pull_requests[].head.*repo.url", "$.check_runs[].pull_requests[].base.*repo.url"},
 	"GET /repos/{owner}/{repo}/commits/{ref}/check-runs":                 {"$.check_runs[].pull_requests[].head.*repo.url", "$.check_runs[].pull_requests[].base.*repo.url"},
 
+	// A check-SUITE (singleton + the commits/{ref}/check-suites list) embeds pull_requests[].head/base.repo
+	// as MINIMAL {id,url,name} repos GitHub does NOT guarantee are same-repo — a fork PR's head.repo is a
+	// possibly-denied private fork. Only check-suites/{id}/check-runs was scrubbed before, so the bare suite
+	// ops streamed the fork identity (round-43 F4). Null by the api `url` (minimal repo has no full_name).
+	"GET /repos/{owner}/{repo}/check-suites/{check_suite_id}": {"$.pull_requests[].head.*repo.url", "$.pull_requests[].base.*repo.url"},
+	"GET /repos/{owner}/{repo}/commits/{ref}/check-suites":    {"$.check_suites[].pull_requests[].head.*repo.url", "$.check_suites[].pull_requests[].base.*repo.url"},
+
+	// A workflow-RUN embeds head_repository (a full minimal-repository: name/full_name/private/owner) of the
+	// fork that produced a fork-originated run, plus pull_requests[].head/base.repo (minimal {id,url,name}).
+	// Keyed only on the run's OWN repository (the allowed path repo), so a fork-originated run on an allowed
+	// repo streamed the denied fork's metadata + PR head/base fork identity (round-43 F4). The list ops wrap
+	// in workflow_runs[]; the singleton run + attempt forms carry the run object directly. The GraphQL
+	// WorkflowRun.headRepository twin IS already redacted (crossRepoNavFields) — close the one-sided REST gap.
+	"GET /repos/{owner}/{repo}/actions/runs":                                    {"$.workflow_runs[].*head_repository.full_name", "$.workflow_runs[].pull_requests[].head.*repo.url", "$.workflow_runs[].pull_requests[].base.*repo.url"},
+	"GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs":            {"$.workflow_runs[].*head_repository.full_name", "$.workflow_runs[].pull_requests[].head.*repo.url", "$.workflow_runs[].pull_requests[].base.*repo.url"},
+	"GET /repos/{owner}/{repo}/actions/runs/{run_id}":                           {"$.*head_repository.full_name", "$.pull_requests[].head.*repo.url", "$.pull_requests[].base.*repo.url"},
+	"GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}": {"$.*head_repository.full_name", "$.pull_requests[].head.*repo.url", "$.pull_requests[].base.*repo.url"},
+
 	// activity event feeds (forkee + PR head/base repo).
 	"GET /events":                                  eventForeignRepoLocs,
 	"GET /networks/{owner}/{repo}/events":          eventForeignRepoLocs,

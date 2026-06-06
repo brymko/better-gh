@@ -390,6 +390,88 @@ func TestSpecCoverage_OpaqueRepoIDOps(t *testing.T) {
 	}
 }
 
+// TestSpecCoverage_RepoKeyedMapOps is the build-time guard for the round-43 F5 class: a Pass GET whose 200
+// response is an additionalProperties MAP keyed by repository name leaks a denied repo via its KEY (the
+// ContainsDeniedRepo body-scan reads only values). It enumerates every GET whose response is type:object
+// with a value-typed additionalProperties and asserts each is either registered in repoKeyedMapOps (→ the
+// proxy key-scans + drops denied keys) or in the exempt set (keys are NOT repo names). A spec refresh that
+// adds a repo-keyed map fails the build.
+func TestSpecCoverage_RepoKeyedMapOps(t *testing.T) {
+	raw, err := os.ReadFile("testdata/api.github.com.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec struct {
+		Paths      map[string]map[string]json.RawMessage `json:"paths"`
+		Components struct {
+			Schemas map[string]json.RawMessage `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	var deref func(m map[string]any, depth int) map[string]any
+	deref = func(m map[string]any, depth int) map[string]any {
+		if m == nil || depth > 12 {
+			return m
+		}
+		if ref, ok := m["$ref"].(string); ok {
+			var sub map[string]any
+			if json.Unmarshal(spec.Components.Schemas[ref[strings.LastIndex(ref, "/")+1:]], &sub) == nil {
+				return deref(sub, depth+1)
+			}
+		}
+		return m
+	}
+	// additionalProperties-map GET responses whose KEYS are NOT repository names (no key-scan needed).
+	exempt := map[string]string{
+		"/emojis":                         "keys are emoji names (values are CDN urls) — not repos",
+		"/repos/{owner}/{repo}/languages": "keys are language names; also path-scoped (the repo scope gates it)",
+	}
+	registered := map[string]bool{}
+	for _, p := range repoKeyedMapOps {
+		registered[p] = true
+	}
+	var missing []string
+	for path, methods := range spec.Paths {
+		rawOp, ok := methods["get"]
+		if !ok {
+			continue
+		}
+		var op struct {
+			Responses map[string]struct {
+				Content map[string]struct {
+					Schema map[string]any `json:"schema"`
+				} `json:"content"`
+			} `json:"responses"`
+		}
+		if json.Unmarshal(rawOp, &op) != nil {
+			continue
+		}
+		sch := deref(op.Responses["200"].Content["application/json"].Schema, 0)
+		if sch == nil {
+			continue
+		}
+		if tp, _ := sch["type"].(string); tp != "object" {
+			continue
+		}
+		if _, isMap := sch["additionalProperties"].(map[string]any); !isMap {
+			continue // bool/absent additionalProperties → not a value-typed map
+		}
+		if registered[path] || exempt[path] != "" {
+			continue
+		}
+		missing = append(missing, "GET "+path)
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Fatalf("%d Pass GET op(s) return an additionalProperties-map response whose KEYS the body-scan cannot "+
+			"inspect — if the keys are repo names they leak a denied repo (round-43 F5); register them in "+
+			"repoKeyedMapOps (key-scan) or add to the exempt set with a reason:\n  %s",
+			len(missing), strings.Join(missing, "\n  "))
+	}
+}
+
 func pm2(v any) (map[string]any, bool) { m, ok := v.(map[string]any); return m, ok }
 
 func classifierScopesRepo(r classifier.Result, owner, repo string) bool {
@@ -522,13 +604,20 @@ func TestSpecCoverage_NoPathScopedLeak(t *testing.T) {
 		covered := dec == NeedsFilter || len(ScrubLocations(path)) > 0 || len(ContentScrubFields(path)) > 0
 
 		if isGet {
-			// A GET's enumerated/foreign repos must be dropped/scrubbed only when the request is
-			// PATH-scoped (a path-scoped Pass response streams). A non-path-scoped GET is bounded by the
-			// Pass body-scan (ContainsDeniedRepo fails closed) / NeedsFilter / off-spec deny for the same
-			// detectable shapes RepoReach uses, and a subject-only repo is the path repo (path-scoped) or
-			// likewise body-scanned. So a GET leaks only if it is path-scoped AND surfaces an enumerated/
-			// foreign repo it neither drops nor scrubs.
-			if (reach.Enum || reach.Foreign) && pathScoped && !covered {
+			// FOREIGN (cross-ref) locations need an EXPLICIT scrub even on a NeedsFilter GET: the enum redactor
+			// drops a row whose OWN repo is denied but KEEPS an allowed row whose embedded head_repository /
+			// pull_requests[].head.repo is a denied FORK (round-43 F4: actions/runs, check-suites). The boolean
+			// `covered` masked this — a partial/absent FOREIGN scrub on an otherwise-NeedsFilter GET passed.
+			// Check per FOREIGN location, exactly as the WRITE branch does (round-22), against the GET scrub.
+			if pathScoped {
+				getScrub := strings.Join(ScrubLocations(path), " ")
+				for _, field := range unscrubbedForeignFields(reach, getScrub, ContentScrubFields(path)) {
+					leaks = append(leaks, method+" "+o.Path+" [unscrubbed foreign cross-ref field (GET): "+field+"]")
+				}
+			}
+			// Enumerated repos on a path-scoped GET are dropped by NeedsFilter / bounded by the Pass body-scan;
+			// flag only if neither dropped nor scrubbed. (A non-path-scoped GET is bounded by the body-scan.)
+			if reach.Enum && pathScoped && !covered {
 				leaks = append(leaks, method+" "+o.Path+leakWhy(reach, dec))
 			}
 			continue
