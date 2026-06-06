@@ -105,6 +105,45 @@ func TestSpecCoverage_RequestBodyNamedRepos(t *testing.T) {
 	}
 }
 
+// TestSpecCoverage_PathNamedReposScoped is the REQUEST-PATH dual of NoPathScopedLeak: every spec path
+// template that names a repository by {owner}/{repo} must produce a classifier scope for that repo, so a
+// repo embedded DEEPER than the org/user prefix (the round-23 team-repo, the round-24 /user/starred and
+// /networks feeds) cannot be read/written/probed under a coarser scope. A new such path fails the build.
+func TestSpecCoverage_PathNamedReposScoped(t *testing.T) {
+	raw, err := os.ReadFile("testdata/api.github.com.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec struct {
+		Paths map[string]map[string]json.RawMessage `json:"paths"`
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	var miss []string
+	for path, methods := range spec.Paths {
+		if !strings.Contains(path, "{owner}") || !strings.Contains(path, "{repo}") {
+			continue
+		}
+		cp := concretePath(path)
+		for method := range methods {
+			m := strings.ToUpper(method)
+			if m != "GET" && m != "PUT" && m != "POST" && m != "DELETE" && m != "PATCH" {
+				continue
+			}
+			if !classifierScopesRepo(classifier.Classify(m, cp, nil), "o", "r") {
+				miss = append(miss, m+" "+path)
+			}
+		}
+	}
+	if len(miss) > 0 {
+		sort.Strings(miss)
+		t.Fatalf("%d path(s) name a repository by {owner}/{repo} the classifier does NOT scope (it lives deeper "+
+			"than the scoped prefix — the round-23/24 path-embedded class): add a pathEmbeddedRepoScopes case:\n  %s",
+			len(miss), strings.Join(miss, "\n  "))
+	}
+}
+
 func mapOf(v any) map[string]any { m, _ := v.(map[string]any); return m }
 
 func classifierScopesRepo(r classifier.Result, owner, repo string) bool {

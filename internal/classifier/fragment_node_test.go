@@ -65,10 +65,36 @@ func TestSec_VariableDefaultsResolved(t *testing.T) {
 func TestSec_MultiRootMutationPerNodeResource(t *testing.T) {
 	body := []byte(`{"query":"mutation { enablePullRequestAutoMerge(input:{pullRequestId:\"PR_x\"}){clientMutationId} createIssue(input:{repositoryId:\"R_y\",title:\"t\"}){clientMutationId} }"}`)
 	r := Classify("POST", "/api/graphql", body)
-	if r.NodeIDResource["PR_x"] != "pulls" {
-		t.Errorf("PR_x should map to resource pulls, got %q", r.NodeIDResource["PR_x"])
+	if !nodeResContains(r, "PR_x", "pulls") {
+		t.Errorf("PR_x should map to resource pulls, got %v", r.NodeIDResource["PR_x"])
 	}
-	if r.NodeIDResource["R_y"] != "issues" {
-		t.Errorf("R_y (createIssue) should map to resource issues, got %q", r.NodeIDResource["R_y"])
+	if !nodeResContains(r, "R_y", "issues") {
+		t.Errorf("R_y (createIssue) should map to resource issues, got %v", r.NodeIDResource["R_y"])
 	}
+}
+
+// Round-24 HIGH: when ONE repository node ID is referenced by two root mutation fields mapping to
+// DIFFERENT per-resource keys, BOTH resources must be recorded — the first-wins dedup dropped the
+// second, letting a branches="none" createRef ride under a permitted issues=rw createIssue.
+func TestSec_R24_SharedRepoNodeMultiResource(t *testing.T) {
+	body := []byte(`{"query":"mutation { a: createIssue(input:{repositoryId:\"R_kgDOABCDEF\",title:\"x\"}){clientMutationId} b: createRef(input:{repositoryId:\"R_kgDOABCDEF\",name:\"refs/heads/evil\",oid:\"deadbeef\"}){clientMutationId} }"}`)
+	r := Classify("POST", "/api/graphql", body)
+	if !nodeResContains(r, "R_kgDOABCDEF", "issues") || !nodeResContains(r, "R_kgDOABCDEF", "branches") {
+		t.Fatalf("shared repo node must record BOTH issues and branches, got %v", r.NodeIDResource["R_kgDOABCDEF"])
+	}
+	// order independence: createRef first must still record both
+	body2 := []byte(`{"query":"mutation { b: createRef(input:{repositoryId:\"R_kgDOABCDEF\",name:\"refs/heads/evil\",oid:\"deadbeef\"}){clientMutationId} a: createIssue(input:{repositoryId:\"R_kgDOABCDEF\",title:\"x\"}){clientMutationId} }"}`)
+	r2 := Classify("POST", "/api/graphql", body2)
+	if !nodeResContains(r2, "R_kgDOABCDEF", "issues") || !nodeResContains(r2, "R_kgDOABCDEF", "branches") {
+		t.Fatalf("reversed order must also record both, got %v", r2.NodeIDResource["R_kgDOABCDEF"])
+	}
+}
+
+func nodeResContains(r Result, id, resource string) bool {
+	for _, res := range r.NodeIDResource[id] {
+		if res == resource {
+			return true
+		}
+	}
+	return false
 }

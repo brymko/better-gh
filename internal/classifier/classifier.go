@@ -44,13 +44,15 @@ type Result struct {
 	// scope, so the proxy resolves each node ID to its real repository before
 	// authorizing the write.
 	NodeIDs []string
-	// NodeIDResource maps each NodeID to the per-resource key of the root mutation field
-	// that referenced it (mergePullRequest → "pulls", createIssue → "issues", …). The
-	// proxy stamps it on that node's resolved repository scope so a multi-root mutation
-	// cannot smuggle a restricted-resource write under a different field's resource. A
-	// node referenced by a field that maps to no specific resource, and every read node,
-	// map to "" (the proxy falls back to the request's primary resource for reads only).
-	NodeIDResource map[string]string
+	// NodeIDResource maps each NodeID to EVERY per-resource key under which a root mutation
+	// field referenced it (mergePullRequest → "pulls", createIssue → "issues", …). The proxy
+	// emits one resolved-repository scope per (node, resource) so a multi-root mutation cannot
+	// smuggle a restricted-resource write under a DIFFERENT field's resource — including when
+	// two root fields share ONE repository node ID under different keys (createIssue/issues +
+	// createRef/branches), which a single-resource map collapsed to first-wins (round-24). A
+	// node referenced by a field that maps to no specific resource, and every read node, map to
+	// [""] (the proxy falls back to the request's primary resource for reads only).
+	NodeIDResource map[string][]string
 	// NavEscapes is set on a GraphQL read whose selection navigates from a scoped entry
 	// to other repositories (owner.repositories, forks, ...). The proxy's response
 	// filter handles it soundly when available, else denies.
@@ -934,18 +936,30 @@ func splitOwnerRepo(s string) (owner, repo string, ok bool) {
 // safe — every collected ID is independently resolved and policy-checked; missing one
 // would be the dangerous case. ok is false if the input is too deep/cyclic to walk
 // safely; the caller fails closed.
-func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionList, vars map[string]interface{}) (ids []string, resourceByID map[string]string, repoScopes []Scope, ok bool) {
+func collectNodeIDArgs(ops ast.OperationList, fragments ast.FragmentDefinitionList, vars map[string]interface{}) (ids []string, resourceByID map[string][]string, repoScopes []Scope, ok bool) {
 	seen := make(map[string]bool)
-	resourceByID = make(map[string]string)
+	resourceByID = make(map[string][]string)
+	resSeen := make(map[string]map[string]bool)
 	scopeSeen := make(map[Scope]bool)
 	var out []string
 	add := func(id, resource string) {
-		if id == "" || !looksLikeNodeID(id) || seen[id] {
+		if id == "" || !looksLikeNodeID(id) {
 			return
 		}
-		seen[id] = true
-		out = append(out, id)
-		resourceByID[id] = resource
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id) // the ID list stays deduped (one upstream resolution per node)
+		}
+		// Record EVERY distinct resource a field referenced this id under: a repository node shared by
+		// two root mutation fields (createIssue→issues, createRef→branches) must yield BOTH per-resource
+		// scopes, not just the first — keying the dedup on the id alone dropped the rest (round-24).
+		if resSeen[id] == nil {
+			resSeen[id] = make(map[string]bool)
+		}
+		if !resSeen[id][resource] {
+			resSeen[id][resource] = true
+			resourceByID[id] = append(resourceByID[id], resource)
+		}
 	}
 	// addScope records a STRING-named repo target (repositoryNameWithOwner) as an explicit scope
 	// the policy must allow, tagged with the enclosing root mutation field's resource. This is the
@@ -1205,6 +1219,16 @@ func pathEmbeddedRepoScopes(segments []string) []Scope {
 	case n >= 6 && segments[0] == "orgs" && segments[2] == "migrations" && segments[4] == "repos":
 		// /orgs/{org}/migrations/{id}/repos/{repo_name}/lock — the repo lives in the migration's org.
 		return []Scope{{Owner: segments[1], Repo: segments[5]}}
+	case n == 4 && segments[0] == "user" && segments[1] == "starred":
+		// GET/PUT/DELETE /user/starred/{owner}/{repo} probe/star the named repo under the unscoped
+		// `user` category — a denied private repo would otherwise be an existence oracle (204 vs 404)
+		// and its stargazer list a write target. Scope the repo so policy gates it (round-24).
+		return []Scope{{Owner: segments[2], Repo: segments[3], Resource: "metadata"}}
+	case n >= 3 && segments[0] == "networks":
+		// GET /networks/{owner}/{repo}/events is the fork-network activity feed for the named repo (the
+		// only {owner}/{repo} path the segment[0] branches missed). Scope it to the repo (round-24); the
+		// cross-fork events of OTHER repos in the network are dropped by the restfilter events filter.
+		return []Scope{{Owner: segments[1], Repo: segments[2]}}
 	}
 	return nil
 }

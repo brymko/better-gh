@@ -649,7 +649,7 @@ type nodeRes struct {
 // no repo scope, which the policy denies as an unscoped write. Only a node that resolves
 // to a repo-scoped TYPE without a repository (anomalous) fails the whole request closed.
 // An upstream error also fails closed. Returns (scopes, ok); scopes may be empty.
-func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceByID map[string]string, access classifier.AccessLevel) ([]classifier.Scope, bool) {
+func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceByID map[string][]string, access classifier.AccessLevel) ([]classifier.Scope, bool) {
 	if len(ids) > maxResolveIDs {
 		return nil, false
 	}
@@ -690,8 +690,18 @@ func (h *Handler) resolveNodeScopes(ctx context.Context, ids []string, resourceB
 
 	scopes := make([]classifier.Scope, 0, len(repoOf))
 	for _, id := range ids {
-		if r, ok := repoOf[id]; ok {
-			scopes = append(scopes, classifier.Scope{Owner: r.owner, Repo: r.repo, Resource: h.nodeResource(access, r.typename, resourceByID[id])})
+		r, ok := repoOf[id]
+		if !ok {
+			continue
+		}
+		// One scope per DISTINCT resource the node was referenced under, so a shared repository node
+		// used by two root mutation fields (issues + branches) is policy-checked for BOTH (round-24).
+		resources := resourceByID[id]
+		if len(resources) == 0 {
+			resources = []string{""}
+		}
+		for _, res := range resources {
+			scopes = append(scopes, classifier.Scope{Owner: r.owner, Repo: r.repo, Resource: h.nodeResource(access, r.typename, res)})
 		}
 	}
 	return scopes, true
