@@ -82,7 +82,9 @@ func TestSpecCoverage_RequestBodyNamedRepos(t *testing.T) {
 			}
 			sch := deref(op.RequestBody.Content["application/json"].Schema, 0)
 			props, _ := sch["properties"].(map[string]any)
-			if props == nil || (!stringArrayField(props, "repositories") && !stringArrayField(props, "repository_owners")) {
+			hasFullRepos := stringArrayField(props, "repositories") || stringArrayField(props, "repository_owners")
+			hasBareNames := stringArrayField(props, "repository_names") // BARE names qualified by the path org (round-44 F3)
+			if props == nil || (!hasFullRepos && !hasBareNames) {
 				continue
 			}
 			key := strings.ToUpper(method) + " " + path
@@ -91,9 +93,17 @@ func TestSpecCoverage_RequestBodyNamedRepos(t *testing.T) {
 			}
 			// The classifier must turn a body-named foreign repo into a scope.
 			cp := concretePath(path)
-			r := classifier.Classify(strings.ToUpper(method), cp, []byte(`{"repositories":["foreign-denied/secret"],"repository_owners":["foreign-denied"]}`))
-			if !classifierScopesRepo(r, "foreign-denied", "secret") && !classifierScopesOrg(r, "foreign-denied") {
-				leaks = append(leaks, key)
+			if hasFullRepos {
+				r := classifier.Classify(strings.ToUpper(method), cp, []byte(`{"repositories":["foreign-denied/secret"],"repository_owners":["foreign-denied"]}`))
+				if !classifierScopesRepo(r, "foreign-denied", "secret") && !classifierScopesOrg(r, "foreign-denied") {
+					leaks = append(leaks, key+" (repositories/repository_owners)")
+				}
+			}
+			if hasBareNames {
+				r := classifier.Classify(strings.ToUpper(method), cp, []byte(`{"repository_names":["bodyleakrepo"]}`))
+				if !classifierScopesRepoName(r, "bodyleakrepo") {
+					leaks = append(leaks, key+" (repository_names)")
+				}
 			}
 		}
 	}
@@ -472,11 +482,109 @@ func TestSpecCoverage_RepoKeyedMapOps(t *testing.T) {
 	}
 }
 
+// TestSpecCoverage_ProjectItemContentScrubbed is the build-time guard for the round-44 Finding 2 class: a
+// projectsV2 item/draft endpoint whose 2xx response carries a linked Issue/PR `content` object (of a
+// possibly-denied repo) must be in contentRepoScrubOps — including the WRITE forms (POST/PATCH), whose
+// response the proxy scrubs ONLY via ContentScrubFields (the Pass body-scan is GET-only). The op's `content`
+// is an opaque additionalProperties body the spec-derived RepoReach cannot see, so it must be enumerated by
+// PATH here. A new project-item content op fails the build instead of streaming a denied repo's content.
+func TestSpecCoverage_ProjectItemContentScrubbed(t *testing.T) {
+	raw, err := os.ReadFile("testdata/api.github.com.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec struct {
+		Paths      map[string]map[string]json.RawMessage `json:"paths"`
+		Components struct {
+			Schemas map[string]json.RawMessage `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	var deref func(m map[string]any, depth int) map[string]any
+	deref = func(m map[string]any, depth int) map[string]any {
+		if m == nil || depth > 12 {
+			return m
+		}
+		if ref, ok := m["$ref"].(string); ok {
+			var sub map[string]any
+			if json.Unmarshal(spec.Components.Schemas[ref[strings.LastIndex(ref, "/")+1:]], &sub) == nil {
+				return deref(sub, depth+1)
+			}
+		}
+		return m
+	}
+	var hasContent func(sch map[string]any, depth int) bool
+	hasContent = func(sch map[string]any, depth int) bool {
+		sch = deref(sch, depth)
+		if sch == nil || depth > 12 {
+			return false
+		}
+		if props, ok := sch["properties"].(map[string]any); ok {
+			if _, has := props["content"]; has {
+				return true
+			}
+		}
+		if items, ok := sch["items"].(map[string]any); ok && hasContent(items, depth+1) { // array element
+			return true
+		}
+		return false
+	}
+	var missing []string
+	for path, methods := range spec.Paths {
+		if !strings.Contains(path, "/projectsV2/") || !(strings.Contains(path, "/items") || strings.Contains(path, "/drafts")) {
+			continue
+		}
+		for m, rawOp := range methods {
+			if m != "get" && m != "post" && m != "patch" {
+				continue
+			}
+			var op struct {
+				Responses map[string]struct {
+					Content map[string]struct {
+						Schema map[string]any `json:"schema"`
+					} `json:"content"`
+				} `json:"responses"`
+			}
+			if json.Unmarshal(rawOp, &op) != nil {
+				continue
+			}
+			contentBearing := false
+			for code, resp := range op.Responses {
+				if strings.HasPrefix(code, "2") && hasContent(resp.Content["application/json"].Schema, 0) {
+					contentBearing = true
+				}
+			}
+			if contentBearing && len(ContentScrubFields(concretePath(path))) == 0 {
+				missing = append(missing, strings.ToUpper(m)+" "+path)
+			}
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Fatalf("%d projectsV2 item/draft op(s) carry a linked-content object but are NOT in contentRepoScrubOps "+
+			"(a write streams a denied repo's Issue/PR content — round-44 F2):\n  %s",
+			len(missing), strings.Join(missing, "\n  "))
+	}
+}
+
 func pm2(v any) (map[string]any, bool) { m, ok := v.(map[string]any); return m, ok }
 
 func classifierScopesRepo(r classifier.Result, owner, repo string) bool {
 	for _, s := range r.AllScopes() {
 		if s.Owner == owner && s.Repo == repo {
+			return true
+		}
+	}
+	return false
+}
+
+// classifierScopesRepoName reports whether ANY scope names the repo (by Repo name, any owner) — for a
+// bare-name body field qualified by the path org, where the test does not know the concrete path owner.
+func classifierScopesRepoName(r classifier.Result, repo string) bool {
+	for _, s := range r.AllScopes() {
+		if s.Repo == repo {
 			return true
 		}
 	}

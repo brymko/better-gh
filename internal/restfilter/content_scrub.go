@@ -23,6 +23,16 @@ var contentRepoScrubOps = map[string][]string{
 	"/orgs/{org}/projectsV2/{project_number}/items":       {"content"},
 	"/user/{user_id}/projectsV2/{project_number}/drafts":  {"content"},
 	"/users/{username}/projectsV2/{project_number}/items": {"content"},
+	// The single-item GET + PATCH twins (`/items/{item_id}`) carry the SAME `content` (the linked Issue/PR of
+	// a possibly-denied repo) but were omitted, so a PATCH updating a board item streamed the denied repo's
+	// title/body/repository on the write path (which runs only Write/Content scrub, no Pass body-scan) —
+	// round-44 Finding 2. The op's `content` is an opaque additionalProperties body the spec-derived RepoReach
+	// cannot see, so TestSpecCoverage_ProjectItemContentScrubbed enumerates these project-item paths explicitly.
+	"/orgs/{org}/projectsV2/{project_number}/items/{item_id}":       {"content"},
+	"/users/{username}/projectsV2/{project_number}/items/{item_id}": {"content"},
+	// The per-VIEW item lists carry the same linked `content` (one element per board item) — round-44 F2.
+	"/orgs/{org}/projectsV2/{project_number}/views/{view_number}/items":       {"content"},
+	"/users/{username}/projectsV2/{project_number}/views/{view_number}/items": {"content"},
 	// A CodeQL variant-analysis (POST) echoes its target repos in scanned_repositories[].repository and
 	// skipped_repositories.*; the classifier scopes the `repositories[]`/`repository_owners[]` body forms,
 	// but the `repository_lists` form names a saved list the proxy can't resolve offline, so null these

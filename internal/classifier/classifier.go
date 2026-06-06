@@ -1414,10 +1414,10 @@ func parseSearchRepoQualifiers(query string) []ownerRepo {
 // it (round-23) — the REST-body analogue of compareForkScopes (round-16) / createCommitOnBranch (round-15).
 // Each named repo becomes a scope the policy must allow, so a denied target is rejected at the front gate.
 func bodyNamedRepoScopes(method string, segments []string, body []byte) []Scope {
-	if method != http.MethodPost || len(body) == 0 {
+	if (method != http.MethodPost && method != http.MethodPatch && method != http.MethodPut) || len(body) == 0 {
 		return nil
 	}
-	var resource string
+	var resource, bareNameOrg string
 	switch {
 	case len(segments) == 3 && segments[0] == "orgs" && segments[2] == "migrations":
 		resource = "migrations"
@@ -1426,15 +1426,23 @@ func bodyNamedRepoScopes(method string, segments []string, body []byte) []Scope 
 	case len(segments) == 6 && segments[0] == "repos" && segments[3] == "code-scanning" &&
 		segments[4] == "codeql" && segments[5] == "variant-analyses":
 		resource = restResource(segments) // the repo's code-scanning resource key
+	case len(segments) == 4 && segments[0] == "orgs" && segments[2] == "properties" && segments[3] == "values":
+		// PATCH /orgs/{org}/properties/values applies custom-property VALUES to the repos named in
+		// repository_names[] (BARE names within {org}); each must be gated by its per-repo carve-out or a
+		// client with org `properties` write writes to a DENIED repo (round-44 Finding 3 — the round-15/16/23
+		// "foreign repo named in a request must become a scope" class via a third body field name).
+		resource = "properties"
+		bareNameOrg = segments[1]
 	default:
 		return nil
 	}
 	var b struct {
 		Repositories     []string `json:"repositories"`
 		RepositoryOwners []string `json:"repository_owners"`
+		RepositoryNames  []string `json:"repository_names"`
 	}
 	if json.Unmarshal(body, &b) != nil {
-		return nil // a body GitHub itself rejects (400) runs no migration/scan, so it discloses nothing
+		return nil // a body GitHub itself rejects (400) runs no migration/scan/write, so it discloses nothing
 	}
 	var out []Scope
 	for _, full := range b.Repositories {
@@ -1445,6 +1453,17 @@ func bodyNamedRepoScopes(method string, segments []string, body []byte) []Scope 
 	for _, owner := range b.RepositoryOwners {
 		if owner != "" {
 			out = append(out, Scope{Org: owner, Resource: resource})
+		}
+	}
+	for _, name := range b.RepositoryNames {
+		switch {
+		case name == "":
+		case strings.Contains(name, "/"):
+			if o, r, ok := splitOwnerRepo(name); ok {
+				out = append(out, Scope{Owner: o, Repo: r, Resource: resource})
+			}
+		case bareNameOrg != "": // a bare name is qualified by the path org
+			out = append(out, Scope{Owner: bareNameOrg, Repo: name, Resource: resource})
 		}
 	}
 	return out

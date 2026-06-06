@@ -37,8 +37,8 @@ func TestR42_UserOwnedAmbientNarrowed(t *testing.T) {
 	// marker, so it is nulled under user_private-DENIED (closes the custodian Sponsors-financials leak)…
 	slBody := func() map[string]any {
 		return map[string]any{
-			userMarkerAlias:                "octocat",
-			ownerMemberMarkerPrefix + "sl": "SponsorsListing",
+			userMarkerAlias:                   "octocat",
+			userOwnContentMarkerPrefix + "sl": "SponsorsListing",
 			"sl": map[string]any{
 				ownerSelfMarkerPrefix + resourceCode("sponsors"): "SponsorsListing",
 				"contactEmailAddress":                            "SECRET_STRIPE_EMAIL", "id": "SL_1",

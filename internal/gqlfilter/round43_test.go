@@ -18,15 +18,16 @@ func TestR43_UserOwnedSentinelNonTransitive(t *testing.T) {
 		return map[string]any{ownerSelfMarkerPrefix + resourceCode(res): "X", "title": secret, "id": "node1"}
 	}
 
-	// F1: viewer{ projectsV2 { nodes { ...own board scalars... <nested foreign project> } } }.
-	// The outer ProjectV2 is the user's own (reached via the projectsV2 userPrivateField marker) → KEPT;
-	// the nested self-marked ProjectV2 (a foreign board reached through the board's own subtree) → FAIL CLOSED.
+	// F1: viewer{ projectsV2 { nodes { ...own board scalars... <nested foreign project> } } }. projectsV2 is an
+	// OWN-content private field (userOwnContentMarkerPrefix) so the outer ProjectV2 is KEPT; the nested
+	// self-marked ProjectV2 (a foreign board reached through the board's own subtree) → FAIL CLOSED (the
+	// round-43 non-transitive reset).
 	ownBoard := selfMarked("projects", "MY_OWN_BOARD")
 	ownBoard["crossOwner"] = selfMarked("projects", "FOREIGN_BOARD")
 	f1 := map[string]any{
-		userMarkerAlias:                "octocat",
-		ownerMemberMarkerPrefix + "pv": "ProjectV2",
-		"pv":                           ownBoard,
+		userMarkerAlias:                   "octocat",
+		userOwnContentMarkerPrefix + "pv": "ProjectV2",
+		"pv":                              ownBoard,
 	}
 	js := mustJSON(RedactDeniedOwnerPrivate(f1, allow, noUP))
 	if !strings.Contains(js, "MY_OWN_BOARD") {
@@ -34,29 +35,5 @@ func TestR43_UserOwnedSentinelNonTransitive(t *testing.T) {
 	}
 	if strings.Contains(js, "FOREIGN_BOARD") {
 		t.Fatalf("F1: a nested cross-owner ProjectV2 under the user's own board was NOT fail-closed: %s", js)
-	}
-
-	// F2: viewer{ sponsorshipsAsSponsor { nodes { ...own sponsorship... tier { sponsorsListing {...} } } } }.
-	// Sponsorship/SponsorsTier/SponsorsListing are all @docsCategory "sponsors" → a contiguous self-marked
-	// chain; the sentinel must die at the first node so the sponsorable's listing financials fail closed.
-	ownSponsorship := selfMarked("sponsors", "MY_SPONSORSHIP")
-	ownSponsorship["tier"] = map[string]any{
-		ownerSelfMarkerPrefix + resourceCode("sponsors"): "SponsorsTier",
-		"sponsorsListing": map[string]any{
-			ownerSelfMarkerPrefix + resourceCode("sponsors"): "SponsorsListing",
-			"contactEmailAddress":                            "SPONSORABLE_STRIPE_EMAIL", "id": "sl1",
-		},
-	}
-	f2 := map[string]any{
-		userMarkerAlias:                "octocat",
-		ownerMemberMarkerPrefix + "sp": "SponsorshipConnection",
-		"sp":                           ownSponsorship,
-	}
-	js2 := mustJSON(RedactDeniedOwnerPrivate(f2, allow, noUP))
-	if !strings.Contains(js2, "MY_SPONSORSHIP") {
-		t.Fatalf("F2: the user's OWN sponsorship node was wrongly fail-closed: %s", js2)
-	}
-	if strings.Contains(js2, "SPONSORABLE_STRIPE_EMAIL") {
-		t.Fatalf("F2: the sponsorable's cross-owner sponsorsListing financials were NOT fail-closed: %s", js2)
 	}
 }

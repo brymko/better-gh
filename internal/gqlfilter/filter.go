@@ -44,6 +44,15 @@ const ownerMemberMarkerPrefix = "bghOrgMemZ9_"
 // keep ownerMemberMarkerPrefix (category "user_private"). The suffix is the response key (for nulling).
 const userGistMarkerPrefix = "bghUGstZ9_"
 
+// userOwnContentMarkerPrefix marks a navigated User's private field that returns the user's OWN owner-owned
+// CONTENT (projectsV2/sponsorsListing/…, the userOwnContentFields), as opposed to a private field that
+// returns a FOREIGN entity (sponsoring/sponsors/organizations → other Users/Orgs). Only an own-content field
+// may carry the userOwnedAmbient sentinel into its subtree — an entity-returning private field must NOT, or
+// the sentinel rides through the foreign entity to a cross-owner self-marked node and keeps it (round-44
+// Finding 1). The category is still "user_private" (the field is nulled when user_private is denied); the
+// distinct prefix only tells redaction whether to thread the sentinel. The suffix is the response key.
+const userOwnContentMarkerPrefix = "bghUOCZ9_"
+
 // orgMemberFieldNames are Organization member-identity fields (synced with the classifier's
 // gqlOrgFieldToResource "members" keys); enterpriseMemberFieldNames are the Enterprise counterparts.
 // A member field is nulled when the owner's "members" carve-out is denied but base IS readable.
@@ -250,6 +259,23 @@ var userGistFields = map[string]bool{
 	"pinnableItems": true, "pinnedItems": true, "itemShowcase": true,
 }
 
+// userOwnContentFields are the userPrivateFields whose DIRECT value is the user's OWN owner-owned CONTENT
+// (a self-marked ProjectV2/Project/SponsorsListing). ONLY these may carry the userOwnedAmbient sentinel into
+// their subtree (so the user's own projects/listing are kept, not fail-closed). Every OTHER private field —
+// sponsoring/sponsors (→ foreign Sponsorable Users/Orgs), organizations/enterprises (→ Orgs), the
+// sponsorshipsAs* connections (→ Sponsorships referencing a FOREIGN sponsorable's tier/listing) — must NOT
+// carry the sentinel: it would ride through the foreign entity to a cross-owner self-marked node and keep it
+// (round-44 Finding 1). TestR44_UserOwnContentFieldsAreSelfMarked couples this set to the schema so a field
+// whose type is not owner-owned content cannot be added here. The over-redaction of a user's own deep
+// content (a sponsorship's tier, a project's items) reached through a non-own-content private field is the
+// safe direction.
+// (classic `projects`/`project` are deliberately ABSENT: their type Project is repo-attributable, handled by
+// the repo filter — not the owner self-marker — so they need no sentinel; TestR44_UserOwnContentFieldsCoupled
+// enforces that every member resolves to a self-marked owner-owned content type.)
+var userOwnContentFields = map[string]bool{
+	"projectsV2": true, "projectV2": true, "recentProjects": true, "sponsorsListing": true,
+}
+
 // UserPrivateFields returns the owner-private User field names (sorted), so a cross-package guard can
 // couple them to the classifier's viewer-private front-gate set. UserGistField reports whether a
 // private User field is gated on the "gists" category rather than "user_private".
@@ -273,6 +299,9 @@ func UserGistField(field string) bool { return userGistFields[field] }
 func userPrivateMarkerPrefix(fieldName string) string {
 	if userGistFields[fieldName] {
 		return userGistMarkerPrefix
+	}
+	if userOwnContentFields[fieldName] {
+		return userOwnContentMarkerPrefix
 	}
 	return ownerMemberMarkerPrefix
 }
@@ -377,23 +406,31 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 			// Each per-field marker carries the field's policy CATEGORY in its PREFIX (set at augment time
 			// from the schema field NAME), so a client ALIAS on the field cannot downgrade gists→user_private
 			// (round-36). The suffix is the response key, used to null the field.
-			type marked struct{ key, cat string }
+			type marked struct {
+				key, cat   string
+				ownContent bool // field returns the user's OWN owner-owned content → may carry the sentinel
+			}
 			var ms []marked
 			for k := range val {
 				if rest, isGist := strings.CutPrefix(k, userGistMarkerPrefix); isGist {
-					ms = append(ms, marked{rest, "gists"})
+					ms = append(ms, marked{rest, "gists", false})
+				} else if rest, ok := strings.CutPrefix(k, userOwnContentMarkerPrefix); ok {
+					ms = append(ms, marked{rest, "user_private", true})
 				} else if rest, ok := strings.CutPrefix(k, ownerMemberMarkerPrefix); ok {
-					ms = append(ms, marked{rest, "user_private"})
+					ms = append(ms, marked{rest, "user_private", false})
 				}
 			}
-			privateKeys := make(map[string]bool, len(ms))
+			ownContentKeys := make(map[string]bool, len(ms))
 			for _, m := range ms {
-				if m.cat == "gists" {
+				switch {
+				case m.cat == "gists":
 					delete(val, userGistMarkerPrefix+m.key)
-				} else {
+				case m.ownContent:
+					delete(val, userOwnContentMarkerPrefix+m.key)
+					ownContentKeys[m.key] = true
+				default:
 					delete(val, ownerMemberMarkerPrefix+m.key)
 				}
-				privateKeys[m.key] = true
 				if denied(userLogin, "") || categoryDenied(m.cat) {
 					if _, present := val[m.key]; present {
 						val[m.key] = nil
@@ -402,13 +439,14 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 			}
 			for k, c := range val {
 				// The user-owned sentinel suppresses the ownerSelfMarker fail-close ONLY for the user's OWN
-				// owner-owned content — its projectsV2/sponsors/… reached through a userPrivateField that the
-				// markers above already gate (user_private). Content reached through a NON-private User field
-				// (sponsorsListing) or a cross-owner edge (issues→…→project) is NOT the user's own and is gated
-				// by no User marker, so it keeps the inherited ambient and the self-marker fails it closed —
-				// blanket-threading the sentinel into every child leaked exactly those paths (round-42 F1/F3/F4).
+				// owner-owned content reached through an OWN-CONTENT private field (projectsV2/sponsorsListing).
+				// It is NOT threaded into an ENTITY-returning private field (sponsoring/sponsors/organizations →
+				// foreign Users/Orgs) nor any non-private field: that would let the sentinel ride through the
+				// foreign entity to a CROSS-OWNER self-marked node and keep it past a per-resource carve-out
+				// (round-44 Finding 1). The round-43 non-transitive reset then zeroes the sentinel below the
+				// first self-marked own node, so even an own-content field cannot leak its deep references.
 				child := ambientOwner
-				if privateKeys[k] {
+				if ownContentKeys[k] {
 					child = userOwnedAmbient
 				}
 				val[k] = redactOwnerPrivate(c, denied, categoryDenied, child)
@@ -675,6 +713,7 @@ func usesReservedAlias(sels ast.SelectionSet, depth int) bool {
 			if strings.HasPrefix(key, markerAlias) || strings.HasPrefix(key, markerTypeAlias) ||
 				strings.HasPrefix(key, ownerMarkerAlias) || strings.HasPrefix(key, ownerMemberMarkerPrefix) ||
 				strings.HasPrefix(key, userMarkerAlias) || strings.HasPrefix(key, userGistMarkerPrefix) ||
+				strings.HasPrefix(key, userOwnContentMarkerPrefix) ||
 				strings.HasPrefix(key, ownerContentMarkerPrefix) || strings.HasPrefix(key, ownerSelfMarkerPrefix) {
 				// Reserve the whole marker namespace (exact aliases AND the per-member
 				// "markerAlias_Type" suffixes augment injects, plus the owner + per-member-field markers),

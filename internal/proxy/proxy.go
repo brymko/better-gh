@@ -670,12 +670,23 @@ const redactedErrorMessage = "redacted by bgh: this response referenced a resour
 // repos AND a trailing '.' made the dotted token miss the carve-out's exact name).
 var repoNameToken = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*`)
 
+// webURLToken matches an http(s) URL substring so a github.com/owner/repo web URL in free-form error text
+// can be parsed with the data-side RepoFromWebURL: the owner/repo regex matches "github.com/owner" and
+// orphans the real repo, so a "...moved to https://github.com/owner/repo." message dodged the scrub (round-44 F4).
+var webURLToken = regexp.MustCompile(`https?://[^\s"'<>)\]]+`)
+
 // scrubDeniedRepoStrings recursively replaces any string in a GraphQL errors[]/extensions subtree that
 // names a repository `denied` reports unreadable, with a generic message. Fail-closed: a name-bearing
 // string is replaced WHOLESALE rather than partially patched, so a denied repo's name cannot survive.
 func scrubDeniedRepoStrings(v any, denied func(ownerRepo string) bool) any {
 	switch val := v.(type) {
 	case string:
+		// github.com/owner/repo WEB urls first (the owner/repo regex below mis-tokenizes them as github.com/owner).
+		for _, u := range webURLToken.FindAllString(val, -1) {
+			if r := restfilter.RepoFromWebURL(u); r != "" && (denied(r) || denied(strings.TrimRight(r, "._-"))) {
+				return redactedErrorMessage
+			}
+		}
 		for _, tok := range repoNameToken.FindAllString(val, -1) {
 			// Check the raw token AND the token with trailing name-punctuation stripped: GitHub's permission
 			// sentences end the repo name with a '.'/',' the greedy regex captures, which would miss the

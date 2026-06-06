@@ -36,7 +36,7 @@ func scanForDeniedRepo(v any, org string, authorized func(string) bool) bool {
 		// student_repository_url / …) — the shape the keyed checks miss (round-39 Classroom grades feed,
 		// whose student_repository_url is a bare-repo html_url). Conservative: github.com host only, a
 		// reserved-top-level-path denylist, so an ordinary github.com link does not over-fail the scan.
-		if r := repoFromWebURL(t); r != "" && !authorized(r) {
+		if r := RepoFromWebURL(t); r != "" && !authorized(r) {
 			return true
 		}
 		return false
@@ -126,11 +126,11 @@ var reservedWebFirstSegment = map[string]bool{
 	"watching": true, "gist": true, "site": true, "contact": true, "security": true, "readme": true,
 }
 
-// repoFromWebURL extracts "owner/repo" from a GitHub WEB url (html_url / clone_url / *_repository_url),
+// RepoFromWebURL extracts "owner/repo" from a GitHub WEB url (html_url / clone_url / *_repository_url),
 // e.g. "https://github.com/owner/repo", ".../owner/repo/issues/1", or ".../owner/repo.git". Returns "" for a
 // non-github.com host, a 1-segment profile url, or a reserved top-level path — the conservative form that
 // avoids false-positives in the fail-closed Pass body-scan (round-39).
-func repoFromWebURL(u string) string {
+func RepoFromWebURL(u string) string {
 	i := strings.Index(u, "://")
 	if i < 0 {
 		return ""

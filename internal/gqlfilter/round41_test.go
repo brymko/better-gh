@@ -78,7 +78,7 @@ func TestR41_OwnerOwnedContentSelfMarked(t *testing.T) {
 	}
 	// (4) under a User via the USER-PRIVATE projectsV2 field (the realistic augmented shape: the field carries
 	// its user_private marker), user_private ALLOWED → kept (no over-redaction of the custodian's OWN projects).
-	underUser := map[string]any{userMarkerAlias: "octocat", ownerMemberMarkerPrefix + "p": "ProjectV2", "p": proj()}
+	underUser := map[string]any{userMarkerAlias: "octocat", userOwnContentMarkerPrefix + "p": "ProjectV2", "p": proj()}
 	if js := mustJSON(RedactDeniedOwnerPrivate(underUser, allow, noUP)); !strings.Contains(js, "SECRET_BOARD") {
 		t.Fatalf("ProjectV2 under a User via projectsV2 wrongly fail-closed (over-redaction): %s", js)
 	}
