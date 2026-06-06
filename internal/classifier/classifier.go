@@ -180,6 +180,23 @@ func Classify(method, path string, body []byte) Result {
 		}
 	}
 
+	// Owner-private REST roots that the GraphQL enterprise(slug:)/organization(login:) scoping (round-21/22)
+	// was never mirrored to — they named an enterprise slug or a NUMERIC org/team id the segment-0 branches
+	// above never matched, so they fell to Defaults.Mode and leaked enterprise team rosters / org billing /
+	// legacy team members ungateably under mode=allow (round-27). Scope each to its owner so an [[org]] rule
+	// (keyed on the slug, or — for the numeric forms — the id) gates it and default-deny denies it. The
+	// numeric-id forms fail closed under mode=deny; an operator allowing them under mode=allow must key the
+	// rule on the id (the classifier does not resolve id→slug).
+	if len(segments) >= 2 && segments[0] == "enterprises" {
+		return Result{Org: segments[1], Access: access, Resource: enterpriseResource(segments)}
+	}
+	if len(segments) >= 2 && segments[0] == "organizations" {
+		return Result{Org: segments[1], Access: access, Resource: orgResource(segments)}
+	}
+	if len(segments) >= 3 && segments[0] == "teams" && (segments[2] == "members" || segments[2] == "memberships") {
+		return Result{Org: segments[1], Access: access, Resource: "members"}
+	}
+
 	res := Result{
 		Access:           access,
 		UnscopedCategory: restUnscopedCategory(segments),
@@ -1364,6 +1381,20 @@ func orgResource(segments []string) string {
 		return "metadata"
 	}
 	return segments[2]
+}
+
+// enterpriseResource maps an /enterprises/{ent}/… subpath to a per-resource key so a [org.permissions]
+// members="none" carve-out on the enterprise slug gates its team/member rosters (parity with the GraphQL
+// enterprise member fields — round-27).
+func enterpriseResource(segments []string) string {
+	if len(segments) >= 3 {
+		switch segments[2] {
+		case "teams", "members", "memberships", "owners", "admins":
+			return "members"
+		}
+		return segments[2]
+	}
+	return "metadata"
 }
 
 var restMetadataSegments = map[string]bool{

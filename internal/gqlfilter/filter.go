@@ -54,7 +54,8 @@ var enterpriseMemberFieldNames = map[string]bool{
 // carve-out (the owner analogue of repoOwnedNoPath ambient attribution). TestOwnerPrivateCoverage asserts
 // this set ∪ {Organization, Enterprise} ∪ the justified exceptions covers every member-bearing type.
 var memberBearingNonOwnerTypes = map[string]map[string]bool{
-	"Team": {"members": true, "memberStatuses": true, "invitations": true},
+	"Team":           {"members": true, "memberStatuses": true, "invitations": true},
+	"EnterpriseTeam": {"enterpriseTeamMembers": true, "assignedOrganizations": true},
 }
 
 // ownerPublicFields are the only fields kept when an owner object is BASE-denied (the client has no
@@ -505,6 +506,59 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 		}
 	}
 	budget.count(len(idMembers))
+	// Owner (Organization/Enterprise) members of the abstract type: an interface-typed field selected via
+	// its COMMON owner-private fields with NO inline fragment (Sponsorship.sponsorable: Sponsorable →
+	// monthlyEstimatedSponsorsIncomeInCents; ProjectV2.owner: ProjectV2Owner → projectsV2; ProfileOwner →
+	// email) resolves to an Organization that the concrete branch never marked, so a DENIED owner's
+	// owner-private data streamed unredacted (round-27). Inject an owner-marker fragment so the resolved
+	// owner self-identifies and RedactDeniedOwnerPrivate's base-denied coarse redaction (or members null)
+	// fires regardless of the abstract path.
+	orig := *sels
+	owners := s.ownerMembers(typeName)
+	for _, owner := range owners {
+		*sels = append(*sels, s.ownerMarkerFragment(owner, orig))
+	}
+	budget.count(len(owners))
+}
+
+// ownerMembers returns the Organization/Enterprise concrete possible types of an interface/union, so an
+// abstract selection that could resolve to a denied owner via common fields is marked and redacted.
+func (s *Schema) ownerMembers(typeName string) []string {
+	def := s.schema.Types[typeName]
+	if def == nil || (def.Kind != ast.Interface && def.Kind != ast.Union) {
+		return nil
+	}
+	var out []string
+	for _, pt := range s.schema.PossibleTypes[typeName] {
+		if pt.Name == "Organization" || pt.Name == "Enterprise" {
+			out = append(out, pt.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ownerMarkerFragment builds `... on Organization { bghOrgLoginZ9: login <per-selected-member-field markers> }`
+// (or Enterprise/slug) for an owner reached through an abstract field via its COMMON fields with no inline
+// fragment, so the resolved owner self-identifies and RedactDeniedOwnerPrivate gates it (round-27).
+func (s *Schema) ownerMarkerFragment(ownerType string, siblingSels ast.SelectionSet) *ast.InlineFragment {
+	idField := "login"
+	memberFields := orgMemberFieldNames
+	if ownerType == "Enterprise" {
+		idField = "slug"
+		memberFields = enterpriseMemberFieldNames
+	}
+	sel := ast.SelectionSet{&ast.Field{Alias: ownerMarkerAlias, Name: idField}}
+	for _, ss := range siblingSels {
+		if f, ok := ss.(*ast.Field); ok && memberFields[f.Name] {
+			key := f.Alias
+			if key == "" {
+				key = f.Name
+			}
+			sel = append(sel, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
+		}
+	}
+	return &ast.InlineFragment{TypeCondition: ownerType, SelectionSet: sel}
 }
 
 // repoIdentityNoPathMembers returns the repo-identity-scalar concrete object members of an

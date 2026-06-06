@@ -113,22 +113,62 @@ func TestR26_TeamMembersAttributedToOrg(t *testing.T) {
 }
 
 // TestOwnerPrivateCoverage is the structural coverage invariant (the owner-private analogue of the
-// repo-coverage invariants that converged repo isolation): EVERY object type in the embedded schema that
-// exposes a member-identity field MUST be covered by the owner-private redaction — owner-marked
-// (Organization/Enterprise), ambient-attributed (memberBearingNonOwnerTypes), or a justified exception —
-// and every member field it declares must be in that type's marked set. A schema refresh that adds a new
-// member-bearing type/field fails the build instead of silently leaking members="none" data by navigation.
+// repo-coverage invariants that converged repo isolation). For every type in the org/enterprise hierarchy
+// it DERIVES the member-identity fields from the schema — fields returning a connection whose element
+// exposes a `login` (a roster of members/orgs) — rather than a hand-list (which in round-26 missed
+// EnterpriseTeam.enterpriseTeamMembers), and asserts each is in that type's MARKED set so augment tags it
+// and RedactDeniedOwnerPrivate nulls it under members="none". A schema refresh that adds a new
+// member-roster field to one of these types fails the build instead of silently leaking by navigation.
 func TestOwnerPrivateCoverage(t *testing.T) {
 	s, _ := Load()
-	memberIdentityFields := map[string]bool{
-		"membersWithRole": true, "members": true, "pendingMembers": true, "memberStatuses": true,
-		"mannequins": true, "enterpriseOwners": true, "samlIdentityProvider": true, "auditLog": true,
-		"administrators": true, "ownerInfo": true, "memberInvitations": true, "outsideCollaborators": true,
-		"failedInvitations": true, "invitations": true,
+	unwrap := func(tp *ast.Type) string {
+		for tp.Elem != nil {
+			tp = tp.Elem
+		}
+		return tp.Name()
 	}
+	exposesLogin := func(typeName string) bool {
+		for _, cand := range append([]*ast.Definition{s.schema.Types[typeName]}, s.schema.PossibleTypes[typeName]...) {
+			if cand == nil {
+				continue
+			}
+			for _, f := range cand.Fields {
+				if f.Name == "login" {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	// an owner element (Organization/Enterprise) is itself owner-marked and redacted per its own policy,
+	// so a field returning a connection/navigation of OWNERS is not a member ROSTER — exclude it.
+	isOwner := func(name string) bool { return name == "Organization" || name == "Enterprise" }
+	// a field is a member-roster field if its return element (one hop into a connection's nodes) exposes a
+	// login AND is NOT itself an owner type — i.e. a roster of member USERS/mannequins, not an org-nav list.
+	rosterField := func(f *ast.FieldDefinition) bool {
+		rt := unwrap(f.Type)
+		def := s.schema.Types[rt]
+		if def == nil {
+			return false
+		}
+		if exposesLogin(rt) && !isOwner(rt) {
+			return true
+		}
+		for _, sub := range def.Fields {
+			if sub.Name == "nodes" {
+				if el := unwrap(sub.Type); exposesLogin(el) && !isOwner(el) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	// sponsors/sponsoring expose login-bearing Sponsor connections but are PUBLIC GitHub Sponsors data
+	// (round-22), not the private member roster — base-governed, not "members".
+	publicRosterFields := map[string]bool{"sponsors": true, "sponsoring": true}
+	ownerHierarchy := []string{"Organization", "Enterprise", "Team", "EnterpriseTeam", "EnterpriseOwnerInfo"}
 	exceptions := map[string]string{
-		"EnterpriseOwnerInfo": "reached only via Enterprise.ownerInfo, a marked Enterprise member field " +
-			"nulled with the enterprise",
+		"EnterpriseOwnerInfo": "reached only via Enterprise.ownerInfo, a marked Enterprise member field nulled with the enterprise",
 	}
 	markedSetOf := func(typ string) map[string]bool {
 		switch typ {
@@ -140,33 +180,30 @@ func TestOwnerPrivateCoverage(t *testing.T) {
 			return memberBearingNonOwnerTypes[typ]
 		}
 	}
-	for name, def := range s.schema.Types {
-		if def.Kind != ast.Object {
+	for _, name := range ownerHierarchy {
+		def := s.schema.Types[name]
+		if def == nil {
 			continue
 		}
 		var declared []string
 		for _, f := range def.Fields {
-			if memberIdentityFields[f.Name] {
+			if !publicRosterFields[f.Name] && rosterField(f) {
 				declared = append(declared, f.Name)
 			}
 		}
-		if len(declared) == 0 {
-			continue
-		}
-		if _, ok := exceptions[name]; ok {
+		if len(declared) == 0 || exceptions[name] != "" {
 			continue
 		}
 		marked := markedSetOf(name)
 		if marked == nil {
-			t.Errorf("type %q exposes member-identity fields %v but is NOT covered by owner-private redaction "+
-				"(not owner-marked, not in memberBearingNonOwnerTypes, not a justified exception) — navigation "+
-				"to it would leak members=\"none\" data; cover it or justify it", name, declared)
+			t.Errorf("owner-hierarchy type %q exposes member-roster fields %v but is NOT covered (not owner-marked, "+
+				"not in memberBearingNonOwnerTypes, not an exception) — navigation leaks members=\"none\" data", name, declared)
 			continue
 		}
 		for _, f := range declared {
 			if !marked[f] {
-				t.Errorf("type %q exposes member field %q its marked set omits — augment won't mark it, so it "+
-					"leaks under members=\"none\"", name, f)
+				t.Errorf("owner-hierarchy type %q exposes member-roster field %q its marked set omits — augment "+
+					"won't tag it, so it leaks under members=\"none\"", name, f)
 			}
 		}
 	}
