@@ -47,6 +47,23 @@ var enterpriseMemberFieldNames = map[string]bool{
 	"members": true, "administrators": true, "ownerInfo": true, "memberInvitations": true,
 }
 
+// userMarkerAlias marks a User reached as an interface/union possible type (Sponsorable/ProfileOwner/…)
+// when an owner-PRIVATE User field is selected, so RedactDeniedOwnerPrivate can null those fields for a
+// DENIED user. A User is NOT coarse-redacted like an Organization (it is reached everywhere as an
+// Actor/author, so coarse would null every user's data under default-deny) — only its curated private
+// fields are nulled, by the per-field response-key markers, and only when a private field is selected.
+const userMarkerAlias = "bghOwnerUserZ9"
+
+// userPrivateFields are User fields that are owner-private (GitHub Sponsors financials + org-verified
+// domain emails) and that also appear as Sponsorable common fields, so a denied User reached via an
+// interface field leaks them past the Organization-only owner marking (round-28). On Organization these
+// same fields are covered by the base-denied coarse redaction; on User they are nulled precisely.
+var userPrivateFields = map[string]bool{
+	"monthlyEstimatedSponsorsIncomeInCents": true, "estimatedNextSponsorsPayoutInCents": true,
+	"totalSponsorshipAmountAsSponsorInCents": true, "lifetimeReceivedSponsorshipValues": true,
+	"sponsorsActivities": true, "organizationVerifiedDomainEmails": true,
+}
+
 // memberBearingNonOwnerTypes are object types that are NOT themselves an owner (Organization/Enterprise)
 // but expose their owning org's/enterprise's member identity — Team (members/memberStatuses/invitations),
 // reachable by navigation (organization(){teams{nodes{members}}}). They have no owner-id scalar, so the
@@ -101,6 +118,30 @@ func RedactDeniedOwnerPrivate(v any, denied func(owner, resource string) bool) a
 func redactOwnerPrivate(v any, denied func(owner, resource string) bool, ambientOwner string) any {
 	switch val := v.(type) {
 	case map[string]any:
+		// A User is marked ONLY for its own owner-private fields (sponsors financials / verified-domain
+		// emails) and is NEVER coarse-redacted: null exactly the per-field-marked private fields when THIS
+		// user is base-denied, keeping all its public data (round-28).
+		if userLogin, ok := val[userMarkerAlias].(string); ok {
+			delete(val, userMarkerAlias)
+			var keys []string
+			for k := range val {
+				if strings.HasPrefix(k, ownerMemberMarkerPrefix) {
+					keys = append(keys, strings.TrimPrefix(k, ownerMemberMarkerPrefix))
+				}
+			}
+			for _, key := range keys {
+				delete(val, ownerMemberMarkerPrefix+key)
+				if denied(userLogin, "") {
+					if _, present := val[key]; present {
+						val[key] = nil
+					}
+				}
+			}
+			for k, c := range val {
+				val[k] = redactOwnerPrivate(c, denied, ambientOwner)
+			}
+			return val
+		}
 		effectiveOwner := ambientOwner
 		isOwnerObj := false
 		if o, ok := val[ownerMarkerAlias].(string); ok {
@@ -322,7 +363,8 @@ func usesReservedAlias(sels ast.SelectionSet, depth int) bool {
 				key = f.Name
 			}
 			if strings.HasPrefix(key, markerAlias) || strings.HasPrefix(key, markerTypeAlias) ||
-				strings.HasPrefix(key, ownerMarkerAlias) || strings.HasPrefix(key, ownerMemberMarkerPrefix) {
+				strings.HasPrefix(key, ownerMarkerAlias) || strings.HasPrefix(key, ownerMemberMarkerPrefix) ||
+				strings.HasPrefix(key, userMarkerAlias) {
 				// Reserve the whole marker namespace (exact aliases AND the per-member
 				// "markerAlias_Type" suffixes augment injects, plus the owner + per-member-field markers),
 				// so a client cannot pre-declare a look-alike key to spoof/suppress a tag and defeat redaction.
@@ -519,6 +561,51 @@ func (s *Schema) augment(sels *ast.SelectionSet, typeName string, budget *inject
 		*sels = append(*sels, s.ownerMarkerFragment(owner, orig))
 	}
 	budget.count(len(owners))
+	// User possible type of an interface/union (Sponsorable/ProfileOwner/Actor/…): inject a USER marker +
+	// per-field markers ONLY when an owner-private User field is selected, so a DENIED user's sponsors
+	// financials / verified-domain emails are nulled — without coarse-redacting the user (it is reached
+	// everywhere as an Actor/author) (round-28).
+	if s.unionHasUser(typeName) {
+		if frag := s.userMarkerFragment(orig); frag != nil {
+			*sels = append(*sels, frag)
+			budget.count(1)
+		}
+	}
+}
+
+// unionHasUser reports whether an interface/union has User as a possible type.
+func (s *Schema) unionHasUser(typeName string) bool {
+	def := s.schema.Types[typeName]
+	if def == nil || (def.Kind != ast.Interface && def.Kind != ast.Union) {
+		return false
+	}
+	for _, pt := range s.schema.PossibleTypes[typeName] {
+		if pt.Name == "User" {
+			return true
+		}
+	}
+	return false
+}
+
+// userMarkerFragment builds `... on User { bghOwnerUserZ9: login <bghOrgMemZ9_<key> per selected private field> }`
+// or nil when the sibling selection touches no owner-private User field.
+func (s *Schema) userMarkerFragment(siblingSels ast.SelectionSet) *ast.InlineFragment {
+	sel := ast.SelectionSet{&ast.Field{Alias: userMarkerAlias, Name: "login"}}
+	any := false
+	for _, ss := range siblingSels {
+		if f, ok := ss.(*ast.Field); ok && userPrivateFields[f.Name] {
+			key := f.Alias
+			if key == "" {
+				key = f.Name
+			}
+			sel = append(sel, &ast.Field{Alias: ownerMemberMarkerPrefix + key, Name: "__typename"})
+			any = true
+		}
+	}
+	if !any {
+		return nil
+	}
+	return &ast.InlineFragment{TypeCondition: "User", SelectionSet: sel}
 }
 
 // ownerMembers returns the Organization/Enterprise concrete possible types of an interface/union, so an
