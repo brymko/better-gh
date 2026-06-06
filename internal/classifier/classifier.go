@@ -811,6 +811,21 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					for _, res := range gqlOrgResources(s, fragments, budget) {
 						add(Scope{Org: login, Resource: res})
 					}
+					// user(login:)/repositoryOwner(login:) resolve to a USER node; when `login` is the
+					// custodian's OWN login GitHub returns the authenticated viewer and exposes the SAME
+					// owner-private User fields (email/gists/savedReplies/organizations/keys/…) the viewer
+					// root gates. But gqlOrgResources scopes only the 8 member/team keys, so every other
+					// private field degraded to one base org-read scope and leaked the custodian's account
+					// data on a floored token (round-34, the user(login:) sibling of the round-31 viewer fix).
+					// Un-floor them exactly as the viewer root does (collectViewerPrivateCategories walks the
+					// `... on User` inline fragments repositoryOwner uses). The organization root is EXCLUDED:
+					// an org login can never equal a USER login (shared namespace), so organization(login:)
+					// never resolves to the viewer — gating its base-read metadata would regress org reads.
+					if s.Name != "organization" {
+						for _, cat := range collectViewerPrivateCategories(s.SelectionSet, fragments, map[string]bool{}, depth+1, budget) {
+							add(Scope{UnscopedCategory: cat})
+						}
+					}
 					// Enumerating this owner's own repos/orgs is allowed; reaching forks/
 					// parents in other owners is not.
 					scanCrossRepoNav(s.SelectionSet, fragments, gqlForkNavFields, escapes, map[string]bool{}, depth+1, tooComplex, budget)
