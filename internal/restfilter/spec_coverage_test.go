@@ -83,12 +83,17 @@ var pathScopedSafeExceptions = map[string]string{
 	// creating an installation access token requires a GitHub App JWT the user-token custodian lacks;
 	// GitHub denies, so its repositories[] never reaches a proxy client.
 	"POST /app/installations/{installation_id}/access_tokens": "requires GitHub App JWT auth the user-token custodian lacks; GitHub denies",
-	// migration / variant-analysis responses echo the repos the CLIENT specified as targets in the
-	// request (and are gated behind migration / code-scanning write); not a new disclosure. The variant-
-	// analysis GET result form IS redacted (repoEnumOps + string-array + per-bucket count).
-	"POST /orgs/{org}/migrations": "echoes the client's own requested migration target repos; gated behind migration write",
-	"POST /user/migrations":       "echoes the client's own requested migration target repos; gated behind migration write",
-	"POST /repos/{owner}/{repo}/code-scanning/codeql/variant-analyses": "echoes the client's own requested scan target repos; gated behind code-scanning write (GET form is redacted)",
+	// the migration response echoes the repos named in the request body, but the classifier now scopes
+	// EVERY body `repositories[]` target as its own policy scope (bodyNamedRepoScopes), so a denied target
+	// is rejected at the front gate before any migration runs — the only repos that reach the response are
+	// ones the policy already allows. TestBodyNamedReposScoped proves this holds, so the exception cannot
+	// silently regress to the round-23 fail-open (a denied repo named in the body, unscoped, archived by the
+	// custodian). NOT the original false "client only names its own repos" justification.
+	"POST /orgs/{org}/migrations": "classifier body-scopes every repositories[] target (bodyNamedRepoScopes) → denied target rejected pre-response; see TestBodyNamedReposScoped",
+	"POST /user/migrations":       "classifier body-scopes every repositories[] target (bodyNamedRepoScopes) → denied target rejected pre-response; see TestBodyNamedReposScoped",
+	// (POST variant-analyses is NOT here: body-scoping covers repositories[]/repository_owners[], and the
+	// response is additionally content-scrubbed for the unresolvable repository_lists form — so it is
+	// covered by the normal path, not an exception.)
 }
 
 // TestSpecCoverage_NoPathScopedLeak is the strong, spec-grounded boundary guarantee: for EVERY operation,

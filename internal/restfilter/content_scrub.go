@@ -23,6 +23,12 @@ var contentRepoScrubOps = map[string][]string{
 	"/orgs/{org}/projectsV2/{project_number}/items":       {"content"},
 	"/user/{user_id}/projectsV2/{project_number}/drafts":  {"content"},
 	"/users/{username}/projectsV2/{project_number}/items": {"content"},
+	// A CodeQL variant-analysis (POST) echoes its target repos in scanned_repositories[].repository and
+	// skipped_repositories.*; the classifier scopes the `repositories[]`/`repository_owners[]` body forms,
+	// but the `repository_lists` form names a saved list the proxy can't resolve offline, so null these
+	// fields wholesale if any names a denied repo — closing the identity oracle for every target form
+	// (round-23). The per-repo RESULTS are fetched via a path-scoped GET, gated separately.
+	"/repos/{owner}/{repo}/code-scanning/codeql/variant-analyses": {"scanned_repositories", "skipped_repositories"},
 	// Codespace WRITE responses (create/update/start/stop) echo `repository` — the repo the codespace is
 	// for, a DIFFERENT repo than the unscoped /user/codespaces path. The GET forms are NeedsFilter-
 	// redacted, but the write path is not, so a token with `user` write + a per-repo `none` carve-out

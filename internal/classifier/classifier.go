@@ -137,6 +137,7 @@ func Classify(method, path string, body []byte) Result {
 		// redact (the foreign content has no per-element repository identity). Add each foreign owner
 		// as a scope the policy must allow, so an un-permitted fork is denied (round-16).
 		res.Additional = append(res.Additional, compareForkScopes(segments)...)
+		res.Additional = append(res.Additional, bodyNamedRepoScopes(method, segments, body)...)
 		return res
 	}
 
@@ -160,9 +161,10 @@ func Classify(method, path string, body []byte) Result {
 
 	if len(segments) >= 2 && segments[0] == "orgs" {
 		return Result{
-			Org:      segments[1],
-			Access:   access,
-			Resource: orgResource(segments),
+			Org:        segments[1],
+			Access:     access,
+			Resource:   orgResource(segments),
+			Additional: bodyNamedRepoScopes(method, segments, body),
 		}
 	}
 
@@ -177,6 +179,7 @@ func Classify(method, path string, body []byte) Result {
 	return Result{
 		Access:           access,
 		UnscopedCategory: restUnscopedCategory(segments),
+		Additional:       bodyNamedRepoScopes(method, segments, body), // /user/migrations names repos in its body
 	}
 }
 
@@ -491,6 +494,38 @@ func gqlOrgResources(orgField *ast.Field, fragments ast.FragmentDefinitionList, 
 	return out
 }
 
+// collectNamedChildFields returns the direct child fields named `name` in a selection set, descending
+// through inline fragments and fragment spreads (so `... on Repository { owner {…} }` and a spread are
+// found) but NOT into other fields' own sub-selections. Used to reach a repository root's `owner`
+// sub-selection so it can be org-scoped (round-23).
+func collectNamedChildFields(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, name string, seenFrags map[string]bool, depth int, budget *int) []*ast.Field {
+	if depth > maxGraphQLDepth {
+		return nil
+	}
+	var out []*ast.Field
+	for _, sel := range sels {
+		if visit(budget) {
+			return out
+		}
+		switch s := sel.(type) {
+		case *ast.Field:
+			if s.Name == name {
+				out = append(out, s)
+			}
+		case *ast.InlineFragment:
+			out = append(out, collectNamedChildFields(s.SelectionSet, fragments, name, seenFrags, depth+1, budget)...)
+		case *ast.FragmentSpread:
+			if !seenFrags[s.Name] {
+				seenFrags[s.Name] = true
+				if frag := fragments.ForName(s.Name); frag != nil {
+					out = append(out, collectNamedChildFields(frag.SelectionSet, fragments, name, seenFrags, depth+1, budget)...)
+				}
+			}
+		}
+	}
+	return out
+}
+
 func collectOrgResources(sels ast.SelectionSet, fragments ast.FragmentDefinitionList, set map[string]struct{}, baseGoverned *bool, seenFrags map[string]bool, depth int, budget *int) {
 	if depth > maxGraphQLDepth {
 		*baseGoverned = true
@@ -668,6 +703,19 @@ func collectGraphQLScopes(selections ast.SelectionSet, fragments ast.FragmentDef
 					// mixing a restricted resource with a sibling can't dodge its policy.
 					for _, res := range gqlRepoResources(s, fragments, budget) {
 						add(Scope{Owner: owner, Repo: name, Resource: res})
+					}
+					// The repo's owner is reachable via `owner { ... on Organization { membersWithRole /
+					// mannequins / auditLog / … } }`, returning the SAME owner-private member-identity data as
+					// the organization(login:) root — but the repository root never scoped it, so a
+					// [org.permissions] members="none" carve-out was bypassed on this second navigation path
+					// (round-23). Scope the owner sub-selection as an org exactly as the organization root does
+					// (gqlOrgResources reads gqlOrgFieldToResource), so the member-identity map gates it here too.
+					for _, ownerField := range collectNamedChildFields(s.SelectionSet, fragments, "owner", map[string]bool{}, depth+1, budget) {
+						for _, res := range gqlOrgResources(ownerField, fragments, budget) {
+							if res != "" { // base owner-metadata stays covered by the repo's own metadata scope
+								add(Scope{Org: owner, Resource: res})
+							}
+						}
 					}
 					scanCrossRepoNav(s.SelectionSet, fragments, gqlCrossRepoNavFields, escapes, map[string]bool{}, depth+1, tooComplex, budget)
 					continue
@@ -1092,6 +1140,50 @@ func parseSearchRepoQualifiers(query string) []ownerRepo {
 // (the path repo name — forks share it), so the policy must allow that fork too. The path owner
 // referenced as `owner:ref` is the same repo and is skipped. Best-effort on the repo name: a renamed
 // fork is the rare exception and mis-naming only ever fails an ALLOWED compare closed, never opens one.
+// bodyNamedRepoScopes scopes the FOREIGN repositories a REST request names in its JSON BODY (not its
+// path) — the migration and CodeQL variant-analysis endpoints, whose `repositories[]` (and the variant-
+// analysis `repository_owners[]`) target repos the broad custodian token, not the client, has the reach to
+// act on. Without scoping them, a client with org-migration / code-scanning write but a per-repo `none`
+// carve-out could name a DENIED repo and have the custodian migrate it (full archive exfiltration) or scan
+// it (round-23) — the REST-body analogue of compareForkScopes (round-16) / createCommitOnBranch (round-15).
+// Each named repo becomes a scope the policy must allow, so a denied target is rejected at the front gate.
+func bodyNamedRepoScopes(method string, segments []string, body []byte) []Scope {
+	if method != http.MethodPost || len(body) == 0 {
+		return nil
+	}
+	var resource string
+	switch {
+	case len(segments) == 3 && segments[0] == "orgs" && segments[2] == "migrations":
+		resource = "migrations"
+	case len(segments) == 2 && segments[0] == "user" && segments[1] == "migrations":
+		resource = "migrations"
+	case len(segments) == 6 && segments[0] == "repos" && segments[3] == "code-scanning" &&
+		segments[4] == "codeql" && segments[5] == "variant-analyses":
+		resource = restResource(segments) // the repo's code-scanning resource key
+	default:
+		return nil
+	}
+	var b struct {
+		Repositories     []string `json:"repositories"`
+		RepositoryOwners []string `json:"repository_owners"`
+	}
+	if json.Unmarshal(body, &b) != nil {
+		return nil // a body GitHub itself rejects (400) runs no migration/scan, so it discloses nothing
+	}
+	var out []Scope
+	for _, full := range b.Repositories {
+		if o, r, ok := splitOwnerRepo(full); ok {
+			out = append(out, Scope{Owner: o, Repo: r, Resource: resource})
+		}
+	}
+	for _, owner := range b.RepositoryOwners {
+		if owner != "" {
+			out = append(out, Scope{Org: owner, Resource: resource})
+		}
+	}
+	return out
+}
+
 func compareForkScopes(segments []string) []Scope {
 	if len(segments) < 4 {
 		return nil
