@@ -147,9 +147,9 @@ mode = "socket"        # "socket", "ghe", or "both"
 
 # Upstream GitHub token (one of):
 #   - set BGH_GITHUB_TOKEN env var, or
-#   - github_token = "ghp_..." below, or
+#   - github_token = "..." below, or
 #   - run 'bgh-proxy login' (device flow, like gh — no setup needed)
-# github_token = "ghp_..."
+# github_token = "..."
 # oauth_client_id = "Iv1...."   # optional: your own OAuth App for 'bgh-proxy login' (defaults to gh's)
 # oauth_scopes = "repo read:org gist workflow"
 

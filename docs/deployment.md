@@ -155,7 +155,7 @@ bgh-proxy serve                      # loopback proxy (127.0.0.1:7843) — NOT y
 > GitHub sign-in becomes the permanent owner. The moment Caddy is up, `/login/*` and `/ui` are
 > reachable by the whole internet, so a stranger who signs in first **takes over the deployment**.
 > Claim it yourself over loopback first (sign in at `https://127.0.0.1:7843/ui` on the proxy host,
-> accepting the self-signed cert — or pre-seed `BGH_GITHUB_TOKEN`), confirm `owner.json` exists,
+> accepting the self-signed cert — or, if you truly need headless bootstrap, pre-seed `BGH_GITHUB_TOKEN`), confirm `owner.json` exists,
 > and only then start Caddy:
 
 ```bash
@@ -254,8 +254,7 @@ mostly about protecting that host and knowing how to rotate/recover. Everything 
 > only stops *other users*; anyone who gains file read as the proxy's own UID — a same-uid process, a
 > misconfigured backup agent, a container-volume snapshot, or root — gets full custodian access. This
 > at-rest secret **is** the host's blast radius, so treat host file-read as full compromise: use
-> full-disk encryption and tight host access. A fine-grained PAT custodian (see the README's
-> "optional GitHub-enforced floor") bounds that blast radius to the PAT's repos.
+> full-disk encryption and tight host access.
 
 > **Inspect / triage before responding.** Confirm who owns the deployment via the startup log line
 > (`deployment owner login=…`) or `owner.json`, and enumerate outstanding client tokens with
@@ -293,10 +292,9 @@ Back these up **off-host, encrypted** — losing them loses access, leaking them
 ### Rotate the custodian / respond to compromise
 
 - **Rotate the custodian token** (e.g. on suspicion, or on a schedule): revoke the proxy's OAuth
-  authorization at <https://github.com/settings/connections/applications> (or the fine-grained PAT
-  at its settings page if you pre-seeded one), then sign in again — the new sign-in re-captures a
-  fresh token into `owner.json`. For a pre-seeded `BGH_GITHUB_TOKEN`/`github_token`, rotate at
-  GitHub and update the env/file.
+  authorization at <https://github.com/settings/connections/applications>, then sign in again — the
+  new sign-in re-captures a fresh token into `owner.json`. For a pre-seeded `BGH_GITHUB_TOKEN` /
+  `github_token`, revoke or rotate that token at GitHub and update the env/file.
 - **Rotate the admin secret** (`~/.config/bgh/admin-secret`): this is a **second, independent**
   full-token-minting credential — the admin API (`POST /api/tokens` on `admin_bind`) mints a token
   with **any** policy on the admin secret alone, with **no** GitHub-owner check. It is auto-created

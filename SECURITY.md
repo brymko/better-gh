@@ -40,8 +40,7 @@ These are accepted trade-offs of being a policy proxy over a broad token, docume
 [README.md](README.md) ("What is *not* a boundary") and [SPEC.md](SPEC.md):
 
 - **GraphQL counts/aggregates** (`totalCount`, `search` `*Count`) reveal *how many* denied items
-  match — an existence oracle on counts, not contents. A fine-grained PAT custodian closes this at
-  the source.
+  match — an existence oracle on counts, not contents.
 - **GraphQL `errors`** may echo a repo *name* a query references. Contents are isolated; the
   existence/name of a referenced repo is not.
 - **Host compromise** exposes the plaintext custodian token (encrypted-at-rest is a non-goal).

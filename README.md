@@ -25,9 +25,10 @@ go build -o bgh-proxy ./cmd/bgh-proxy/
 # Initialize (generates TLS certs, example config/policy)
 bgh-proxy init
 
-# Give the proxy an upstream GitHub token — either:
-export BGH_GITHUB_TOKEN=$(gh auth token)        # reuse an existing token, or
+# Give the proxy an upstream GitHub token — usually:
 bgh-proxy login                                 # log in like gh (device flow), no setup
+# Or, for headless bootstrap / CI only:
+export BGH_GITHUB_TOKEN=$(gh auth token)
 
 # Edit the policy
 $EDITOR ~/.config/bgh/policy.toml
@@ -49,15 +50,19 @@ gh config set http_unix_socket ~/.config/bgh/proxy.sock
 
 The proxy uses one real GitHub token to reach `api.github.com` (the **custodian**). You don't have to pre-provide it: the **first GitHub sign-in** (web `/ui` or `gh auth login`) captures that account's token as the custodian and claims the deployment (trust-on-first-use; recorded in `~/.config/bgh/owner.json`, `0600`). After that, only that same account can sign in, and each sign-in refreshes the captured token. This is the easiest path — just start the proxy and sign in.
 
-If you'd rather **pre-seed** a custodian (so the proxy can forward before the first sign-in, e.g. for CI), provide one of these — they become the fallback custodian until a sign-in claims ownership:
-
-1. **A fine-grained PAT** — *Settings → Developer settings → Fine-grained tokens*, scoped as narrowly as possible, set as `BGH_GITHUB_TOKEN` or `github_token`. **Narrowest; recommended for high-stakes setups.**
-2. **Reuse an existing token** — `export BGH_GITHUB_TOKEN=$(gh auth token)`. Quickest, but as broad as your `gh` login.
-3. **`bgh-proxy login` (device flow)** — writes a `gho_` token (gh's public app, no registration) to `~/.config/bgh/github-token`.
-
-The captured/sign-in token carries gh's standard scopes (`repo read:org gist workflow`); a pre-seeded fine-grained PAT is narrower. Storage is plaintext (`0600`); encrypted-at-rest is a non-goal.
+If you'd rather **pre-seed** a custodian (so the proxy can forward before the first sign-in, e.g. for CI), set `BGH_GITHUB_TOKEN`, `github_token`, or run `bgh-proxy login` ahead of time. That token is only a **fallback custodian** until a GitHub sign-in claims ownership. This is a bootstrap / headless escape hatch, not the preferred model; the intended path is still “start the proxy, sign in, let the proxy hold the broad token, and enforce the boundary itself.”
 
 The token is stored in plaintext (`github-token`, mode `0600`), same as the env/config options — encrypted storage is not implemented. Whichever you choose, the proxy then narrows access per client via policy.
+
+## Why PATs are cringe
+
+GitHub's fine-grained PAT model is a bad fit for this project:
+
+- A fine-grained PAT is limited to resources owned by a **single** user or organization, and GitHub explicitly calls out [using one fine-grained PAT across multiple organizations](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) as a limitation. If your real access spans org A and org B, one PAT does not solve it.
+- Org approval and review are also per-organization, so cross-org use turns into token sprawl and approval churn instead of one coherent boundary.
+- Even when a PAT works, it still does **not** express this project's actual policy model: per-client, per-repo, per-org, per-resource read/write rules. You still need a separate policy boundary in front of it.
+- So the project model is: hold one broad custodian on the proxy host, then enforce the real boundary in the proxy. A pre-seeded token is only a bootstrap escape hatch, not the design center.
+
 
 ## Two modes
 
@@ -228,7 +233,7 @@ When the classifier identifies a specific resource within a repo-scoped request,
 | `keys` | `keys`, `deploy-keys` | — |
 | `metadata` | `stargazers`, `subscribers`, `topics`, `languages`, `tags`, `forks`, `contributors`, `collaborators`, `teams`, `license`, `community`, `traffic`, repo root | `name`, `owner`, `url`, `id`, `isPrivate`, `stargazers`, etc. |
 
-> **Caveat:** several privacy/admin-sensitive sub-resources collapse into the coarse `metadata` key and **cannot be denied independently** of general repo metadata — notably `traffic` (clone/view analytics, normally admin-only), the `collaborators` roster, and `teams`. If those matter, deny the whole repo (`access = "none"`) rather than relying on a per-resource carve-out, or scope the custodian with a fine-grained PAT that excludes them.
+> **Caveat:** several privacy/admin-sensitive sub-resources collapse into the coarse `metadata` key and **cannot be denied independently** of general repo metadata — notably `traffic` (clone/view analytics, normally admin-only), the `collaborators` roster, and `teams`. If those matter, deny the whole repo (`access = "none"`) rather than relying on a per-resource carve-out.
 
 > **Spell `[repo.permissions]` keys exactly as in the first column above.** A `[repo.permissions]` key that is **not** one of these is **rejected** — `bgh-proxy serve` refuses to start on a typo in `policy.toml`, and the mint paths (CLI/admin API, owner console, `gh auth login`) reject it with an error. (Earlier builds silently accepted a misspelled key like `contnets = "none"`; because it matched no request, the per-resource `none` was silently ignored and the resource fell back to the rule's base access — a fail-open footgun, now closed.) Note this validation covers **repo** keys; **org** per-resource keys are open-ended (any org subpath segment, e.g. `members`, `blocks`) and are **not** checked against a fixed list — so a misspelled `[org.permissions]` key **silently fails open** (the real resource falls back to the rule's base access). Org keys *are* matched case-insensitively, but for an org-direct deny carve-out, double-check the segment name or deny at the base access level. (The GraphQL owner-root fields `membersWithRole`/`teams` are enforced against the `members`/`teams` keys, matching the REST `/orgs/{org}/{members,teams}` paths.)
 
@@ -499,7 +504,7 @@ bind = "127.0.0.1:7843"           # GHE HTTPS listener
 admin_bind = "127.0.0.1:7844"     # Admin UI (plain HTTP, loopback)
 socket = "~/.config/bgh/proxy.sock"
 mode = "socket"                   # "socket", "ghe", or "both"
-# github_token = "ghp_..."        # optional fallback custodian (or BGH_GITHUB_TOKEN); the first sign-in captures one
+# github_token = "..."          # optional fallback custodian; the first sign-in captures one
 # external_url = "https://proxy.example.com"  # public URL when behind a TLS-terminating front (Tailscale/Caddy) — used in the device-flow verification URL
 # oauth_client_id = "..."         # OAuth app for sign-in / `bgh-proxy login` (default: gh's public app, no registration); for `bgh-proxy login` the BGH_OAUTH_CLIENT_ID env var / --client-id flag override this
 # oauth_scopes = "repo read:org gist workflow"  # scopes captured as the custodian on sign-in
@@ -568,16 +573,14 @@ The proxy holds one **powerful upstream GitHub token** — by default the broad 
 **What is *not* a boundary** — read these before trusting it:
 - **Per-resource redaction is driven by the schema's own categorization.** The filter tags each object with its GraphQL type and enforces per-resource policy (e.g. `pulls = "none"`, `deployments = "none"`) on it wherever it appears — entry point *and* navigation. The type→resource map is **derived from each type's `@docsCategory` directive in GitHub's embedded schema** (with a few overrides where the category names a different axis, e.g. commit statuses → `checks`, git refs → `branches`), and a build-time invariant (`gqlfilter.TestR15_TypeResourceCoverageInvariant`) fails the build if any repo-scoped type in the embedded schema whose category is a real per-resource key would map to `metadata`. A repo-scoped type whose `@docsCategory` has **no** dedicated per-resource key (discussions, projects, packages, security-advisories, …) falls back to the rule's base access; such types have no per-resource policy key to enforce anyway.
 - **Only response `data` is redacted, not GraphQL `errors`.** A denied/absent repo's *name* can still surface in an upstream error message (e.g. "Could not resolve to a Repository …"). This isolates repo *contents*, not the existence/names of repos a query already references.
-- **Counts and aggregates leak; only contents are redacted.** The filter removes denied-repo *objects* from a GraphQL response, but a connection's `totalCount` / `search`'s `issueCount`/`repositoryCount`/`discussionCount` are scalars computed by GitHub over the full (pre-redaction) set, so they reveal *how many* denied items matched — and `totalCount − len(nodes)` discloses the hidden count regardless of how elements are dropped. In particular `search(query:"<text>", type:ISSUE){ issueCount }` is an existence oracle for issue/PR/discussion *text* in denied repos, and `viewer { repositories { totalCount } }` leaks the custodian token's repo breadth. This is not soundly closable in the response filter (count fields can be aliased, `totalCount` is a cross-page total, and stripping counts would break legitimate counts on *allowed* repos), so it is an **accepted residual** of being a policy proxy over a broad token: contents are redacted, counts/existence are not. (The REST `/search` `total_count` is opportunistically rewritten to the kept count; GraphQL counts are not. A fine-grained PAT custodian would stop GitHub counting denied repos at the source, but that's opt-in — see the last bullet.)
-- **Only the GitHub API is proxied, not git.** The proxy serves `/api/v3` + `/api/graphql` (plus `/login`/`/ui`), not git transport — so `gh repo clone` / `git push` *through the proxy* fail (it is not a git server), and git traffic is never carried or filtered by it. Policy governs **API** access (including reading file contents via the `contents` API); cloning or pushing a repo's code over git is out of scope. A client that also holds a direct `github.com` credential can run git (and API) straight to GitHub, bypassing the proxy entirely — see [docs/deployment.md](docs/deployment.md) "Client gotchas".
-- **An optional fine-grained PAT custodian is the *only* way to get a GitHub-enforced floor — and it runs against the project's grain.** By default the custodian is your broad sign-in token and the proxy is the sole boundary. If you pre-seed a fine-grained PAT (`BGH_GITHUB_TOKEN` / `github_token`) scoped to only the repos the proxy should reach, GitHub itself bounds every request — typed or not, listed or not — so the residuals above (the count oracle and a host compromise's blast radius) collapse to what that PAT can see. But this re-introduces exactly the coarse-PAT management this project exists to avoid, so it's a deliberate trade-off for high-stakes setups, **not** the recommended default.
+- **Counts and aggregates leak; only contents are redacted.** The filter removes denied-repo *objects* from a GraphQL response, but a connection's `totalCount` / `search`'s `issueCount`/`repositoryCount`/`discussionCount` are scalars computed by GitHub over the full (pre-redaction) set, so they reveal *how many* denied items matched — and `totalCount − len(nodes)` discloses the hidden count regardless of how elements are dropped. In particular `search(query:"<text>", type:ISSUE){ issueCount }` is an existence oracle for issue/PR/discussion *text* in denied repos, and `viewer { repositories { totalCount } }` leaks the custodian token's repo breadth. This is not soundly closable in the response filter (count fields can be aliased, `totalCount` is a cross-page total, and stripping counts would break legitimate counts on *allowed* repos), so it is an **accepted residual** of being a policy proxy over a broad token: contents are redacted, counts/existence are not. (The REST `/search` `total_count` is opportunistically rewritten to the kept count; GraphQL counts are not.)
 - It does not authenticate *which* local process uses the socket, only that it is your user.
 - mTLS / per-identity client certs are not implemented; GHE-mode identity is the bearer proxy token.
 
 ## Deployment & operations
 
 - **Rotation, backup & incident response.** See [docs/deployment.md](docs/deployment.md) → "Operations & incident response" for the full runbook: rotating the captured custodian token, **rotating the `admin-secret`** (delete the `admin-secret` file and restart — note that rotating the custodian or deleting `owner.json` does **not** invalidate it; it independently mints full-access tokens), clearing a pre-seeded fallback custodian, backing up `owner.json`/`tokens.json`/`admin-secret`, shipping the audit log off-host, and responding to host / owner-account / client-token compromise.
-- **Token custody.** The real GitHub token sits on the proxy host (**plaintext** — encrypted storage is not implemented), and by default it is your **broad sign-in token**: full `repo` access to everything you can see. Whoever can read the host's memory/config has all of that. The proxy concentrates one powerful credential on one host *by design* — so that clients never hold it — which makes **protecting that host paramount** (it is the thing the whole model trades for client-side safety). Optionally pre-seeding a fine-grained PAT as the custodian bounds a host compromise to that PAT's repos, at the cost of the coarse-PAT management this project avoids.
+- **Token custody.** The real GitHub token sits on the proxy host (**plaintext** — encrypted storage is not implemented), and by default it is your **broad sign-in token**: full `repo` access to everything you can see. Whoever can read the host's memory/config has all of that. The proxy concentrates one powerful credential on one host *by design* — so that clients never hold it — which makes **protecting that host paramount** (it is the thing the whole model trades for client-side safety).
 - **Bind loopback.** `admin_bind` is plain HTTP and the proxy `bind` (GHE) is HTTPS with a self-signed cert. Keep both on loopback unless you mean to expose them; a non-loopback `admin_bind` sends the admin secret in cleartext (the server logs a warning). For remote clients, front the GHE listener with your own TLS/network controls.
 - **Rate limits.** All proxied traffic *and* node-ID resolution calls consume the single upstream token's rate limit. A mutation or a `node(id:)`/`nodes(ids:)` read adds one batched GraphQL `nodes(ids:)` call for its uncached node IDs (resolved repository mappings are cached 30 min; non-repo and unresolved results are not cached). Resolution is gated on the policy being able to act at that level — writes need a write grant, reads a read grant — and capped at 100 IDs/request, but not otherwise throttled, so a token can spend some GraphQL budget resolving IDs in repos it can't ultimately access.
 - **Fail-closed effects.** When the resolver can't reach GitHub or is rate-limited, mutations are denied. Over-complex GraphQL and node types the resolver doesn't recognize are denied. Plan for "denied" being the safe failure during upstream trouble.

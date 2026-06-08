@@ -1377,9 +1377,9 @@ var strippedResponseHeaders = map[string]bool{
 	"Content-Encoding":        true,
 	"X-Oauth-Scopes":          true,
 	"X-Accepted-Oauth-Scopes": true,
-	// X-Accepted-Github-Permissions discloses the endpoint's required fine-grained permission set AND, by its
-	// presence, that the custodian is a fine-grained PAT / GitHub-App user token (the loginflow-minted class) —
-	// the same custodian-property disclosure class as the OAuth-scopes headers; strip it (round-43 F7).
+	// X-Accepted-Github-Permissions discloses the endpoint's required fine-grained permission set and,
+	// by its presence, extra custodian properties; strip it as the same disclosure class as the
+	// OAuth-scopes headers (round-43 F7).
 	"X-Accepted-Github-Permissions": true,
 	"X-Oauth-Client-Id":             true,
 	"X-Github-Sso":                  true,
