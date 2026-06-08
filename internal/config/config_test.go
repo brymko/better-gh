@@ -167,8 +167,8 @@ func TestLoadNonexistentFileUsesDefaults(t *testing.T) {
 	if cfg.AdminBind != "127.0.0.1:7844" {
 		t.Errorf("expected default admin_bind, got %q", cfg.AdminBind)
 	}
-	if cfg.Mode != "both" {
-		t.Errorf("expected default mode=both, got %q", cfg.Mode)
+	if cfg.Mode != "socket" {
+		t.Errorf("expected default mode=socket, got %q", cfg.Mode)
 	}
 }
 

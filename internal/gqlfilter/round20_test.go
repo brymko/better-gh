@@ -95,8 +95,8 @@ func TestR20_RepoIdentityNoPathRedaction(t *testing.T) {
 	}
 }
 
-// Round-20: the drift guard helper recognizes known object types and rejects unknown ones, so the
-// proxy callback can fail closed on a repo-marked object whose runtime __typename is schema drift.
+// Round-20: the known-type helper recognizes embedded-schema object types and rejects unknown ones, so
+// the proxy callback can fail closed on a repo-marked object whose runtime __typename is unknown.
 func TestR20_IsKnownObjectType(t *testing.T) {
 	s, err := Load()
 	if err != nil {
@@ -106,6 +106,6 @@ func TestR20_IsKnownObjectType(t *testing.T) {
 		t.Errorf("known object types reported unknown")
 	}
 	if s.IsKnownObjectType("DefinitelyNotARealType_R20") {
-		t.Errorf("unknown drift type reported known")
+		t.Errorf("unknown type reported known")
 	}
 }

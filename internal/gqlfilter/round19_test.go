@@ -33,7 +33,7 @@ func TestR19_EventRepoPathOwnership(t *testing.T) {
 	}
 	for _, typ := range mustNoPath {
 		if s.schema.Types[typ] == nil {
-			continue // schema refresh removed it; nothing to assert
+			continue // type absent from the embedded schema; nothing to assert
 		}
 		if s.repoScoped[typ] {
 			t.Errorf("%s is repoScoped via %q but its only repo link is FOREIGN; expected repoOwnedNoPath", typ, firstHop(typ))
@@ -65,9 +65,8 @@ func TestR19_EventRepoPathOwnership(t *testing.T) {
 
 // TestR19_NoForeignDirectRepositoryPath is the PERMANENT guard for the round-19 F2 class: no
 // repo-scoped type may derive its repository through a DIRECT Repository field whose name is not
-// the canonical `repository` membership. A schema refresh that introduces a new foreign direct-
-// Repository link (e.g. someOtherRepository: Repository) and lets deriveRepoPaths follow it fails
-// the build here instead of silently mis-attributing — and leaking — that type's data.
+// the canonical `repository` membership. Foreign direct-Repository links in the embedded schema must not let deriveRepoPaths silently
+// mis-attribute — and leak — that type's data.
 func TestR19_NoForeignDirectRepositoryPath(t *testing.T) {
 	s, err := Load()
 	if err != nil {

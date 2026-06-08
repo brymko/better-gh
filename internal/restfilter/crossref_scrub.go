@@ -25,9 +25,8 @@ package restfilter
 // denied; "$.*parent.full_name" nulls the response's own parent object when denied.
 //
 // Maintenance: this is intentionally hand-maintained — the cross-ref-content pattern is rare and
-// structural, and a regeneration of openapi_table.go does NOT touch this file. When refreshing
-// against a new GitHub OpenAPI spec, audit sibling endpoints that embed a cross-referenced/source/
-// fork/parent object and add them here.
+// structural, and generated enum locations do NOT touch this file. The coverage tests keep the
+// current embedded spec bounded by requiring sibling cross-reference/source/fork/parent objects here.
 
 // eventForeignRepoLocs are the cross-ref repo objects an activity-event element can embed: the new
 // fork (ForkEvent.payload.forkee) and a PR's head/base repo (PullRequestEvent etc.). Each is nulled

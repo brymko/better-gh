@@ -38,8 +38,7 @@ func TestR15_FilterResourceFromDocsCategory(t *testing.T) {
 }
 
 // Build-time invariant: every repo-scoped OBJECT type whose @docsCategory is a real per-resource key
-// MUST map to that resource (never silently "metadata"), so a schema refresh can't reintroduce the
-// round-15 fail-open. Mirrors TestSchemaCoverageInvariant for the marker machinery.
+// MUST map to that resource (never silently "metadata"), preventing the round-15 fail-open. Mirrors TestSchemaCoverageInvariant for the marker machinery.
 func TestR15_TypeResourceCoverageInvariant(t *testing.T) {
 	s, err := Load()
 	if err != nil {
@@ -73,7 +72,7 @@ func TestR15_TypeResourceCoverageInvariant(t *testing.T) {
 	}
 }
 
-// The node resolver relies on IsKnownNodeObjectType to fail closed on drift; sanity-check the set.
+// The node resolver relies on IsKnownNodeObjectType to fail closed on unknown types; sanity-check the set.
 func TestR15_KnownNodeObjectTypes(t *testing.T) {
 	s, err := Load()
 	if err != nil {
@@ -84,7 +83,7 @@ func TestR15_KnownNodeObjectTypes(t *testing.T) {
 			t.Errorf("%s should be a known Node object type", known)
 		}
 	}
-	if s.IsKnownNodeObjectType("NewlyAddedRepoScopedType") {
-		t.Error("an unknown (drift) type must NOT be a known Node object type")
+	if s.IsKnownNodeObjectType("UnknownRepoScopedType") {
+		t.Error("an unknown type must NOT be a known Node object type")
 	}
 }

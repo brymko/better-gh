@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"better-gh/internal/audit"
 	"better-gh/internal/gqlfilter"
 	"better-gh/internal/policy"
 )
@@ -42,7 +41,7 @@ func TestSec_E2E_RestEnumerationFiltered(t *testing.T) {
 		},
 	}
 	h := &Handler{
-		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		GithubToken: "t", Store: mustStore(t), Audit: testAuditLogger(t),
 		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol,
 		UpstreamURL: upstream.URL, GQLFilter: sch,
 	}

@@ -39,7 +39,7 @@ func TestR29_ConcreteAndInlineUserMarked(t *testing.T) {
 	}
 }
 
-// TestR29_UserMarkerInjectionInvariant is the marker-INJECTION drift guard (the meta-fix): for every field
+// TestR29_UserMarkerInjectionInvariant is the marker-INJECTION coverage guard (the meta-fix): for every field
 // whose unwrapped type is concrete User and every interface/union with a User possible type, selecting a
 // userPrivateField — directly AND inside `... on User` — must yield the user marker in the augmented query.
 func TestR29_UserMarkerInjectionInvariant(t *testing.T) {

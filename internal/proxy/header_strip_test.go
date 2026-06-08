@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"better-gh/internal/audit"
 	"better-gh/internal/gqlfilter"
 	"better-gh/internal/policy"
 )
@@ -27,7 +26,7 @@ func TestSec_E2E_UpstreamTokenHeadersStripped(t *testing.T) {
 	pol := &policy.Policy{Defaults: policy.Defaults{Mode: policy.ModeDeny},
 		Repo: []policy.RepoRule{{Name: "o/r", Access: policy.AccessRead}}}
 	h := &Handler{
-		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		GithubToken: "t", Store: mustStore(t), Audit: testAuditLogger(t),
 		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol, UpstreamURL: upstream.URL,
 	}
 	srv := httptest.NewServer(h)
@@ -69,7 +68,7 @@ func TestSec_E2E_NotificationsFiltered(t *testing.T) {
 		},
 	}
 	h := &Handler{
-		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		GithubToken: "t", Store: mustStore(t), Audit: testAuditLogger(t),
 		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol, UpstreamURL: upstream.URL, GQLFilter: sch,
 	}
 	srv := httptest.NewServer(h)
@@ -86,5 +85,52 @@ func TestSec_E2E_NotificationsFiltered(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "ALLOWED_TITLE") {
 		t.Errorf("/notifications dropped an allowed notification: %s", body)
+	}
+}
+
+func TestSec_E2E_FilteredRESTHeadersStripPaginationAndValidators(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Link", `<https://api.github.com/user/repos?page=2>; rel="next"`)
+		w.Header().Set("ETag", `"upstream-etag"`)
+		w.Header().Set("Last-Modified", "Mon, 01 Jan 2024 00:00:00 GMT")
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.Header().Set("X-GitHub-Request-Id", "req-1")
+		io.WriteString(w, `[{"full_name":"allowed-org/pub"},{"full_name":"blocked-org/secret"}]`)
+	}))
+	t.Cleanup(upstream.Close)
+	pol := &policy.Policy{
+		Defaults: policy.Defaults{Mode: policy.ModeDeny, Unscoped: map[string]policy.Access{"user": policy.AccessRead}},
+		Repo: []policy.RepoRule{
+			{Name: "allowed-org/pub", Access: policy.AccessRead},
+			{Name: "blocked-org/secret", Access: policy.AccessNone},
+		},
+	}
+	h := &Handler{
+		GithubToken: "t", Store: mustStore(t), Audit: testAuditLogger(t),
+		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol, UpstreamURL: upstream.URL,
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/user/repos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if strings.Contains(string(body), "blocked-org/secret") {
+		t.Fatalf("filtered body leaked denied repo: %s", body)
+	}
+	for _, h := range []string{"Link", "Etag", "Last-Modified"} {
+		if v := resp.Header.Get(h); v != "" {
+			t.Fatalf("%s should be stripped from filtered response, got %q", h, v)
+		}
+	}
+	if resp.Header.Get("X-Ratelimit-Remaining") != "4999" {
+		t.Fatalf("rate-limit header should remain on filtered response")
+	}
+	if resp.Header.Get("X-Github-Request-Id") != "req-1" {
+		t.Fatalf("request-id header should remain on filtered response")
 	}
 }

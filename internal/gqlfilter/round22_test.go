@@ -95,9 +95,8 @@ func TestR22_CrossReferencedEventURIScrub(t *testing.T) {
 	}
 }
 
-// TestR22_CrossRepoURIScrubCoverage is the drift guard: crossRepoURIScrubTypes must equal the schema-
-// derived set of repoOwnedNoPath types exposing BOTH isCrossRepository AND a url/resourcePath scalar, so a
-// schema refresh that adds another such cross-repository event type cannot silently leak its foreign URL.
+// TestR22_CrossRepoURIScrubCoverage is the coverage guard: crossRepoURIScrubTypes must equal the schema-
+// derived set of repoOwnedNoPath types exposing BOTH isCrossRepository AND a url/resourcePath scalar, so cross-repository event types in the embedded schema cannot silently leak their foreign URL.
 func TestR22_CrossRepoURIScrubCoverage(t *testing.T) {
 	s, _ := Load()
 	want := map[string]bool{}
@@ -120,7 +119,7 @@ func TestR22_CrossRepoURIScrubCoverage(t *testing.T) {
 		}
 	}
 	if !reflect.DeepEqual(want, crossRepoURIScrubTypes) {
-		t.Fatalf("crossRepoURIScrubTypes drift: schema-derived=%v static=%v — a new cross-repo URI event "+
+		t.Fatalf("crossRepoURIScrubTypes mismatch: schema-derived=%v static=%v — a cross-repo URI event "+
 			"type is unguarded; add it (and verify scrubCrossRepoURIScalars handles its URL shape)", want, crossRepoURIScrubTypes)
 	}
 }

@@ -78,7 +78,7 @@ func classifierScopesOrgR35(r Result, org string) bool {
 // the custodian's OWN tier price / payment source; sponsorsListing was here until round-42 F1 showed the
 // OWNER's own listing exposes activeStripeConnectAccount/contactEmailAddress — both are now in
 // gqlfilter.userPrivateFields, gated on user_private on User AND Organization nav paths.) Kept as an
-// (empty) exemption hook so a future justified viewer-relative-public field has a documented home.
+// (empty) exemption hook so a additional justified viewer-relative-public field has a documented home.
 var r35ViewerRelativePublic = map[string]bool{}
 
 // TestR35_UserPrivateFieldSetsCoupled is the cross-package coupling guard the round-31/34 work lacked: it
@@ -87,8 +87,8 @@ var r35ViewerRelativePublic = map[string]bool{}
 // — the response-side set that nulls a navigated User's private fields. Without this coupling the two sets
 // drifted (round-35: the classifier gated ~33 fields, gqlfilter nulled only 11 sponsors fields), so the
 // custodian's email/SECRET-gists/savedReplies/keys leaked via an author/uploadedBy edge that bypasses the
-// front gate. A schema refresh or future round that adds a private viewer field to one side now fails the
-// build unless it is added to BOTH (or justified as viewer-relative-public).
+// front gate. A private viewer field present on one side now fails the build unless it is added to BOTH
+// (or justified as viewer-relative-public).
 func TestR35_UserPrivateFieldSetsCoupled(t *testing.T) {
 	s, err := gqlfilter.Load()
 	if err != nil {

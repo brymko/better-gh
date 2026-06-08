@@ -36,7 +36,7 @@ type Schema struct {
 	repoPath                  map[string][]pathStep // type name -> no-arg field path to its repo's nameWithOwner
 	nodeResolveQuery          string                // nodes(ids:) query covering every repo-scoped Node type
 	typeRes                   map[string]string     // object type -> per-resource policy key (derived from @docsCategory + overrides)
-	nodeTypes                 map[string]bool       // object types implementing Node (recognized by this snapshot)
+	nodeTypes                 map[string]bool       // object types implementing Node (recognized by the embedded schema)
 	repoOwnedNoPath           map[string]bool       // concrete OBJECT types (Node or not) that belong to a repo (by @docsCategory) but have NO derivable repoPath
 	repoIdentityNoPath        map[string]bool       // Node types exposing a repo-identity scalar (nameWithOwner) but neither repoScoped nor repoOwnedNoPath
 	repoIdentityScalar        map[string]string     // repoIdentityNoPath type -> its repo-identity scalar field ("nameWithOwner" preferred; else "repositoryName")
@@ -75,8 +75,7 @@ var repoOwnedCategories = map[string]bool{
 // object reached by navigation (e.g. repository{submodules{gitUrl}} leaked .gitmodules under
 // contents="none"). Including them lets augment() inject a type-only marker so the filter attributes
 // each to its nearest marked ancestor's repository and enforces s.FilterResource(type) there
-// (fail-closed when no ancestor repo). Deriving from @docsCategory (not a hand-maintained list) means
-// a schema refresh that introduces another such type is covered automatically. The node resolver,
+// (fail-closed when no ancestor repo). Deriving from @docsCategory (not a hand-maintained list) keeps the embedded schema covered automatically. The node resolver,
 // which also reads this set (IsRepoOwnedUnattributableNodeType), only ever sees Node typenames, so the
 // added non-Node entries never change its behavior — they only widen the response filter's coverage.
 func deriveRepoOwnedNoPath(schema *ast.Schema, repoPath map[string][]pathStep) map[string]bool {
@@ -268,7 +267,7 @@ var typeResourceOverride = map[string]string{
 	// rule for a ref (allowsForcePushes/requiredApprovingReviewCount/requiredStatusCheckContexts/…), the
 	// "branches" resource — like its sibling BranchProtectionRule and Ref. It is reachable only via the
 	// branches-gated Ref.refUpdateRule today (so masked), but pinning it keeps the per-resource axis
-	// correct if a future schema adds a non-branches path to it (round-20). Guarded by the extended
+	// correct for every path to it (round-20). Guarded by the extended
 	// repoOwnedNoPath resource invariant below.
 	"RefUpdateRule": "branches",
 	// CommitComment is @docsCategory "commits" but the REST surface gates a commit comment as the
@@ -305,8 +304,8 @@ func deriveTypeResources(schema *ast.Schema) map[string]string {
 
 // deriveNodeObjectTypes is the set of OBJECT types that implement Node (the only types nodes(ids:)
 // can return). The node resolver uses it to fail closed on a node whose runtime __typename the
-// embedded snapshot does not recognize (live schema drift) rather than treating it as a
-// constraint-free non-repo node (round-15).
+// embedded schema does not recognize rather than treating it as a constraint-free non-repo node
+// (round-15).
 func deriveNodeObjectTypes(schema *ast.Schema) map[string]bool {
 	out := map[string]bool{}
 	for _, d := range schema.PossibleTypes["Node"] {
@@ -324,8 +323,7 @@ func deriveNodeObjectTypes(schema *ast.Schema) map[string]bool {
 //
 // The Repository-typed links are joined by the head-side Ref/GitObject links: a PR/comparison's
 // head ref/target can live in a FORK. Following headRef mis-attributed HeadRefDeletedEvent to the
-// fork (audit round-14 hardening) — wrong-repo over-redaction today, a latent leak under schema
-// drift. The own-repo side (baseRef/baseTarget/mergeCommit — a PR's base/merge are in the repo
+// fork (audit round-14 hardening) — wrong-repo over-redaction today, and would be a leak if accepted as an own-repo path. The own-repo side (baseRef/baseTarget/mergeCommit — a PR's base/merge are in the repo
 // itself) is intentionally NOT excluded, so own-repo-only types (Comparison, MergeBranchPayload)
 // keep their correct path; types whose ONLY link is head-side become non-repo-scoped and are gated
 // by their already-tagged parent (the PR's Repository container), which is sound.
@@ -629,7 +627,7 @@ func renderPathSelection(alias string, path []pathStep) string {
 // IsOwnerPrivateType reports whether typeName's @docsCategory marks it as owner-private (org/user/
 // enterprise/gists/projects/migrations/sponsors/…) — categories whose data is not repo-attributable and
 // must be policy-gated. The classifier's viewer coverage guard uses it to DERIVE (not hand-list) which
-// viewer sub-fields expose owner-private data, so a schema refresh adding one fails the build.
+// viewer sub-fields expose owner-private data, so uncovered fields fail the build.
 func IsOwnerPrivateType(s *Schema, typeName string) bool {
 	def := s.schema.Types[typeName]
 	if def == nil {

@@ -11,7 +11,7 @@ import (
 // hand-listed EnterpriseOwnerInfo missed Team / EnterpriseUserAccount): for every connection/object field on a
 // known owner or content-carrier, if its element type CARRIES owner-private content (a field in
 // ownerContentResource) and is not itself an owner / repo-scoped / member-mechanism / content-mechanism type,
-// the build fails — so a schema refresh adding another such carrier is forced into a marking branch.
+// the build fails unless that carrier is handled by a marking branch.
 func TestR40_ContentBearingNonOwnerCovered(t *testing.T) {
 	s, _ := Load()
 	unwrap := func(tp *ast.Type) string {

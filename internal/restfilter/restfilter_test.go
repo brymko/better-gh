@@ -247,22 +247,27 @@ func TestFilterDropsUndeterminable(t *testing.T) {
 	}
 }
 
-// An off-shape body (error object on a list path, or no items on a search path) is passed
-// through unchanged (defense-in-depth, must not break availability).
-func TestFilterPassesThroughOffShape(t *testing.T) {
-	errObj := []byte(`{"message":"Not Found","status":"404"}`)
-	if string(Filter("/user/repos", errObj, allowOnly())) != string(errObj) {
-		t.Fatalf("error object on a list path should pass through unchanged")
+func TestRedactFailsClosedOnOffShapeNeedsFilterBody(t *testing.T) {
+	d, locs := Lookup("/user/repos")
+	if d != NeedsFilter {
+		t.Fatalf("/user/repos should be NeedsFilter, got %v", d)
 	}
-	if string(Filter("/search/code", errObj, allowOnly())) != string(errObj) {
-		t.Fatalf("object without items on a search path should pass through unchanged")
+	body := []byte(`{"full_name":"b/drop","secret":"LEAK"}`)
+	if out, ok := Redact(body, locs, allowOnly("a/keep")); ok {
+		t.Fatalf("off-shape repo-bearing body must fail closed, got %s", out)
+	}
+
+	_, searchLocs := Lookup("/search/code")
+	errObj := []byte(`{"message":"Not Found","status":"404"}`)
+	if out, ok := Redact(errObj, searchLocs, allowOnly("a/keep")); ok {
+		t.Fatalf("search body without declared items[] shape must fail closed, got %s", out)
 	}
 }
 
 // TestSingletonSubjectFailsClosed is the audit F4 regression: a single-object endpoint whose whole
 // body belongs to one repo (notifications thread, codespace) must FAIL CLOSED when that repo is
-// denied — nulling only the $.repository sub-object would leak same-repo siblings (issue/PR titles,
-// branch names). An allowed subject passes through; an absent repo identity does not fail.
+// denied or cannot be determined — nulling only the $.repository sub-object would leak same-repo
+// siblings (issue/PR titles, branch names).
 func TestSingletonSubjectFailsClosed(t *testing.T) {
 	deny := func(repo string) bool { return repo == "a/keep" }
 
@@ -287,6 +292,11 @@ func TestSingletonSubjectFailsClosed(t *testing.T) {
 	cs := []byte(`{"name":"my-space","repository":{"full_name":"a/denied"},"git_status":{"ref":"secret-branch"}}`)
 	if _, ok := Redact(cs, clocs, deny); ok {
 		t.Fatal("denied-repo codespace must fail closed")
+	}
+
+	missingRepo := []byte(`{"subject":{"title":"SECRET_ISSUE_TITLE"}}`)
+	if out, ok := Redact(missingRepo, locs, deny); ok {
+		t.Fatalf("singleton without repository identity must fail closed, got %s", out)
 	}
 }
 

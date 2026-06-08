@@ -6,7 +6,7 @@ import (
 	"better-gh/internal/gqlfilter"
 )
 
-// TestR25_OrgMemberResponseFieldsInSync is the anti-drift guard for the round-25 member-nav fix: every
+// TestR25_OrgMemberResponseFieldsInSync is the coverage guard for the round-25 member-nav fix: every
 // Organization field the classifier maps to the "members" per-resource key MUST be in the response
 // filter's redaction set (gqlfilter.OrgMemberResponseFields), and vice versa — otherwise a member field
 // scoped request-side would not be redacted response-side (or a redacted field would have no request gate).
@@ -30,7 +30,7 @@ func TestR25_OrgMemberResponseFieldsInSync(t *testing.T) {
 	for f := range responseFields {
 		if !requestMembers[f] {
 			t.Errorf("gqlfilter.OrgMemberResponseFields has %q but it is not a gqlOrgFieldToResource "+
-				"\"members\" key — response-redacted with no request-side gate (drift)", f)
+				"\"members\" key — response-redacted with no request-side gate (mismatch)", f)
 		}
 	}
 }

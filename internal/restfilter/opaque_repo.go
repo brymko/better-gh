@@ -36,9 +36,8 @@ func BodyHasOpaqueRepoIDs(body []byte) bool {
 // Maintenance: hand-maintained, but TestSpecCoverage_OpaqueRepoIDOps DERIVES the detectable members
 // from the embedded spec (every Pass GET op whose response declares a `repository_id` property the
 // generator/body-scan can't map) and fails the build if one is missing — so the round-20/33/35 class
-// (a denied repo named only by a numeric id) cannot silently grow. When refreshing, run the suite and
-// add any op the guard flags; also audit ops whose repo id hides under an opaque `additionalProperties`
-// metadata object (which the guard cannot see) and add those by hand.
+// (a denied repo named only by a numeric id) cannot silently grow. Ops whose repo id hides under an
+// opaque `additionalProperties` metadata object are not visible to the guard and are listed by hand.
 var opaqueRepoIDOps = []string{
 	"/agents/tasks",
 	"/agents/tasks/{task_id}",

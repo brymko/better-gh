@@ -55,11 +55,10 @@ var sponsorablePublicFields = map[string]bool{
 	"viewerCanSponsor": true, "viewerIsSponsoring": true,
 }
 
-// TestR28_SponsorableFieldsClassified is the INVERTED anti-drift guard (round-30): rather than a name
+// TestR28_SponsorableFieldsClassified is the INVERTED coverage guard (round-30): rather than a name
 // heuristic ("ends in InCents", which missed sponsorshipsAsMaintainer/Newsletters/sponsors), assert EVERY
 // Sponsorable field is classified as either owner-private (userPrivateFields, nulled for a denied user) or
-// justified-public (sponsorablePublicFields). A schema refresh that adds an unclassified Sponsorable field
-// fails the build, forcing a triage instead of a silent leak.
+// justified-public (sponsorablePublicFields). Unclassified Sponsorable fields in the embedded schema fail the build instead of silently leaking.
 func TestR28_SponsorableFieldsClassified(t *testing.T) {
 	s, _ := Load()
 	sp := s.schema.Types["Sponsorable"]

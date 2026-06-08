@@ -11,9 +11,9 @@ import "testing"
 // replies, orgs/enterprises/projectsV2/keys/social/2FA). Before round-34 these roots scoped the User type
 // only through gqlOrgResources (the 8 member/team keys); every other private field degraded to one base
 // org-read scope, so a token granting base read to the custodian's own login read all of it. This guard
-// iterates viewerPrivateFieldCategory itself, so a schema refresh that adds a new private viewer field
-// (already required to be in the map by TestR31_ViewerPrivateFieldCoverage) is automatically asserted to
-// be gated on the user(login:) path too — the request and viewer sides cannot drift.
+// iterates viewerPrivateFieldCategory itself, so every private viewer field in the embedded schema
+// (required to be in the map by TestR31_ViewerPrivateFieldCoverage) is automatically asserted to
+// be gated on the user(login:) path too — the request and viewer sides cannot diverge.
 func TestR34_UserRootPrivateFieldParity(t *testing.T) {
 	has := func(scopes []Scope, cat string) bool {
 		for _, s := range scopes {

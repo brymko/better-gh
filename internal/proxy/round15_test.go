@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"better-gh/internal/audit"
 	"better-gh/internal/gqlfilter"
 	"better-gh/internal/nodecache"
 	"better-gh/internal/policy"
@@ -25,7 +24,7 @@ func r15Handler(t *testing.T, pol *policy.Policy, upstreamURL string) *Handler {
 	nc := nodecache.New(time.Minute)
 	t.Cleanup(nc.Stop)
 	return &Handler{
-		GithubToken: "t", Store: mustStore(t), Audit: audit.NewLogger(t.TempDir() + "/a.jsonl"),
+		GithubToken: "t", Store: mustStore(t), Audit: testAuditLogger(t),
 		Client: &http.Client{}, Mode: SocketMode, SocketPolicy: pol,
 		UpstreamURL: upstreamURL, GQLFilter: sch, NodeCache: nc,
 	}
@@ -218,17 +217,17 @@ func TestSec_R15_ViewerNodeIDCollapseDenied(t *testing.T) {
 }
 
 // round-15 MEDIUM: a resolved node whose runtime __typename the embedded schema doesn't recognize
-// (live drift) must fail closed, not be treated as a constraint-free non-repo node.
-func TestSec_R15_NodeDriftFailClosed(t *testing.T) {
+// must fail closed, not be treated as a constraint-free non-repo node.
+func TestSec_R15_UnknownNodeTypeFailClosed(t *testing.T) {
 	forwarded := false
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(string(body), "nodes(ids") {
-			// carrier resolves to the allowed repo; the drift node returns an unknown type, no repo.
+			// carrier resolves to the allowed repo; the second node returns an unknown type, no repo.
 			io.WriteString(w, `{"data":{"nodes":[`+
 				`{"__typename":"PullRequest","repository":{"nameWithOwner":"o/rw"}},`+
-				`{"__typename":"NewlyAddedRepoScopedType"}]}}`)
+				`{"__typename":"UnknownRepoScopedType"}]}}`)
 			return
 		}
 		forwarded = true
@@ -244,14 +243,14 @@ func TestSec_R15_NodeDriftFailClosed(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	resp := postGQL(t, srv.URL, `mutation{a:addComment(input:{subjectId:"PR_kwDOcarrier1",body:"x"}){clientMutationId} b:addComment(input:{subjectId:"X_kwDOdrift2",body:"y"}){clientMutationId}}`)
+	resp := postGQL(t, srv.URL, `mutation{a:addComment(input:{subjectId:"PR_kwDOcarrier1",body:"x"}){clientMutationId} b:addComment(input:{subjectId:"X_kwDOunknown2",body:"y"}){clientMutationId}}`)
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("drift node must fail closed (403), got %d", resp.StatusCode)
+		t.Fatalf("unknown node type must fail closed (403), got %d", resp.StatusCode)
 	}
 	if forwarded {
-		t.Fatal("mutation with an unresolved drift node must NOT reach upstream")
+		t.Fatal("mutation with an unresolved unknown node type must NOT reach upstream")
 	}
 }
 

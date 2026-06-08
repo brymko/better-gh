@@ -88,9 +88,10 @@ func Lookup(normPath string) (Decision, []string) {
 }
 
 // Redact parses a repo-bearing GET response and drops denied repositories at the given
-// locations. It FAILS CLOSED (ok=false) on a non-empty body it cannot parse — a known
-// repo-bearing op returning non-JSON is anomalous and must not be forwarded unredacted. An
-// empty body (e.g. a 304) is passed through. authorized receives "owner/repo".
+// locations. It FAILS CLOSED (ok=false) on a non-empty body it cannot parse, on a declared
+// singleton repository whose identity is absent/malformed, or on a body where none of the declared
+// array repository locations can be observed. An empty body (e.g. a 304) is passed through.
+// authorized receives "owner/repo".
 func Redact(body []byte, locs []string, authorized func(ownerRepo string) bool) ([]byte, bool) {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return body, true
@@ -102,14 +103,11 @@ func Redact(body []byte, locs []string, authorized func(ownerRepo string) bool) 
 		return nil, false
 	}
 	// Singleton (non-array) locations address the response's OWN subject repository (a
-	// notification thread, a codespace, a single package). If that repo is present and denied,
-	// the WHOLE body belongs to a denied repo and its same-repo siblings (issue/PR titles, branch
-	// names, source paths) would survive a mere sub-object null — so fail closed and let the proxy
-	// reject the body, matching the all-or-nothing semantics the array path gets by dropping the
-	// element (audit F4). An absent/undeterminable singleton repo (e.g. an org-scoped package with
-	// no repository) exposes no repo identity, so it is not failed. For repo-path-scoped endpoints
-	// the singleton repo is the path repo the classifier already authorized, so this never trips.
+	// notification thread, a codespace, a single package). If that repo is denied, the WHOLE
+	// body belongs to a denied repo and its same-repo siblings would survive a mere sub-object
+	// null; if the repo identity is absent/malformed, the proxy cannot prove the subject repo.
 	var arrayLocs []string
+	observed := false
 	for _, loc := range locs {
 		steps := parseLoc(loc)
 		if len(steps) == 0 {
@@ -126,12 +124,22 @@ func Redact(body []byte, locs []string, authorized func(ownerRepo string) bool) 
 			arrayLocs = append(arrayLocs, loc)
 			continue
 		}
-		if repo := readSingletonRepo(root, steps); repo != "" && !authorized(repo) {
+		repo, ok := readSingletonRepo(root, steps)
+		if !ok {
+			return nil, false
+		}
+		observed = true
+		if !authorized(repo) {
 			return nil, false
 		}
 	}
 	dropped := 0
-	root = applyLocations(root, arrayLocs, authorized, &dropped)
+	var arrayObserved bool
+	root, arrayObserved = applyLocations(root, arrayLocs, authorized, &dropped)
+	observed = observed || arrayObserved
+	if len(locs) > 0 && !observed {
+		return nil, false
+	}
 	// Close the count oracle: if denied-repo elements were dropped and the body reports a
 	// total_count, reduce it by the number dropped (and flag it incomplete) so the count can't
 	// reveal how many denied-repo entries existed. Generalized from the {items,total_count} search
@@ -197,13 +205,13 @@ func parseLoc(loc string) []locStep {
 	return steps
 }
 
-// applyLocations redacts denied repositories addressed by all of an endpoint's locations.
+// applyLocations redacts denied repositories addressed by all of an endpoint's array locations.
 // Locations that filter the SAME array are evaluated together per element (an element is kept
 // only if it exposes at least one determinable repository and ALL exposed repositories are
 // allowed) — so an element isn't dropped merely because one location's optional path is absent
-// (e.g. a PushEvent has repo.name but no payload.issue.repository). A singleton repo (no
-// enclosing array) is nulled when denied.
-func applyLocations(root any, locs []string, authorized func(string) bool, dropped *int) any {
+// (e.g. a PushEvent has repo.name but no payload.issue.repository). The returned observed flag
+// reports whether at least one declared target array shape was actually present.
+func applyLocations(root any, locs []string, authorized func(string) bool, dropped *int) (any, bool) {
 	type group struct {
 		prefix []locStep
 		elems  [][]locStep
@@ -234,11 +242,14 @@ func applyLocations(root any, locs []string, authorized func(string) bool, dropp
 		}
 		g.elems = append(g.elems, elem)
 	}
+	observed := false
 	for _, key := range order {
 		g := groups[key]
-		root = descendGroup(root, g.prefix, g.elems, authorized, dropped)
+		var ok bool
+		root, ok = descendGroup(root, g.prefix, g.elems, authorized, dropped)
+		observed = observed || ok
 	}
-	return root
+	return root, observed
 }
 
 func prefixKey(prefix []locStep) string {
@@ -256,11 +267,12 @@ func prefixKey(prefix []locStep) string {
 
 // descendGroup walks prefix steps to the target array, then keeps only elements elementAllowed
 // accepts. Recurses through any arrays in the prefix (e.g. migrations' $[].repositories[]).
-func descendGroup(cur any, prefix []locStep, elems [][]locStep, authorized func(string) bool, dropped *int) any {
+// The returned observed flag is true only when the declared target array shape was present.
+func descendGroup(cur any, prefix []locStep, elems [][]locStep, authorized func(string) bool, dropped *int) (any, bool) {
 	if len(prefix) == 0 {
 		arr, ok := cur.([]any)
 		if !ok {
-			return cur
+			return cur, false
 		}
 		kept := make([]any, 0, len(arr))
 		for _, el := range arr {
@@ -269,38 +281,47 @@ func descendGroup(cur any, prefix []locStep, elems [][]locStep, authorized func(
 			}
 		}
 		*dropped += len(arr) - len(kept)
-		return kept
+		return kept, true
 	}
 	s := prefix[0]
 	if s.array {
 		arr, ok := cur.([]any)
 		if !ok {
-			return cur
+			return cur, false
 		}
+		if len(arr) == 0 {
+			return arr, true
+		}
+		observed := false
 		for i := range arr {
-			arr[i] = descendGroup(arr[i], prefix[1:], elems, authorized, dropped)
+			var ok bool
+			arr[i], ok = descendGroup(arr[i], prefix[1:], elems, authorized, dropped)
+			observed = observed || ok
 		}
-		return arr
+		return arr, observed
 	}
 	m, ok := cur.(map[string]any)
 	if !ok {
-		return cur
+		return cur, false
 	}
-	if v, present := m[s.field]; present {
-		before := *dropped
-		m[s.field] = descendGroup(v, prefix[1:], elems, authorized, dropped)
-		// If this field's array had denied entries dropped, decrement a sibling per-bucket
-		// repository_count (the CodeQL variant-analysis skip buckets carry one per object) so it can't
-		// serve as a denied-repo existence/count oracle — the per-bucket analogue of the root total_count
-		// rewrite, which the round-16 root-only adjustment missed (round-21). total_count is handled once
-		// at the root in Redact; only repository_count is touched here to avoid double-counting.
-		if d := *dropped - before; d > 0 {
-			if c, ok := m["repository_count"]; ok {
-				m["repository_count"] = json.Number(strconv.Itoa(maxInt(0, jsonNumberToInt(c)-d)))
-			}
+	v, present := m[s.field]
+	if !present {
+		return cur, false
+	}
+	before := *dropped
+	var observed bool
+	m[s.field], observed = descendGroup(v, prefix[1:], elems, authorized, dropped)
+	// If this field's array had denied entries dropped, decrement a sibling per-bucket
+	// repository_count (the CodeQL variant-analysis skip buckets carry one per object) so it can't
+	// serve as a denied-repo existence/count oracle — the per-bucket analogue of the root total_count
+	// rewrite, which the round-16 root-only adjustment missed (round-21). total_count is handled once
+	// at the root in Redact; only repository_count is touched here to avoid double-counting.
+	if d := *dropped - before; d > 0 {
+		if c, ok := m["repository_count"]; ok {
+			m["repository_count"] = json.Number(strconv.Itoa(maxInt(0, jsonNumberToInt(c)-d)))
 		}
 	}
-	return cur
+	return cur, observed
 }
 
 // elementAllowed keeps an array element iff it exposes at least one determinable repository
@@ -342,15 +363,19 @@ func readRepo(v any, elem []locStep) string {
 }
 
 // readSingletonRepo reads the "owner/repo" a non-array location points at (e.g.
-// $.repository.full_name or $.full_name → the response's own subject repo), or "" if the field
-// is absent/malformed. Redact fails the whole body closed when such a repo is present and denied.
-func readSingletonRepo(root any, steps []locStep) string {
+// $.repository.full_name or $.full_name → the response's own subject repo). ok=false when the
+// field is absent/malformed.
+func readSingletonRepo(root any, steps []locStep) (repo string, ok bool) {
+	if len(steps) == 0 {
+		return "", false
+	}
 	repoPath := steps[:len(steps)-1] // drop the terminal full_name/name → the repo object
 	m, ok := walkPath(root, repoPath).(map[string]any)
 	if !ok {
-		return ""
+		return "", false
 	}
-	return readRepo(m, steps[len(steps)-1:]) // re-read the leaf with one-slash validation
+	repo = readRepo(m, steps[len(steps)-1:]) // re-read the leaf with one-slash validation
+	return repo, repo != ""
 }
 
 func walkPath(v any, steps []locStep) any {

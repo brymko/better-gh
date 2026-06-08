@@ -24,9 +24,8 @@ import (
 // learns the exact NAMES/existence of private repos its policy denies. DropRepoStrings drops each
 // denied "owner/repo" from the array and decrements the sibling count.
 //
-// Maintenance: this is intentionally hand-maintained (like crossref_scrub.go); regenerating
-// openapi_table.go does NOT touch it. When refreshing against a new spec, audit for other
-// "*_full_names"-style string arrays and add them here.
+// Maintenance: this is intentionally hand-maintained (like crossref_scrub.go); generated enum
+// locations do NOT touch it. "*_full_names"-style string arrays belong here.
 
 // stringRepoArrayLoc addresses a bare-string "owner/repo" array inside an object, plus an optional
 // sibling count field to decrement when entries are dropped.

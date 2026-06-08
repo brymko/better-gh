@@ -273,7 +273,7 @@ func TestSec_R20_AttestationsRepoNamesRedacted(t *testing.T) {
 }
 
 // Round-20 MEDIUM/LOW: response headers must strip Github-Authentication-Token-Expiration (custodian
-// lifecycle) and the request must NOT forward the client Cookie header upstream.
+// lifecycle), preserve benign validators on unfiltered responses, and not forward client Cookie upstream.
 func TestSec_R20_HeaderHygiene(t *testing.T) {
 	var gotCookie string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -289,7 +289,7 @@ func TestSec_R20_HeaderHygiene(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/repos/o/r/pulls/1", nil)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/rate_limit", nil)
 	req.Header.Set("Cookie", "bgh_grant=secret.value; other=1")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

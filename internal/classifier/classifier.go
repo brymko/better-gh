@@ -302,7 +302,7 @@ func classifyGraphQL(body []byte) Result {
 		// A mutation's RETURN selection is a normal read sub-graph and can navigate to
 		// other repositories (payload.pullRequest.repository.forks, ...). Scan it like a
 		// read so the proxy's response filter redacts denied navigated repos when
-		// available, and the request fails closed when it is not (schema drift). Without
+		// available; otherwise the request fails closed. Without
 		// this, a write grant on one repo could read any navigable repo via the payload.
 		escapes := false
 		navTooComplex := false
@@ -592,7 +592,7 @@ func gqlOrgResources(orgField *ast.Field, fragments ast.FragmentDefinitionList, 
 // category that gates it: `gists` to the "gists" category (parity with REST /gists and node(id:Gist)),
 // every other private collection to the un-floored "user_private" so default-deny denies it (round-31).
 // Identity and repo-scoped viewer fields are NOT listed — they keep the floored "user" category (repo-scoped
-// ones are redacted by the response filter). A schema refresh adding a private viewer field is caught by
+// ones are redacted by the response filter). Private viewer fields in the embedded schema are checked by
 // TestR31_ViewerPrivateFieldCoverage.
 var viewerPrivateFieldCategory = map[string]string{
 	"gists": "gists", "gist": "gists", "gistComments": "gists", "gistComment": "gists",
@@ -1612,7 +1612,7 @@ var restResourceMap = map[string]string{
 // any request, so a per-resource `none` written under a misspelled key (e.g. "contnets") silently
 // degrades to the rule's BASE access — a fail-open footgun. Mint paths validate against this so a
 // typo is rejected, not silently accepted (round-19 D2). Derived from restResourceMap so it cannot
-// drift from what the classifier emits. NOTE: org per-resource keys are open-ended (any org subpath
+// diverge from what the classifier emits. NOTE: org per-resource keys are open-ended (any org subpath
 // segment via orgResource), so this set governs REPO rules only.
 func KnownRepoResourceKeys() map[string]bool {
 	out := map[string]bool{"metadata": true}
@@ -1730,10 +1730,10 @@ var restUnscopedMap = map[string]string{
 // third-person data (safe to forward — the repo-bearing feeds repos/events/starred/subscriptions are
 // redacted by restfilter, the keys/gpg_keys/ssh_signing_keys listings are the user's published public
 // keys, etc.). EVERY other /users/{username}/<sub> — settings/billing, projectsV2, docker, installation,
-// copilot-spaces, and any FUTURE authenticated-only subtree — is treated as the custodian's owner-private
+// copilot-spaces, and every unlisted authenticated-only subtree — is treated as the custodian's owner-private
 // data (un-floored "user_private", denied under default-deny) because for {username}==the custodian's own
 // login the proxy returns the custodian's PRIVATE account data (round-35). Inverted (allowlist public,
-// deny the rest) so a new private subtree fails closed; TestR35_UsersPathPrivateSubtreesDenied pins it
+// deny the rest) so unlisted private subtrees fail closed; TestR35_UsersPathPrivateSubtreesDenied pins it
 // against the embedded spec. Bare /users/{username} (no sub-segment) is the public profile (org-scoped).
 var usersPublicSubtrees = map[string]bool{
 	"events": true, "followers": true, "following": true, "gists": true,

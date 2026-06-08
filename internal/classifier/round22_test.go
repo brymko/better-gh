@@ -17,11 +17,10 @@ func TestR22_AuditLogScopedToMembers(t *testing.T) {
 	}
 }
 
-// TestR22_OrgMemberIdentityCoverage is the anti-drift guard for the recurring org member-identity class
+// TestR22_OrgMemberIdentityCoverage is the coverage guard for the recurring org member-identity class
 // (round-21 mannequins/memberStatuses/…, round-22 auditLog): EVERY Organization field the schema shows
 // can surface a member/owner identity (login/email/IP) must be mapped to "members" in
-// gqlOrgFieldToResource — or be a justified public-data exception. A schema refresh that adds another such
-// field fails this test rather than silently bypassing members="none" over GraphQL.
+// gqlOrgFieldToResource — or be a justified public-data exception. Every such field in the embedded schema must be covered rather than silently bypassing members="none" over GraphQL.
 func TestR22_OrgMemberIdentityCoverage(t *testing.T) {
 	s, err := gqlfilter.Load()
 	if err != nil {

@@ -57,8 +57,8 @@ func TestR37_OrgOwnerPrivateContentGated(t *testing.T) {
 
 // TestR37_OrgProjectsCategoryCovered is the derived guard: every Organization field whose return element is a
 // ProjectV2/classic-Project board (@docsCategory projects/projects-classic) must be gated on the "projects"
-// resource in gqlOrgFieldToResource, so a schema refresh adding a new org project field fails the build
-// instead of silently bypassing a projects="none" carve-out over GraphQL (round-37).
+// resource in gqlOrgFieldToResource, so org project fields in the embedded schema must be covered instead of silently bypassing
+// a projects="none" carve-out over GraphQL (round-37).
 func TestR37_OrgProjectsCategoryCovered(t *testing.T) {
 	s, err := gqlfilter.Load()
 	if err != nil {

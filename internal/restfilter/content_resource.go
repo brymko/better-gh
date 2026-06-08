@@ -1,6 +1,6 @@
 package restfilter
 
-// Cross-repo CONTENT enumeration feeds + their reviewed metadata-only siblings (round-21 anti-drift).
+// Cross-repo CONTENT enumeration feeds + their reviewed metadata-only siblings (round-21 coverage).
 //
 // A NeedsFilter enum op whose array ELEMENTS NEST a repository inside a content object (the repo
 // location is e.g. `$[].repository.full_name` / `$[].payload.issue.repository.full_name`, NOT the
@@ -19,8 +19,8 @@ package restfilter
 //
 // EVERY nests-a-repo enum op MUST appear in exactly one of these two tables; TestCoverage_NestedRepoEnumOps
 // (coverage_invariant_test.go) re-derives the nests-a-repo set from the generated repoEnumOps and fails
-// the BUILD on an unclassified one — so a spec refresh that adds a new content feed (the round-21
-// events-feed class) cannot silently default to a metadata-only gate and leak. THIS replaces the
+// the BUILD on an unclassified one, so content feeds in the embedded spec cannot silently
+// default to a metadata-only gate and leak. THIS replaces the
 // per-round hand-chasing of content-feed siblings with a spec-coupled invariant.
 var contentEnumResourceOps = map[string]string{
 	// issue feeds (title+body; GitHub "issues" feeds also carry PRs — the same heterogeneity imprecision

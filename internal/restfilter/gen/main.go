@@ -44,7 +44,7 @@ func main() {
 }
 
 // reportCoverage prints (to stderr) the ops a maintainer must keep covered in the hand-maintained
-// restfilter tables after a spec refresh: nests-a-repo GET enum ops (-> content_resource.go) and WRITE
+// restfilter tables: nests-a-repo GET enum ops (-> content_resource.go) and WRITE
 // ops embedding a foreign cross-ref repo (-> write_scrub.go — write responses are invisible to the
 // GET-only table, so this report is the only generation-time guard for write-scrub coverage). The runtime
 // TestCoverage_NestedRepoEnumOps + TestSpecCoverage_* ENFORCE coverage; this just tells the maintainer
@@ -80,7 +80,7 @@ func reportCoverage(spec *specderive.Spec, repoOps map[string][]string) {
 func emit(path string, repoOps map[string][]string, known []string) {
 	var b strings.Builder
 	b.WriteString("// Code generated from GitHub's OpenAPI description by internal/restfilter/gen. DO NOT EDIT.\n")
-	b.WriteString("// Regenerate: go run ./internal/restfilter/gen --spec api.github.com.json --out internal/restfilter/openapi_table.go\n\n")
+	b.WriteString("\n")
 	b.WriteString("package restfilter\n\n")
 	b.WriteString("// repoEnumOps maps \"GET /path/{tmpl}\" to the JSON locations of repository identities in\n")
 	b.WriteString("// its response, so the filter can drop denied-repo data wherever it appears.\n")

@@ -4,7 +4,7 @@ import "testing"
 
 // TestR39_WebURLRepoScan pins the round-39 finding-7 fix: the Pass body-scan recognizes a github.com WEB url
 // naming a repo (the Classroom /assignments/{id}/grades student_repository_url html_url shape), value-driven
-// so it covers future *_url siblings — while NOT over-matching an api.github.com link or a reserved path.
+// so it covers *_url siblings — while NOT over-matching an api.github.com link or a reserved path.
 func TestR39_WebURLRepoScan(t *testing.T) {
 	deny := func(ownerRepo string) bool { return ownerRepo != "classroom-org/intro-alice" }
 

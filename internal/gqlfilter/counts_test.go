@@ -10,8 +10,7 @@ import (
 // issueCount, …). Those are computed by GitHub over the full pre-redaction set, so they
 // reveal the count/existence of denied items; this is not soundly closable in the response
 // filter (count fields can be aliased, totalCount is a cross-page total). The fine-grained
-// upstream PAT is the bound. This test pins the behavior so the docs stay truthful — if a
-// future change starts adjusting counts, update the security model accordingly.
+// upstream PAT is the bound. This test pins the behavior so the docs stay truthful — if count adjustment is introduced, update the security model accordingly.
 func TestFilter_RedactsContentNotCounts(t *testing.T) {
 	resp := map[string]any{"data": map[string]any{"search": map[string]any{
 		"issueCount": float64(2),

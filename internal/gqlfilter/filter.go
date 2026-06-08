@@ -92,7 +92,7 @@ const userOwnedAmbient = "\x00user"
 // ownerContentResource maps an owner-private CONTENT field (NOT a member/team roster field — those keep the
 // ownerMemberMarkerPrefix mechanism) to its per-resource policy key, mirroring the classifier's
 // gqlOrgFieldToResource + gqlEnterpriseFieldToResource. TestR39_OwnerContentResourceInSync couples it to the
-// classifier so the request and response sides cannot drift.
+// classifier so the request and response sides cannot diverge.
 //
 // viewerPrivateContentResource is a SENTINEL "resource" (alias-safe, matches no real per-resource key) for an
 // owner field that is actually the VIEWER's (custodian's) private data, not the owner's — the Sponsorable
@@ -147,7 +147,7 @@ func resourceFromCode(code string) string { return strings.ReplaceAll(code, "X",
 // type that carries its enclosing owner's data (EnterpriseOwnerInfo's org-inventory / roster connections,
 // reached one hop below enterprise(slug:) via ownerInfo) — nulled under the ambient owner's carve-out, the
 // content analogue of memberBearingNonOwnerTypes (round-39 finding-5). The *SettingOrganizations suffix rule
-// auto-covers any future enterprise org-inventory field.
+// covers enterprise org-inventory fields by suffix.
 func contentBearingNonOwnerResource(typeName, field string) string {
 	switch typeName {
 	case "EnterpriseOwnerInfo":
@@ -155,8 +155,7 @@ func contentBearingNonOwnerResource(typeName, field string) string {
 		// EVERY field is owner-private content: the member-org INVENTORY partitioned by setting
 		// (*SettingOrganizations → organizations), the admin/collaborator rosters + pending invitations →
 		// members, and everything else (verified domains, IP-allow-list, SAML config, 2FA enforcement, …) →
-		// settings (round-39 inventory; round-40 settings-class). The suffix rule auto-covers future
-		// *SettingOrganizations fields.
+		// settings (round-39 inventory; round-40 settings-class). The suffix rule covers *SettingOrganizations fields.
 		switch {
 		case strings.HasSuffix(field, "SettingOrganizations"):
 			return "organizations"
@@ -185,7 +184,7 @@ func contentBearingNonOwnerResource(typeName, field string) string {
 
 // contentBearingNonOwnerTypes are the NON-owner types whose own augment branch must inject content markers
 // (Team is handled in the memberBearingNonOwnerTypes branch). TestR40_ContentBearingNonOwnerCovered derives
-// the complete set from the schema so a refresh that adds another such type fails the build.
+// the complete set from the embedded schema so every such type must be covered.
 var contentBearingNonOwnerTypes = map[string]bool{
 	"EnterpriseOwnerInfo": true, "EnterpriseUserAccount": true,
 }
@@ -215,7 +214,7 @@ const userMarkerAlias = "bghOwnerUserZ9"
 // Organization — a User is reached everywhere as a plain Actor/author{login}, so coarse nulling would
 // break every author. A User is marked (and these fields injected) ONLY when one of these is selected, so
 // author{login} stays unmarked. The set is build-time coupled to the classifier's viewerPrivateFieldCategory
-// (the front-gate private set) by TestR35_UserPrivateFieldSetsCoupled so the two cannot drift.
+// (the front-gate private set) by TestR35_UserPrivateFieldSetsCoupled so the two cannot diverge.
 var userPrivateFields = map[string]bool{
 	// Sponsors financials + org-verified domain emails (also Sponsorable common fields, round-28/30).
 	"monthlyEstimatedSponsorsIncomeInCents": true, "estimatedNextSponsorsPayoutInCents": true,
@@ -323,18 +322,12 @@ var memberBearingNonOwnerTypes = map[string]map[string]bool{
 	"EnterpriseTeam": {"enterpriseTeamMembers": true, "assignedOrganizations": true},
 }
 
-// ownerPublicFields are the only fields kept when an owner object is BASE-denied (the client has no
-// org/enterprise access at all); every other field — billing, IP allow-list, domains, 2FA, members, … —
-// is nulled. Keeping by exact key (an aliased public field is also nulled) is safe here precisely BECAUSE
-// base is denied: over-redaction costs availability, never a leak. This is drift-proof: it does not
-// enumerate the (large, GitHub-evolving) owner-private field set, it nulls everything NOT public.
-var ownerPublicFields = map[string]bool{
-	"login": true, "name": true, "id": true, "__typename": true, "slug": true,
-	"url": true, "avatarUrl": true, "databaseId": true, "resourcePath": true,
-}
+// A base-denied owner object carries no client-visible data. Earlier builds kept a small public-field
+// allowlist by RESPONSE KEY (`login`, `url`, `id`, …), but aliases made that unsound: a private field could
+// arrive under one of those public keys.
 
 // OrgMemberFieldNames returns the Organization member-identity field names; a classifier test asserts it
-// equals the gqlOrgFieldToResource "members" keys so the request and response sides cannot drift.
+// equals the gqlOrgFieldToResource "members" keys so the request and response sides cannot diverge.
 func OrgMemberFieldNames() []string {
 	out := make([]string, 0, len(orgMemberFieldNames))
 	for f := range orgMemberFieldNames {
@@ -347,8 +340,8 @@ func OrgMemberFieldNames() []string {
 // RedactDeniedOwnerPrivate enforces org/enterprise policy on owner-private GraphQL data reached by ANY
 // navigation path — the response-side backstop the repo-centric marker filter and the org-ROOT-only
 // classifier scope both miss. For every owner object the augmenter marked (Organization/Enterprise):
-//   - if the owner is BASE-denied (no access), keep only public-identity fields and null the rest
-//     (billing/IP-allow-list/domains/2FA/members/…) — drift-proof and alias-proof;
+//   - if the owner is BASE-denied (no access), null every client-selected field. Public-looking response
+//     keys are not trusted because GraphQL aliases control them;
 //   - else if its "members" carve-out is denied, null exactly the member-identity fields, addressed by
 //     the per-field RESPONSE-KEY markers so a client ALIAS cannot evade the null (round-26).
 //
@@ -492,12 +485,10 @@ func redactOwnerPrivate(v any, denied func(owner, resource string) bool, categor
 		}
 		switch {
 		case isOwnerObj && denied(effectiveOwner, ""):
-			// base-denied owner → keep only public identity, null everything else (drift-proof; covers all
-			// member + content fields).
+			// base-denied owner → keep no client-selected fields. Response keys are alias-controlled, so
+			// even public-looking keys (`login`, `url`, `id`, …) can carry private values.
 			for k := range val {
-				if !ownerPublicFields[k] {
-					val[k] = nil
-				}
+				val[k] = nil
 			}
 		default:
 			// base-allowed owner (or member/content-bearing non-owner attributed to its ambient owner): null
@@ -1605,9 +1596,8 @@ var orgMemberIdentityScalars = map[string]bool{
 // OrgMemberIdentityFields returns every Organization field whose return type — followed one hop into a
 // connection's `nodes`/`edges.node` element and expanded through interface/union members — exposes a
 // member/owner identity scalar (login/email/IP). The classifier maps each of these to the "members"
-// per-resource key (or justifies it as public); a coverage test asserts that mapping stays complete, so a
-// schema refresh adding another member-identity org field (the round-21 mannequins / round-22 auditLog
-// class) cannot silently bypass members="none" over GraphQL. RETURNS them sorted.
+// per-resource key (or justifies it as public); a coverage test asserts that mapping stays complete, so member-identity org fields in the
+// embedded schema cannot silently bypass members="none" over GraphQL. RETURNS them sorted.
 func (s *Schema) OrgMemberIdentityFields() []string {
 	org := s.schema.Types["Organization"]
 	if org == nil {
@@ -1683,16 +1673,16 @@ func (s *Schema) OrgMemberIdentityFields() []string {
 
 // IsKnownNodeObjectType reports whether typename is an OBJECT type implementing Node that this
 // embedded schema recognizes. The node resolver fails closed on a resolved node whose __typename is
-// NOT recognized here (live schema drift), instead of treating it as a constraint-free non-repo node.
+// NOT recognized here, instead of treating it as a constraint-free non-repo node.
 func (s *Schema) IsKnownNodeObjectType(typename string) bool {
 	return s.nodeTypes[typename]
 }
 
 // IsKnownObjectType reports whether typename is an OBJECT type the embedded schema recognizes (not just
 // Node implementors — repo-scoped leaf content like Submodule is not a Node). The response filter denies
-// a repo-marked object whose runtime __typename is unknown (live schema drift) rather than authorize it
-// against the lenient "metadata" FilterResource default, mirroring the node resolver's drift
-// fail-closed (round-20).
+// a repo-marked object whose runtime __typename is unknown rather than authorize it
+// against the lenient "metadata" FilterResource default, mirroring the node resolver's
+// fail-closed behavior (round-20).
 func (s *Schema) IsKnownObjectType(typename string) bool {
 	def := s.schema.Types[typename]
 	return def != nil && def.Kind == ast.Object

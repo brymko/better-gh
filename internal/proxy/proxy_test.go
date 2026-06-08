@@ -158,17 +158,22 @@ type testEnv struct {
 	nodeCache    *nodecache.Cache
 }
 
+func testAuditLogger(t *testing.T) *audit.Logger {
+	t.Helper()
+	l := audit.NewLogger(t.TempDir() + "/a.jsonl")
+	t.Cleanup(l.Close)
+	return l
+}
 func setup(t *testing.T) *testEnv {
 	t.Helper()
 
 	mock := mockGitHub()
 
 	tmpDir := t.TempDir()
-	auditPath := filepath.Join(tmpDir, "audit.jsonl")
 	socketPath := filepath.Join("/tmp", fmt.Sprintf("bgh-test-%d.sock", os.Getpid()))
 
 	tokenStore, secret := testStore(t, tmpDir)
-	auditLogger := audit.NewLogger(auditPath)
+	auditLogger := testAuditLogger(t)
 
 	transport := &http.Transport{}
 	client := &http.Client{Transport: transport}

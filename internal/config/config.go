@@ -55,7 +55,7 @@ func Load(path string) (*Config, error) {
 	c := &Config{
 		Bind:      "127.0.0.1:7843",
 		AdminBind: "127.0.0.1:7844",
-		Mode:      "both",
+		Mode:      "socket",
 		Socket:    filepath.Join(DefaultDir(), "proxy.sock"),
 	}
 

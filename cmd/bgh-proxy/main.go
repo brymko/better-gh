@@ -143,7 +143,7 @@ mode = "deny"
 		example := `bind = "127.0.0.1:7843"
 admin_bind = "127.0.0.1:7844"  # plain HTTP for admin UI
 socket = "~/.config/bgh/proxy.sock"
-mode = "both"          # "socket", "ghe", or "both"
+mode = "socket"        # "socket", "ghe", or "both"
 
 # Upstream GitHub token (one of):
 #   - set BGH_GITHUB_TOKEN env var, or

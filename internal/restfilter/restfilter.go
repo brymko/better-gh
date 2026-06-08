@@ -5,9 +5,10 @@
 // in a response are DERIVED FROM GitHub's OpenAPI description (see internal/restfilter/gen and
 // openapi_table.go), not a hand-maintained allowlist — so the whole REST surface is covered and
 // a path the spec doesn't describe can be failed closed by the proxy. For a recognized endpoint
-// the filter walks the response to the repository locations the spec gives and drops the denied
-// ones (dropping the enclosing list element, or nulling a singleton repo object); on a non-empty
-// body it cannot parse it fails closed. See Lookup/Redact in openapi.go.
+// the filter walks the response to the repository locations the spec gives and drops denied array
+// elements; singleton subject repos are all-or-nothing and fail closed when denied or unattributable.
+// A non-empty body that cannot be parsed or does not expose any declared repo-bearing shape also fails
+// closed. See Lookup/Redact in openapi.go.
 package restfilter
 
 import "strings"

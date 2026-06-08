@@ -20,8 +20,8 @@ import (
 // repos in it enumerated those repos' NAMES/existence (round-20, same class as round-19 F4/F6). The
 // proxy qualifies each name with the path owner and drops the denied ones.
 //
-// Maintenance: hand-maintained. When refreshing against a new spec, audit Pass ops returning a bare
-// {id,name} repo array (no full_name/url) qualified by a path {org}/{username} and add them here.
+// Maintenance: hand-maintained. Pass ops returning a bare {id,name} repo array (no full_name/url)
+// qualified by a path {org}/{username} belong here.
 var orgNamedRepoArrayOps = []string{
 	"/orgs/{org}/attestations/repositories",
 }

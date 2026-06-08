@@ -251,8 +251,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// with its repository, then redact (from the response) any object whose repository
 	// the policy denies. This is the authoritative defense against cross-repo navigation
 	// the classifier can't see. When it IS in effect, the classifier's nav-escape flag
-	// is ignored (the filter handles it); when it is NOT (schema drift / disabled), the
-	// flag falls back to denying the whole request.
+	// is ignored (the filter handles it); when it is NOT available, the flag falls back
+	// to denying the whole request.
 	var respFilter func([]byte) ([]byte, bool)
 	// passScan, when set (a non-path-scoped REST "Pass" response), makes forward() scan the actual
 	// JSON body for a denied-repo identity the static OpenAPI table did not locate, failing closed if
@@ -336,7 +336,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case dec == restfilter.NeedsFilter || len(scrubLocs) > 0 || len(strArrayLocs) > 0 || len(contentScrubFields) > 0:
 			// Redact denied enum entries (drop), scrub embedded foreign cross-ref content (null in
 			// place), drop denied bare-string repo names, null denied linked content; all fail closed on
-			// an unparseable body.
+			// an unparseable body or a filtered body that still contains a denied repo identity.
+			scanOrg := classified.Org
+			if scanOrg == "" {
+				scanOrg = classified.Owner
+			}
+			if scanOrg == "" {
+				scanOrg = pathOwnerForScan(norm)
+			}
 			respFilter = func(resp []byte) ([]byte, bool) {
 				out := resp
 				if dec == restfilter.NeedsFilter {
@@ -362,6 +369,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					if out, ok = restfilter.ScrubDeniedContent(out, contentScrubFields, canRead); !ok {
 						return nil, false
 					}
+				}
+				denied, ok := restfilter.ContainsDeniedRepo(out, scanOrg, canRead)
+				if !ok || denied {
+					return nil, false
 				}
 				return out, true
 			}
@@ -514,8 +525,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result = policy.Result{Reason: "cross-repo navigation without a response filter"}
 	}
 	// A GraphQL request is fully filtered or denied — never forwarded unfiltered. When the
-	// filter is configured but could not type this request (schema drift: a field newer than
-	// the embedded schema; or an invalid / reserved-alias query), respFilter is nil and no
+	// filter is configured but could not type this request (invalid / reserved-alias query), respFilter is nil and no
 	// response can be redacted, so fail closed. Relying instead on the classifier's nav
 	// denylist was unsound: it is not complete (e.g. associatedPullRequests, task-list refs),
 	// so an untyped scoped read could navigate cross-repo through a non-listed field and be
@@ -567,7 +577,7 @@ func (h *Handler) augmentGraphQL(body []byte) ([]byte, bool) {
 	}
 	aug, err := h.GQLFilter.Augment(query)
 	if err != nil {
-		// Untypable against our schema snapshot (or invalid) — forward verbatim; the
+		// Untypable against the embedded schema — forward verbatim; the
 		// classifier's cross-repo-nav denylist still applies as a fallback.
 		slog.Debug("graphql augment skipped", "err", err)
 		return nil, false
@@ -640,10 +650,9 @@ func filterGraphQLResponse(s *gqlfilter.Schema, pol *policy.Policy, resp []byte)
 		if s.IsBareNameRepoIdentityType(typename) {
 			return gqlfilter.Deny
 		}
-		// A repo-marked object whose runtime __typename the embedded schema does NOT recognize is live
-		// schema drift (GitHub ahead of the snapshot): FilterResource would default it to "metadata"
-		// (base), under-enforcing its possibly-stricter real resource. Mirror the node resolver's drift
-		// fail-closed and redact it — the accepted "schema freshness = deny" residual — rather than
+		// A repo-marked object whose runtime __typename the embedded schema does NOT recognize would
+		// otherwise default to "metadata" (base), under-enforcing its possibly-stricter real
+		// resource. Mirror the node resolver's fail-closed behavior and redact it rather than
 		// authorize it against base access (round-20). Only fires for genuinely unrecognized runtime types
 		// (typename=="" maps to metadata by design and is unaffected).
 		if typename != "" && !s.IsKnownObjectType(typename) {
@@ -983,7 +992,7 @@ func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[stri
 			// RepositoryCustomProperty, … These resolve to no nameWithOwner AND get no response marker,
 			// so a node(id:)/nodes(ids:) reference to one would otherwise be treated as a constraint-
 			// free non-repo node and stream the denied repo's data/identity/oracle unfiltered (round-16,
-			// a surviving variant of the round-12 H1/H5 + round-15 drift-deny work — both coverage
+			// a surviving variant of the round-12 H1/H5 + round-15 unknown-type deny work — both coverage
 			// invariants passed with it present). We cannot prove the repository, so fail closed.
 			out[id] = nodeRes{kind: nodeDeny}
 		} else if typename != "" && h.GQLFilter != nil && h.GQLFilter.IsRepoIdentityUnattributableType(typename) {
@@ -1003,9 +1012,9 @@ func (h *Handler) resolveFromGitHub(ctx context.Context, ids []string) (map[stri
 			out[id] = nodeRes{kind: nodeDeny}
 		} else if typename != "" && h.GQLFilter != nil && !h.GQLFilter.IsKnownNodeObjectType(typename) {
 			// A non-null node whose runtime __typename this embedded schema does NOT recognize as a
-			// Node object type → live schema drift (GitHub's schema is ahead of the snapshot). The
-			// resolve query is generated from the same snapshot, so it never asked for this type's
-			// repository — a repo-scoped drift type would arrive unmarked and otherwise slip through
+			// Node object type. The resolve query is generated from the embedded schema, so it never
+			// asked for this type's repository — such a repo-scoped type would arrive unmarked and
+			// otherwise slip through
 			// as "no constraint", letting a carrier multi-root mutation write into a denied repo.
 			// Fail closed, mirroring how the request path denies untypeable queries (round-15).
 			out[id] = nodeRes{kind: nodeDeny}
@@ -1319,13 +1328,11 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 		return
 	}
 
-	// When a response filter is set (GraphQL reads), buffer the body, redact denied
-	// repos, and send the filtered bytes; the Content-Length will be recomputed.
+	// When a response filter is set (GraphQL reads/mutations or REST repo-bearing responses), buffer the
+	// body, redact denied repos, and send the filtered bytes; length/pagination/cache validators are stripped.
 	if respFilter != nil {
-		// Read one byte past the cap to DETECT truncation. A response filtered by restfilter
-		// fails OPEN on an unparseable body (its defense-in-depth pass-through), so a body
-		// silently truncated at maxBodySize would be re-emitted with denied-repo entries intact
-		// (round-12 audit M3). Fail closed on overflow instead, like the request path does.
+		// Read one byte past the cap to DETECT truncation. A body silently truncated at maxBodySize could be
+		// re-emitted with denied-repo entries intact. Fail closed on overflow instead, like the request path does.
 		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBodySize+1))
 		if rerr != nil {
 			w.WriteHeader(http.StatusBadGateway)
@@ -1339,13 +1346,12 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 		filtered, ok := respFilter(raw)
 		if !ok {
 			// The body could not be parsed/redacted; fail closed rather than forward
-			// bytes we could not filter. After Accept-Encoding is dropped upstream this
-			// is only reachable for a genuinely non-JSON /graphql body.
-			slog.Warn("graphql response not filterable; denying", "status", resp.StatusCode)
+			// bytes we could not filter.
+			slog.Warn("filtered response not filterable; denying", "status", resp.StatusCode)
 			jsonError(w, http.StatusBadGateway, "bgh: response could not be filtered")
 			return
 		}
-		copyResponseHeaders(w.Header(), resp.Header, true)
+		copyFilteredResponseHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		w.Write(filtered)
 		return
@@ -1363,8 +1369,8 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 // (canonicalized to "X-Github-Sso") reveals the SAML-SSO organization IDs the custodian token is
 // authorized for — the same custodian-reach class as X-OAuth-* — so it is stripped too. Set-Cookie
 // is never relayed: the proxy is not a cookie-session service and must not forward upstream cookies.
-// This is a denylist, not an allowlist: keeping the broad set of benign GitHub headers (ETag, Link,
-// X-RateLimit-*, X-GitHub-Request-Id, Retry-After, …) that clients depend on, at the cost of
+// This is a denylist, not an allowlist: keeping the broad set of benign GitHub headers
+// (`X-RateLimit-*`, `X-GitHub-Request-Id`, `Retry-After`, …) that clients depend on, at the cost of
 // requiring any new custodian-revealing header GitHub introduces to be added here.
 var strippedResponseHeaders = map[string]bool{
 	"Transfer-Encoding":       true,
@@ -1385,9 +1391,30 @@ var strippedResponseHeaders = map[string]bool{
 	"Github-Authentication-Token-Expiration": true,
 }
 
+// strippedFilteredResponseHeaders are additionally stripped when the body has been filtered. They describe
+// the upstream, pre-redaction representation: Link can preserve pagination/count oracles, and validators can
+// correspond to bytes the client never received.
+var strippedFilteredResponseHeaders = map[string]bool{
+	"Content-Length": true,
+	"Link":           true,
+	"Etag":           true,
+	"Last-Modified":  true,
+}
+
 func copyResponseHeaders(dst, src http.Header, stripContentLength bool) {
 	for key, vals := range src {
 		if strippedResponseHeaders[key] || (stripContentLength && key == "Content-Length") {
+			continue
+		}
+		for _, v := range vals {
+			dst.Add(key, v)
+		}
+	}
+}
+
+func copyFilteredResponseHeaders(dst, src http.Header) {
+	for key, vals := range src {
+		if strippedResponseHeaders[key] || strippedFilteredResponseHeaders[key] {
 			continue
 		}
 		for _, v := range vals {

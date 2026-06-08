@@ -8,7 +8,7 @@ import (
 
 // TestR39_OwnerContentResourceInSync couples the RESPONSE-side owner-content map (gqlfilter.ownerContentResource,
 // round-39: nulls a navigated org/enterprise content field when its resource is denied) to the REQUEST-side
-// classifier maps, so the two sides cannot drift. (1) Every gqlfilter content field must map to the SAME
+// classifier maps, so the two sides cannot diverge. (1) Every gqlfilter content field must map to the SAME
 // resource in gqlOrgFieldToResource or gqlEnterpriseFieldToResource. (2) Every classifier CONTENT field (not a
 // member/team key, not a member-mechanism field) must be present response-side — otherwise a carve-out is
 // enforced at the request gate but bypassed on a navigation path the request scope cannot reach.
@@ -30,7 +30,7 @@ func TestR39_OwnerContentResourceInSync(t *testing.T) {
 			continue
 		}
 		if gqlOrgFieldToResource[field] != res && gqlEnterpriseFieldToResource[field] != res {
-			t.Errorf("gqlfilter.ownerContentResource[%q]=%q but classifier maps it to org=%q/ent=%q — request/response drift",
+			t.Errorf("gqlfilter.ownerContentResource[%q]=%q but classifier maps it to org=%q/ent=%q — request/response mismatch",
 				field, res, gqlOrgFieldToResource[field], gqlEnterpriseFieldToResource[field])
 		}
 	}

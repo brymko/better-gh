@@ -56,8 +56,8 @@ var r38EntAdminExceptions = map[string]bool{}
 // (round-37 org projects/sponsors → round-38 the rest + enterprise): every Organization/Enterprise field
 // whose element @docsCategory is unambiguously owner-ADMIN-private ("orgs" / "enterprise-admin") must be gated
 // on a per-resource key (so a [org.permissions] carve-out is honored over GraphQL) or be a justified
-// exception. A schema refresh adding a new admin field to either type fails the build instead of silently
-// degrading it to base org/enterprise read.
+// exception. Admin fields in the embedded schema must be covered instead of silently degrading to
+// base org/enterprise read.
 func TestR38_OwnerAdminContentCovered(t *testing.T) {
 	s, err := gqlfilter.Load()
 	if err != nil {

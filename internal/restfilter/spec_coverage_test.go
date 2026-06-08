@@ -159,8 +159,8 @@ func mapOf(v any) map[string]any { m, _ := v.(map[string]any); return m }
 
 // TestSpecCoverage_NestedBareNameRepos derives from the embedded spec every GET whose response nests a
 // `repositories` array of BARE-`name` repo objects (no full_name/url/id — the shape the generator and the
-// Pass body-scan can't locate) and asserts each is in nestedBareNameRepoOps, so a spec refresh adding
-// another such op (the round-33 Copilot-metrics class) fails the build instead of silently leaking a denied
+// Pass body-scan can't locate) and asserts each is in nestedBareNameRepoOps, so every such op in the embedded spec is covered
+// instead of silently leaking a denied
 // repo's name (RepoReach's bare-name blind spot — these ops are otherwise skipped by NoPathScopedLeak).
 func TestSpecCoverage_NestedBareNameRepos(t *testing.T) {
 	raw, err := os.ReadFile("testdata/api.github.com.json")
@@ -257,8 +257,7 @@ func TestSpecCoverage_NestedBareNameRepos(t *testing.T) {
 // existence/id/name leaks unless the op fails closed. It derives from the embedded spec every GET op that
 // (a) declares a `repository_id` property, (b) is NOT repo-detectable (specderive RepoReach.Any()==false, so
 // it is a Pass op), and (c) is NOT path-scoped (no {owner}/{repo} the repo scope already gates), and asserts
-// each is registered in opaqueRepoIDOps (→ fail closed when not path-scoped). A spec refresh that adds such
-// an op fails the build. (Ops whose repo id hides under an opaque additionalProperties metadata object carry
+// each is registered in opaqueRepoIDOps (→ fail closed when not path-scoped). (Ops whose repo id hides under an opaque additionalProperties metadata object carry
 // no declared `repository_id` and are invisible here — those are hand-audited; see opaque_repo.go.)
 func TestSpecCoverage_OpaqueRepoIDOps(t *testing.T) {
 	raw, err := os.ReadFile("testdata/api.github.com.json")
@@ -415,8 +414,7 @@ func TestSpecCoverage_OpaqueRepoIDOps(t *testing.T) {
 // response is an additionalProperties MAP keyed by repository name leaks a denied repo via its KEY (the
 // ContainsDeniedRepo body-scan reads only values). It enumerates every GET whose response is type:object
 // with a value-typed additionalProperties and asserts each is either registered in repoKeyedMapOps (→ the
-// proxy key-scans + drops denied keys) or in the exempt set (keys are NOT repo names). A spec refresh that
-// adds a repo-keyed map fails the build.
+// proxy key-scans + drops denied keys) or in the exempt set (keys are NOT repo names).
 func TestSpecCoverage_RepoKeyedMapOps(t *testing.T) {
 	raw, err := os.ReadFile("testdata/api.github.com.json")
 	if err != nil {
@@ -624,8 +622,8 @@ func loadSpec(t *testing.T) *specderive.Spec {
 	return s
 }
 
-// TestSpecCoverage_TableIsCurrent proves the committed openapi_table.go is EXACTLY what regenerating from
-// the embedded spec produces — so it is neither stale nor hand-edited. Combined with the classification
+// TestSpecCoverage_TableIsCurrent proves the committed openapi_table.go is EXACTLY what the
+// embedded spec derivation produces — so it is not hand-edited. Combined with the classification
 // invariants (TestCoverage_*), the whole chain is spec-grounded: table = derive(committed spec), and the
 // hand tables cover the table.
 func TestSpecCoverage_TableIsCurrent(t *testing.T) {
@@ -633,19 +631,19 @@ func TestSpecCoverage_TableIsCurrent(t *testing.T) {
 	if !reflect.DeepEqual(repoOps, repoEnumOps) {
 		for k, v := range repoOps {
 			if !reflect.DeepEqual(repoEnumOps[k], v) {
-				t.Errorf("repoEnumOps[%q] stale/hand-edited: committed=%v derived=%v", k, repoEnumOps[k], v)
+				t.Errorf("repoEnumOps[%q] hand-edited: committed=%v derived=%v", k, repoEnumOps[k], v)
 			}
 		}
 		for k := range repoEnumOps {
 			if _, ok := repoOps[k]; !ok {
-				t.Errorf("repoEnumOps[%q] not derivable from the embedded spec (stale)", k)
+				t.Errorf("repoEnumOps[%q] not derivable from the embedded spec", k)
 			}
 		}
 	}
 	wantKnown := append([]string(nil), knownGetOps...)
 	sort.Strings(wantKnown)
 	if !reflect.DeepEqual(known, wantKnown) {
-		t.Errorf("knownGetOps differs from the embedded spec derivation (regenerate openapi_table.go)")
+		t.Errorf("knownGetOps differs from the embedded spec derivation")
 	}
 }
 
@@ -669,9 +667,7 @@ func concretePath(tmpl string) string {
 }
 
 // pathScopedSafeExceptions are ops the over-approximate scan flags but which cannot disclose a denied
-// repo a client could not otherwise obtain — kept EXPLICIT, one per op with a specific justification, so
-// a future spec change that adds a GENUINELY-foreign op is NOT silently allowlisted (it would be unlisted
-// → flagged → re-triaged). Each was reviewed against the rule: a leak requires surfacing a denied repo's
+// repo a client could not otherwise obtain — kept EXPLICIT, one per op with a specific justification. Each was reviewed against the rule: a leak requires surfacing a denied repo's
 // identity/content the client could not reach through an allowed path.
 var pathScopedSafeExceptions = map[string]string{
 	// the shared authentication-token schema carries repositories[], but GitHub populates it only for

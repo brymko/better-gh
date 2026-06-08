@@ -18,7 +18,7 @@ func TestSec_R18_NonNodeRepoOwnedCovered(t *testing.T) {
 	}
 	for typ, wantRes := range cases {
 		if s.isRepoScoped(typ) {
-			continue // if a future schema gives it a path, it is covered the other way
+			continue // already covered by a direct repo path
 		}
 		if !s.repoOwnedNoPath[typ] {
 			t.Errorf("%s must be in repoOwnedNoPath so augment marks it (per-resource bypass otherwise)", typ)

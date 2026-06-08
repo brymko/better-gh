@@ -14,9 +14,9 @@ import (
 // by the marker/resolve machinery (repoScoped) — using signals INDEPENDENT of deriveRepoPaths'
 // own mechanism, so a derivation gap is caught here instead of by the next auditor.
 //
-// When GitHub adds a repo-bearing type and schema.graphql is refreshed, this test goes red until
-// the type is either covered by deriveRepoPaths or added (with a documented reason) to one of the
-// exception sets below. That converts a silent fail-open into a loud, must-resolve build failure.
+// Every repo-bearing type in the embedded schema must either be covered by deriveRepoPaths or added
+// with a documented reason to one of the exception sets below. That converts a silent fail-open into
+// a loud, must-resolve build failure.
 func TestSchemaCoverageInvariant(t *testing.T) {
 	s, err := Load()
 	if err != nil {
@@ -90,8 +90,8 @@ func implementsInterface(def *ast.Definition, iface string) bool {
 // a concrete OBJECT type whose @docsCategory is an unambiguously repo-owned category (issues/pulls/
 // commits/contents/checks/…) that is NEITHER repoScoped NOR repoOwnedNoPath would receive no marker
 // in augment() and leak under a per-resource `none` (e.g. Submodule under contents="none"). Every
-// such type MUST be covered by one of the two marker mechanisms. A schema refresh that introduces an
-// uncovered repo-owned type fails the build here instead of silently fail-opening.
+// such type in the embedded schema MUST be covered by one of the two marker mechanisms instead of
+// silently fail-opening.
 func TestR18_RepoOwnedCategoryCoverageInvariant(t *testing.T) {
 	s, err := Load()
 	if err != nil {

@@ -1,5 +1,4 @@
 // Code generated from GitHub's OpenAPI description by internal/restfilter/gen. DO NOT EDIT.
-// Regenerate: go run ./internal/restfilter/gen --spec api.github.com.json --out internal/restfilter/openapi_table.go
 
 package restfilter
 

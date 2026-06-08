@@ -9,13 +9,13 @@ import (
 // TestQueryRootCoverage is the GraphQL analogue of restfilter's knownGetOps fail-closed guard: it
 // enumerates EVERY field of the embedded schema's Query root and asserts each is accounted for — either
 // the classifier emits a real scope for it (classifierScopedRoots) or it is a documented public / global /
-// token-gated / filter-covered root (publicSafeRoots). A future schema snapshot that adds a new Query root
-// returning OWNER-PRIVATE non-repo data (the enterprise/gist class — data the repo-centric response filter
-// never redacts) lands in NEITHER set and fails this test, forcing a triage decision instead of silently
-// leaking under Defaults.Mode=allow (round-21 enterprise; round-22 enterprise*Invitation).
+// token-gated / filter-covered root (publicSafeRoots). Every Query root in the embedded schema returning OWNER-PRIVATE non-repo data (the enterprise/gist
+// class — data the repo-centric response filter never redacts) must land in the classifier-scoped set
+// or fail this test instead of silently leaking under Defaults.Mode=allow (round-21 enterprise;
+// round-22 enterprise*Invitation).
 //
 // The two sets mirror internal/classifier collectGraphQLScopes; this duplication is the point — the guard
-// exists to force a human to classify each new root, not to re-derive the classifier.
+// exists to force a human to classify each root, not to re-derive the classifier.
 func TestQueryRootCoverage(t *testing.T) {
 	sch, err := Load()
 	if err != nil {

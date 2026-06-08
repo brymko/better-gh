@@ -141,12 +141,11 @@ func TestR40_AbstractCommonFieldContentMarked(t *testing.T) {
 	}
 }
 
-// TestR40_AbstractContentMarkerCoverage is the build-time anti-drift guard for the round-39-mechanism gap:
-// it DERIVES every (interface/union → owner-private CONTENT common field) pair from the live schema —
+// TestR40_AbstractContentMarkerCoverage is the build-time coverage guard for the round-39-mechanism gap:
+// it DERIVES every (interface/union → owner-private CONTENT common field) pair from the embedded schema —
 // exactly the paths where an Organization/Enterprise is reached without an inline fragment — and asserts
-// ownerMarkerFragment injects a content marker for each. A schema refresh adding a new interface-common
-// content field (or a new ownerContentResource entry) that ownerMarkerFragment forgets to mark fails the
-// build, instead of silently reintroducing the navigation-path content leak.
+// ownerMarkerFragment injects a content marker for each. Interface-common content fields and ownerContentResource entries must be marked by ownerMarkerFragment
+// instead of silently reintroducing the navigation-path content leak.
 func TestR40_AbstractContentMarkerCoverage(t *testing.T) {
 	s, _ := Load()
 	for name, def := range s.schema.Types {

@@ -41,12 +41,9 @@ func TestR31_ViewerPrivateGated(t *testing.T) {
 // ownerPrivateDocsCategories are the @docsCategory names whose User-reachable element types carry
 // owner-PRIVATE data (the custodian's gists, sponsors, orgs, enterprise admin, projects, migrations).
 // The coverage guard derives the owner-private element set from this category set rather than a
-// hand-listed type allowlist, so a schema refresh adding ANY new private element type (e.g. a new
-// gists-category connection like gistComments, round-32) is caught without editing a type list.
-// TestR31_ViewerPrivateFieldCoverage is the derived drift guard: every User field whose return element
-// carries an owner-private @docsCategory must be in viewerPrivateFieldCategory, so a schema refresh adding
-// a new private viewer collection fails the build (round-31; round-32 re-based on @docsCategory after the
-// hand-listed type set missed GistComment).
+// hand-listed type allowlist, so private element types in the embedded schema are caught without editing a type list.
+// TestR31_ViewerPrivateFieldCoverage is the derived coverage guard: every User field whose return element
+// carries an owner-private @docsCategory must be in viewerPrivateFieldCategory, so private viewer collections in the embedded schema must be covered (round-31; round-32 re-based on @docsCategory after the hand-listed type set missed GistComment).
 func TestR31_ViewerPrivateFieldCoverage(t *testing.T) {
 	s, err := gqlfilter.Load()
 	if err != nil {

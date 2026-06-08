@@ -35,8 +35,8 @@ func nestsRepoInElement(locs []string) bool {
 // round-21 content-feed leak class: a NeedsFilter enum op whose element NESTS a repository must be
 // explicitly classified as either a CONTENT feed (contentEnumResourceOps — gets a content per-resource
 // key) or a reviewed METADATA feed (metadataNestedRepoEnumOps). It re-derives the nests-a-repo set from
-// the GENERATED repoEnumOps, so a spec refresh that adds a new content feed (e.g. the round-21 events
-// family) FAILS THE BUILD until it is classified — instead of silently defaulting to a metadata-only
+// the GENERATED repoEnumOps, so content feeds in the embedded spec FAIL THE BUILD until classified
+// instead of silently defaulting to a metadata-only
 // keep-gate and leaking issue/PR content under a per-resource carve-out. This replaces per-round hand-
 // chasing of content-feed siblings with a build-time invariant on the restfilter side (the GraphQL side
 // already has its coverage invariants).

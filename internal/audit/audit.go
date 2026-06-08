@@ -28,10 +28,11 @@ type Entry struct {
 type Logger struct {
 	ch      chan Entry
 	dropped atomic.Int64
+	done    chan struct{}
 }
 
 func NewLogger(path string) *Logger {
-	l := &Logger{ch: make(chan Entry, 1024)}
+	l := &Logger{ch: make(chan Entry, 1024), done: make(chan struct{})}
 	go l.writer(path)
 	return l
 }
@@ -49,7 +50,13 @@ func (l *Logger) Dropped() int64 {
 	return l.dropped.Load()
 }
 
+func (l *Logger) Close() {
+	close(l.ch)
+	<-l.done
+}
+
 func (l *Logger) writer(path string) {
+	defer close(l.done)
 	var lastReportedDropped int64
 	for e := range l.ch {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)

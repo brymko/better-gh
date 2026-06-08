@@ -250,7 +250,7 @@ func TestSec_OversizeBodyRejected(t *testing.T) {
 	}
 }
 
-// When the response filter is configured but cannot type a read (schema drift), a read
+// When the response filter is configured but cannot type a read, a read
 // that enumerates beyond explicit repository() scopes (here viewer{...}) must fail closed
 // rather than be forwarded unfiltered. A read that types fine is still allowed + filtered.
 func TestSec_UntypeableEnumerationReadFailsClosed(t *testing.T) {
@@ -276,10 +276,10 @@ func TestSec_UntypeableEnumerationReadFailsClosed(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	// Drift: a viewer field not in the embedded schema → augmentation fails → no filter.
+	// Untypeable viewer field → augmentation fails → no filter.
 	// Policy allows user=read, so only the filter-availability guard can deny it.
-	drift := `{"query":"query{viewer{login someBrandNewField2030{x}}}"}`
-	resp, err := http.Post(srv.URL+"/graphql", "application/json", strings.NewReader(drift))
+	untypeable := `{"query":"query{viewer{login unknownField2030{x}}}"}`
+	resp, err := http.Post(srv.URL+"/graphql", "application/json", strings.NewReader(untypeable))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +537,7 @@ func TestSec_MutationReturnNavigationRedacted(t *testing.T) {
 }
 
 // Regression for FINDING C (HIGH) fail-closed path: when no response filter is wired
-// (schema disabled/drift), a mutation whose payload navigates cross-repo must be denied
+// (schema disabled), a mutation whose payload navigates cross-repo must be denied
 // rather than forwarded unfiltered.
 func TestSec_E2E_MutationNavigationFailsClosedWithoutFilter(t *testing.T) {
 	env := setup(t) // harness Handler has GQLFilter == nil

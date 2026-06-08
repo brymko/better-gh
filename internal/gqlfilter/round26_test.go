@@ -53,35 +53,41 @@ func TestR26_AliasedMemberFieldRedacted(t *testing.T) {
 }
 
 // TestR26_BaseDeniedOwnerCoarseRedact pins HIGH-3/H-4: an owner the client has NO access to (base denied,
-// e.g. repository().owner with a repo-only grant) is reduced to public identity — billing/IP-allow-list/
-// domains/etc. are nulled even though they are not in any member-field list (drift-proof).
+// e.g. repository().owner with a repo-only grant) exposes no client-selected fields. Response keys are
+// alias-controlled, so even public-looking keys like login/name/slug are nulled.
 func TestR26_BaseDeniedOwnerCoarseRedact(t *testing.T) {
 	out := r26Redact(t, `{"bghOrgLoginZ9":"noorg","login":"noorg","name":"No Org",`+
 		`"organizationBillingEmail":"bill@secret","ipAllowListEntries":{"nodes":[{"allowListValue":"10.0.0.0/8"}]},`+
 		`"domains":{"nodes":[{"domain":"secret.corp"}]}}`)
 	s := mustJSON(out)
-	for _, leak := range []string{"bill@secret", "10.0.0.0/8", "secret.corp"} {
+	for _, leak := range []string{"noorg", "No Org", "bill@secret", "10.0.0.0/8", "secret.corp"} {
 		if strings.Contains(s, leak) {
 			t.Fatalf("base-denied owner leaked %q: %s", leak, s)
 		}
 	}
-	if !strings.Contains(s, "noorg") {
-		t.Fatalf("public identity (login) wrongly redacted: %s", s)
+}
+
+func TestR26_BaseDeniedOwnerAliasToPublicKeyRedacted(t *testing.T) {
+	out := r26Redact(t, `{"bghOrgLoginZ9":"noorg","login":"bill@secret","url":"10.0.0.0/8","id":"secret-id"}`)
+	s := mustJSON(out)
+	for _, leak := range []string{"bill@secret", "10.0.0.0/8", "secret-id"} {
+		if strings.Contains(s, leak) {
+			t.Fatalf("base-denied owner private field aliased to public key leaked %q: %s", leak, s)
+		}
 	}
 }
 
 // TestR26_EnterprisePerResourceAndBase pins HIGH-1: an Enterprise base=read+members=none nulls its members
-// but keeps billingEmail; a base=none enterprise is reduced to its slug.
+// but keeps billingEmail; a base=none enterprise exposes no selected fields.
 func TestR26_EnterprisePerResourceAndBase(t *testing.T) {
-	// base=none enterprise → everything but slug nulled
+	// base=none enterprise → every selected field nulled
 	out := r26Redact(t, `{"bghOrgLoginZ9":"ent-none","slug":"ent-none","billingEmail":"ent-bill",`+
 		`"bghOrgMemZ9_members":"Enterprise","members":{"nodes":[{"login":"ent-member"}]}}`)
 	s := mustJSON(out)
-	if strings.Contains(s, "ent-bill") || strings.Contains(s, "ent-member") {
-		t.Fatalf("base-denied enterprise leaked admin/member data: %s", s)
-	}
-	if !strings.Contains(s, "ent-none") {
-		t.Fatalf("enterprise slug wrongly redacted: %s", s)
+	for _, leak := range []string{"ent-none", "ent-bill", "ent-member"} {
+		if strings.Contains(s, leak) {
+			t.Fatalf("base-denied enterprise leaked %q: %s", leak, s)
+		}
 	}
 }
 
@@ -122,8 +128,7 @@ func TestR26_TeamMembersAttributedToOrg(t *testing.T) {
 // it DERIVES the member-identity fields from the schema — fields returning a connection whose element
 // exposes a `login` (a roster of members/orgs) — rather than a hand-list (which in round-26 missed
 // EnterpriseTeam.enterpriseTeamMembers), and asserts each is in that type's MARKED set so augment tags it
-// and RedactDeniedOwnerPrivate nulls it under members="none". A schema refresh that adds a new
-// member-roster field to one of these types fails the build instead of silently leaking by navigation.
+// and RedactDeniedOwnerPrivate nulls it under members="none". Member-roster fields in the embedded schema must be covered instead of silently leaking by navigation.
 func TestOwnerPrivateCoverage(t *testing.T) {
 	s, _ := Load()
 	unwrap := func(tp *ast.Type) string {
