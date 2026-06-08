@@ -56,9 +56,10 @@ The token is stored in plaintext (`github-token`, mode `0600`), same as the env/
 
 ## Why PATs are cringe
 
-GitHub's fine-grained PAT model is a bad fit for this project:
+GitHub's PAT model is a bad fit for this project:
 
-- A fine-grained PAT is limited to resources owned by a **single** user or organization, and GitHub explicitly calls out [using one fine-grained PAT across multiple organizations](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) as a limitation. If your real access spans org A and org B, one PAT does not solve it.
+- A **classic** PAT cannot do “read-only private repos.” For private repos the classic scope is [`repo`](https://docs.github.com/en/developers/apps/scopes-for-oauth-apps), which is broad read/write; [`public_repo`](https://docs.github.com/en/developers/apps/scopes-for-oauth-apps) is only for public repos. So classic tokens force more authority than this project wants to hand the proxy.
+- A **fine-grained** PAT is limited to resources owned by a **single** user or organization, and GitHub explicitly calls out [using one fine-grained PAT across multiple organizations](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens) as a limitation. If your real access spans org A and org B, one PAT does not solve it.
 - Org approval and review are also per-organization, so cross-org use turns into token sprawl and approval churn instead of one coherent boundary.
 - Even when a PAT works, it still does **not** express this project's actual policy model: per-client, per-repo, per-org, per-resource read/write rules. You still need a separate policy boundary in front of it.
 - So the project model is: hold one broad custodian on the proxy host, then enforce the real boundary in the proxy. A pre-seeded token is only a bootstrap escape hatch, not the design center.
