@@ -37,6 +37,7 @@ type DefaultMode int
 
 const (
 	ModeDeny DefaultMode = iota
+	ModeRead
 	ModeAllow
 )
 
@@ -44,6 +45,8 @@ func (m *DefaultMode) UnmarshalText(text []byte) error {
 	switch string(text) {
 	case "deny":
 		*m = ModeDeny
+	case "read":
+		*m = ModeRead
 	case "allow":
 		*m = ModeAllow
 	default:
@@ -60,6 +63,8 @@ func (m DefaultMode) MarshalText() ([]byte, error) {
 	switch m {
 	case ModeAllow:
 		return []byte("allow"), nil
+	case ModeRead:
+		return []byte("read"), nil
 	default:
 		return []byte("deny"), nil
 	}
@@ -227,6 +232,11 @@ func (p *Policy) Evaluate(repo, org string, access classifier.AccessLevel, resou
 	switch p.Defaults.Mode {
 	case ModeAllow:
 		return Result{Allowed: true}
+	case ModeRead:
+		if access == classifier.Read {
+			return Result{Allowed: true}
+		}
+		return Result{Reason: "default policy is read"}
 	default:
 		return Result{Reason: "default policy is deny"}
 	}
@@ -297,7 +307,7 @@ func (p *Policy) AllowsAnyWrite() bool {
 // AllowsAnyWrite, the proxy uses it to skip node resolution for tokens that can never
 // read at all (avoiding upstream calls that could only be denied).
 func (p *Policy) AllowsAnyRead() bool {
-	if p.Defaults.Mode == ModeAllow {
+	if p.Defaults.Mode == ModeAllow || p.Defaults.Mode == ModeRead {
 		return true
 	}
 	for _, a := range p.Defaults.Unscoped {
@@ -362,7 +372,7 @@ func (p *Policy) CanReadAnything(repo, org string) bool {
 			}
 		}
 	}
-	return p.Defaults.Mode == ModeAllow
+	return p.Defaults.Mode == ModeAllow || p.Defaults.Mode == ModeRead
 }
 
 // lookupResource resolves a per-resource permission, matching the key case-INSENSITIVELY. Repo

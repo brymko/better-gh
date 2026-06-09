@@ -88,6 +88,30 @@ func TestAllowDefaultPermitsUnscopedRead(t *testing.T) {
 	}
 }
 
+func TestReadDefaultPermitsUnknownRead(t *testing.T) {
+	p := &Policy{Defaults: Defaults{Mode: ModeRead}}
+	r := p.Evaluate("any/repo", "", classifier.Read, "", "")
+	if !r.Allowed {
+		t.Fatalf("read default should allow unmatched read: %s", r.Reason)
+	}
+}
+
+func TestReadDefaultDeniesUnknownWrite(t *testing.T) {
+	p := &Policy{Defaults: Defaults{Mode: ModeRead}}
+	r := p.Evaluate("any/repo", "", classifier.Write, "", "")
+	if r.Allowed {
+		t.Fatal("read default should deny unmatched write")
+	}
+}
+
+func TestReadDefaultPermitsUnscopedRead(t *testing.T) {
+	p := &Policy{Defaults: Defaults{Mode: ModeRead}}
+	r := p.Evaluate("", "", classifier.Read, "", "")
+	if !r.Allowed {
+		t.Fatalf("read default should allow unmatched unscoped read: %s", r.Reason)
+	}
+}
+
 func TestNoRepoNoOrgUsesDefault(t *testing.T) {
 	r := testPolicy().Evaluate("", "", classifier.Read, "", "")
 	if r.Allowed {

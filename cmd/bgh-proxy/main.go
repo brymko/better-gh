@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -269,6 +270,9 @@ func cmdServe(configPath string) error {
 	ownerStore, err := owner.Open(filepath.Join(config.DefaultDir(), "owner.json"), cfg.GithubToken)
 	if err != nil {
 		return fmt.Errorf("opening owner store: %w", err)
+	}
+	if err := validatePublicGHEConfig(cfg); err != nil {
+		return err
 	}
 	if !ownerStore.Claimed() && cfg.GithubToken == "" {
 		slog.Warn("no custodian yet — sign in via the web UI or `gh auth login` to provision the proxy")
@@ -875,4 +879,51 @@ func isLoopback(addr string) bool {
 		return ip.IsLoopback()
 	}
 	return host == "localhost"
+}
+
+func validatePublicGHEConfig(cfg *config.Config) error {
+	if cfg.Mode != "ghe" && cfg.Mode != "both" {
+		return nil
+	}
+	publicLoginSurface := !isLoopback(cfg.Bind) || strings.TrimSpace(cfg.ExternalURL) != ""
+	if !publicLoginSurface {
+		return nil
+	}
+	if ext := strings.TrimSpace(cfg.ExternalURL); ext != "" {
+		u, err := url.Parse(ext)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("invalid external_url %q: public GHE deployments require an https URL with a host", cfg.ExternalURL)
+		}
+		if !validPublicHostname(u.Hostname()) {
+			return fmt.Errorf("invalid external_url %q: host %q is not a valid public TLS hostname", cfg.ExternalURL, u.Hostname())
+		}
+	}
+	return nil
+}
+
+func validPublicHostname(host string) bool {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if host == "" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return true
+	}
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }

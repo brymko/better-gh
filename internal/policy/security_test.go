@@ -92,6 +92,7 @@ func TestSec_UnknownWriteUsesBaseWithoutPermissions(t *testing.T) {
 func TestSec_AllowsAnyWrite(t *testing.T) {
 	cannotWrite := []*Policy{
 		{Defaults: Defaults{Mode: ModeDeny}},
+		{Defaults: Defaults{Mode: ModeRead}},
 		{Defaults: Defaults{Mode: ModeDeny}, Org: []OrgRule{{Name: "o", Access: AccessRead}}},
 		{Defaults: Defaults{Mode: ModeDeny}, Repo: []RepoRule{{Name: "o/r", Access: AccessRead, Permissions: map[string]Access{"pulls": AccessRead}}}},
 		{Defaults: Defaults{Mode: ModeDeny, Unscoped: map[string]Access{"user": AccessRead}}},
@@ -111,6 +112,20 @@ func TestSec_AllowsAnyWrite(t *testing.T) {
 	for i, p := range canWrite {
 		if !p.AllowsAnyWrite() {
 			t.Errorf("policy %d should allow some write", i)
+		}
+	}
+}
+
+func TestSec_AllowsAnyRead(t *testing.T) {
+	canRead := []*Policy{
+		{Defaults: Defaults{Mode: ModeAllow}},
+		{Defaults: Defaults{Mode: ModeRead}},
+		{Defaults: Defaults{Mode: ModeDeny}, Org: []OrgRule{{Name: "o", Access: AccessRead}}},
+		{Defaults: Defaults{Mode: ModeDeny, Unscoped: map[string]Access{"user": AccessRead}}},
+	}
+	for i, p := range canRead {
+		if !p.AllowsAnyRead() {
+			t.Errorf("policy %d should allow some read", i)
 		}
 	}
 }

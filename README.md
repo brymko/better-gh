@@ -105,7 +105,7 @@ Listens on HTTPS. Each client gets a **proxy token** with its own scoped policy.
   ```
   `gh` opens the proxy's authorize page; you sign in with GitHub and pick a policy, and the scoped token is handed straight to `gh`. Every `gh` command from then on is policy-checked and audited.
 
-> The first GitHub sign-in claims the deployment and **captures that account's GitHub token as the proxy's custodian** — no `BGH_GITHUB_TOKEN` needed (it's an optional fallback). Sign in immediately after starting, before exposing the proxy, so you claim it first. The **browser** (and `gh`) must trust the proxy's cert — front it with a real cert (Tailscale Serve or Caddy + Let's Encrypt; see [docs/deployment.md](docs/deployment.md)) so remote clients need zero trust setup.
+> The first GitHub sign-in claims the deployment and **captures that account's GitHub token as the proxy's custodian** — no `BGH_GITHUB_TOKEN` needed (it's an optional fallback). Sign in immediately after starting, before exposing the proxy, so you claim it first. The **browser** (and `gh`) must trust the proxy's cert — front it with a real cert (Tailscale Serve or Caddy + Let's Encrypt; see [docs/deployment.md](docs/deployment.md)) so remote clients need zero trust setup. Use the **final production hostname** from the start. If you put a deeper hostname behind Cloudflare, prefer **DNS only** unless you have explicitly provisioned Cloudflare edge-cert coverage for that exact name.
 
 **Or pre-mint a token and paste it** (good for CI bots / headless, or when you don't want the browser step):
 
@@ -131,7 +131,7 @@ Policy files use TOML. In socket mode, the policy is loaded from `~/.config/bgh/
 
 ```toml
 [defaults]
-mode = "deny"                    # "deny" or "allow"
+mode = "deny"                    # "deny", "read", or "allow"
 
 [defaults.unscoped]
 user = "read"                    # allow /user, viewer{} reads
@@ -367,6 +367,15 @@ Note: `/users/{user}` endpoints use the username as the org for policy matching.
 
 These requests have no identifiable repo or org. Under `mode = "deny"`, they are **denied by default** unless `[defaults.unscoped]` grants access for their category.
 
+`mode = "read"` is the middle ground:
+
+- unmatched **repo/org-scoped reads** are allowed
+- unmatched **repo/org-scoped writes** are denied
+- **unscoped writes** are still denied
+- **unscoped reads** still work best when you list the categories you actually want under `[defaults.unscoped]`
+
+So if you want "let me read everything under these owners, but only write where I say so", prefer `mode = "read"` plus a few `[[org]]`/`[[repo]]` overrides over `mode = "allow"`.
+
 This matters because `gh` needs several of these endpoints to function — `gh auth status` calls `/user`, `gh repo list` (without an owner) calls `/user/repos`, and many commands start with a `{ viewer { login } }` GraphQL query.
 
 > In **GHE mode** the proxy answers `GET /user` itself with a synthetic identity (`{"login":"bgh-proxy","id":0}`) so `gh auth login`/`status` can complete before any policy applies — this short-circuits the `user` category for that one GET (it returns fake, not custodian, data; any other `/user/*` path and all of socket mode are classified normally). The empty-path `GET /` GHE handshake is likewise answered synthetically (an empty JSON object `{}` plus a *fixed* placeholder `X-OAuth-Scopes: repo, read:org` header — a hardcoded constant, **not** the custodian's real scopes) and bypasses the `meta` category. Setting `user = "none"` therefore does **not** block GHE `GET /user` (nor does `meta = "none"` block `GET /`); `user = "none"` blocks `viewer{}`, `/user/repos`, `/user/orgs`, etc.
@@ -506,7 +515,7 @@ admin_bind = "127.0.0.1:7844"     # Admin UI (plain HTTP, loopback)
 socket = "~/.config/bgh/proxy.sock"
 mode = "socket"                   # "socket", "ghe", or "both"
 # github_token = "..."          # optional fallback custodian; the first sign-in captures one
-# external_url = "https://proxy.example.com"  # public URL when behind a TLS-terminating front (Tailscale/Caddy) — used in the device-flow verification URL
+# external_url = "https://proxy.example.com"  # final public URL clients type; if a deeper hostname sits behind Cloudflare, prefer DNS only unless edge-cert coverage for that exact name is configured
 # oauth_client_id = "..."         # OAuth app for sign-in / `bgh-proxy login` (default: gh's public app, no registration); for `bgh-proxy login` the BGH_OAUTH_CLIENT_ID env var / --client-id flag override this
 # oauth_scopes = "repo read:org gist workflow"  # scopes captured as the custodian on sign-in
 # tls_dir = "~/.config/bgh"       # directory holding the self-signed CA + server cert/key

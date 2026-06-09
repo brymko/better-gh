@@ -92,13 +92,20 @@
         <label>Token name (optional)</label>
         <input id="tokName" placeholder="e.g. laptop, ci-bot">
 
+        <label>Default mode</label>
+        <select id="defaultMode">
+          <option value="deny">deny</option>
+          <option value="read">read</option>
+          <option value="allow">allow</option>
+        </select>
+
         <div class="tabs">
           <button id="tabBuilder" class="on" type="button">Builder</button>
           <button id="tabToml" type="button">TOML</button>
         </div>
 
         <div class="panel on" id="panelBuilder">
-          <p class="hint">Default <b>deny</b>; <code>user</code>/<code>meta</code> always granted so <code>gh</code> works. <code>gh repo list</code> needs an <b>org</b> entry (your account counts).</p>
+          <p class="hint"><code>deny</code> = explicit allowlist; <code>read</code> = unmatched repo/org reads allowed but writes denied; <code>allow</code> = unmatched repo/org reads and writes allowed. <code>user</code>/<code>meta</code> are always granted so <code>gh</code> works. <code>gh repo list</code> needs an <b>org</b> entry (your account counts).</p>
           <label>Repositories</label>
           <div id="repos"></div>
           <button class="secondary" id="addRepo" type="button" style="margin-top:8px">+ add repo</button>
@@ -264,7 +271,7 @@ function collect(sel){ return [...document.querySelectorAll(sel+" .row")].map(r=
 function currentBuilderPolicy(){
   const unscoped = { user:"read", meta:"read" };
   if($("allowSearch").checked) unscoped.search = "read";
-  return { defaults:{ mode:"deny", unscoped }, org:collect("#orgs"), repo:collect("#repos") };
+  return { defaults:{ mode:$("defaultMode").value || "deny", unscoped }, org:collect("#orgs"), repo:collect("#repos") };
 }
 function applyPolicyToBuilder(p){
   p = p || {};
@@ -273,11 +280,12 @@ function applyPolicyToBuilder(p){
   (p.org||[]).forEach(o=>addOrgRow(o.name, o.access));
   if(!document.querySelector("#repos .row")) addRepoRow();
   if(!document.querySelector("#orgs .row")) addOrgRow();
+  $("defaultMode").value = (p.defaults && p.defaults.mode) || "deny";
   $("allowSearch").checked = !!(p.defaults && p.defaults.unscoped && p.defaults.unscoped.search);
 }
 function builderToToml(){
   const p = currentBuilderPolicy();
-  let s = '[defaults]\nmode = "deny"\n';
+  let s = `[defaults]\nmode = "${p.defaults.mode || "deny"}"\n`;
   const u = p.defaults.unscoped || {}; const keys = Object.keys(u).filter(k=>u[k] && u[k] !== "none");
   if(keys.length){ s += "\n[defaults.unscoped]\n"; keys.forEach(k=> s += `${k} = "${u[k]}"\n`); }
   p.org.forEach(o=> s += `\n[[org]]\nname = "${o.name}"\naccess = "${o.access}"\n`);
@@ -322,6 +330,7 @@ function resetCreate(){
   $("cancelEdit").style.display = "none";
   $("tokName").value = "";
   $("repos").innerHTML=""; $("orgs").innerHTML=""; $("tomlSpec").value=""; $("allowSearch").checked=false;
+  $("defaultMode").value = "deny";
   addRepoRow(); addOrgRow(); setTab("builder");
 }
 $("cancelEdit").onclick = resetCreate;

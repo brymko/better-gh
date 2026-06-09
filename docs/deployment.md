@@ -60,13 +60,13 @@ public address from the request — set it to exactly what clients type after `-
 ```bash
 # 1. set external_url to this node's MagicDNS name, e.g.:
 #    external_url = "https://vps.tailnet.ts.net"
-# 2. start the proxy (loopback). No token needed — the first GitHub sign-in below
-#    captures the custodian and claims the deployment (TOFU). (Pre-seed BGH_GITHUB_TOKEN
-#    only if the proxy must forward before anyone signs in.)
+# 2. bootstrap the custodian on the server FIRST. This avoids exposing the unclaimed
+#    /login and /ui flows at all, and current builds refuse to start a public/fronted
+#    GHE deployment without either an existing owner claim or a fallback custodian.
+#    This writes ~/.config/bgh/github-token for the bgh service user:
+su -s /bin/sh bgh -c 'HOME=/var/lib/bgh bgh-proxy login'
+# 3. start the proxy on loopback:
 bgh-proxy serve
-# 3. CLAIM IT FIRST (ownership is trust-on-first-use — the first sign-in wins). Before exposing
-#    it to the tailnet, sign in yourself over loopback (https://127.0.0.1:7843/ui) or pre-seed
-#    BGH_GITHUB_TOKEN, so another tailnet member can't claim the deployment first.
 # 4. front it with a real cert (helper: scripts/serve-behind-tailscale.sh):
 tailscale serve --bg https+insecure://127.0.0.1:7843
 #    serves https://vps.tailnet.ts.net/  → proxies to the loopback proxy
@@ -131,6 +131,9 @@ cannot mint a token). Two consequences for a public deployment:
 
 ### Prerequisites
 - A domain, e.g. `proxy.example.com`, with an A/AAAA record → the VPS.
+- Use the **final production hostname from the start**. Do **not** bootstrap public TLS on a temporary hostname and then swap names later; `external_url`, the device-flow verification URL, the public cert, and the hostname clients type should all match the final name the whole time.
+- The public hostname must be a **valid certificate hostname**: letters, digits, hyphens, and dots only. Public cert SAN `dNSName` entries use hostname syntax, not arbitrary DNS-label syntax, so underscores are rejected even though some DNS owner names (for example `_acme-challenge`) legitimately use them.
+- If the hostname is **proxied through Cloudflare**, remember that Cloudflare Universal SSL in a normal full-zone setup only covers the apex and first-level subdomains (for example `example.com` and `*.example.com`). A deeper name like `foo.bar.example.com` needs **Cloudflare Total TLS / Advanced Certificate Manager / a custom uploaded edge cert**. The simplest/recommended path for this deployment is to set the record to **DNS only** so clients hit the origin cert directly; only keep orange-cloud enabled if you have intentionally provisioned edge-cert coverage for that exact hostname.
 - TCP **80** and **443** open (80 for the ACME challenge, 443 for serving).
 
 ### Caddyfile (see `scripts/Caddyfile.example`)
@@ -151,16 +154,17 @@ bgh-proxy serve                      # loopback proxy (127.0.0.1:7843) — NOT y
 ```
 
 > [!IMPORTANT]
-> **Claim the deployment before you expose it.** Ownership is trust-on-first-use: the *first*
-> GitHub sign-in becomes the permanent owner. The moment Caddy is up, `/login/*` and `/ui` are
-> reachable by the whole internet, so a stranger who signs in first **takes over the deployment**.
-> Claim it yourself over loopback first (sign in at `https://127.0.0.1:7843/ui` on the proxy host,
-> accepting the self-signed cert — or, if you truly need headless bootstrap, pre-seed `BGH_GITHUB_TOKEN`), confirm `owner.json` exists,
-> and only then start Caddy:
-
-```bash
-caddy run --config Caddyfile.example # now safe to expose; auto-provisions the Let's Encrypt cert
-```
+> **Bring up TLS on the final hostname first.** The public login surface (`/login/*`, `/ui`) should
+> only ever be exposed behind the final HTTPS name clients will use. Current builds validate that
+> `external_url` is an `https://` URL and that its hostname is certificate-safe (letters, digits,
+> hyphens, dots). They do **not** run a background login flow for you. Start the TLS front on the
+> final hostname, then log in through the web UI when you are ready.
+>
+> Typical flow:
+> ```bash
+> caddy run --config Caddyfile.example
+> # then open https://proxy.example.com/ui and sign in with GitHub
+> ```
 
 ### Client — zero trust setup
 Open `https://proxy.example.com/ui` for the owner console (sign in with GitHub → create / list / revoke tokens), or:
