@@ -7,6 +7,7 @@ Transparent GitHub API proxy with per-repo/per-org access control and audit logg
 
 ```
 gh cli  ──unix socket──▶  bgh-proxy  ──HTTPS──▶  api.github.com
+npm     ──HTTPS─────────▶      │      ──HTTPS──▶  npm.pkg.github.com
                               │
                               ├─ classify request (repo, read/write)
                               ├─ evaluate policy (allow/deny)
@@ -122,6 +123,29 @@ gh auth login --hostname proxy.example.com --with-token <<< "bgh_xxxxxxxxxxxx"
 gh pr list -R my-org/my-repo
 gh issue list -R my-org/my-repo
 ```
+
+## npm package registry
+
+The proxy also fronts GitHub's npm registry (`npm.pkg.github.com`) on the **same host** — no separate listener or token. GitHub Packages npm is scoped-only (`@owner/name`), and its request paths (`/@owner/...`, `/-/...`, `/download/...`) never overlap the GitHub API path space, so the proxy routes them to the npm upstream by path and authorizes them with the scope owner's `packages` permission. The custodian's same GitHub token is used upstream (sent as `Bearer`).
+
+Point npm at the proxy per scope:
+
+```ini
+# .npmrc
+@my-org:registry=https://proxy.example.com
+//proxy.example.com/:_authToken=bgh_xxxxxxxxxxxx
+```
+
+Authorize it with an `[[org]]` `packages` permission (the owner is the npm scope — an org *or* user login):
+
+```toml
+[[org]]
+name = "my-org"
+[org.permissions]
+packages = "read"          # `npm install`; use "read-write" to allow `npm publish`
+```
+
+A `GET` (install / metadata) needs `packages = "read"`; a publish (`PUT`) needs `"read-write"`. The packument response is filtered like everything else: tarball URLs are rewritten so downloads come back through the proxy (and are policy-checked), and the package's backing-repository cross-reference is **scrubbed when the token can't read that repo** — same repo-level filtering as the API paths. npm paths that name no scope (`/-/whoami`, `/-/ping`) fail closed, so the custodian's identity isn't echoed. Override the upstream with `npm_upstream` in config if needed (default `https://npm.pkg.github.com`).
 
 ## Policy specification
 
@@ -519,6 +543,7 @@ mode = "socket"                   # "socket", "ghe", or "both"
 # oauth_client_id = "..."         # OAuth app for sign-in / `bgh-proxy login` (default: gh's public app, no registration); for `bgh-proxy login` the BGH_OAUTH_CLIENT_ID env var / --client-id flag override this
 # oauth_scopes = "repo read:org gist workflow"  # scopes captured as the custodian on sign-in
 # tls_dir = "~/.config/bgh"       # directory holding the self-signed CA + server cert/key
+# npm_upstream = "https://npm.pkg.github.com"  # npm package-registry upstream (override only; npm proxying is always on)
 audit_log = "~/.config/bgh/audit.jsonl"
 policy_file = "~/.config/bgh/policy.toml"
 ```

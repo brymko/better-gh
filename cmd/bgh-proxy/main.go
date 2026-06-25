@@ -354,6 +354,7 @@ func cmdServe(configPath string) error {
 			SocketPolicy: socketPolicy,
 			NodeCache:    nodeCache,
 			GQLFilter:    gqlSchema,
+			NpmUpstream:  cfg.NpmUpstream,
 		}
 
 		os.Remove(cfg.Socket)
@@ -387,13 +388,14 @@ func cmdServe(configPath string) error {
 
 	if cfg.Mode == "ghe" || cfg.Mode == "both" {
 		gheHandler := &proxy.Handler{
-			Custodian: ownerStore.Token,
-			Store:     tokenStore,
-			Audit:     auditLogger,
-			Client:    httpClient,
-			Mode:      proxy.GHEMode,
-			NodeCache: nodeCache,
-			GQLFilter: gqlSchema,
+			Custodian:   ownerStore.Token,
+			Store:       tokenStore,
+			Audit:       auditLogger,
+			Client:      httpClient,
+			Mode:        proxy.GHEMode,
+			NodeCache:   nodeCache,
+			GQLFilter:   gqlSchema,
+			NpmUpstream: cfg.NpmUpstream,
 		}
 
 		// /login/* serves the OAuth identity-provider flow so a client can run the normal

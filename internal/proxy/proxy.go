@@ -17,6 +17,7 @@ import (
 	"better-gh/internal/classifier"
 	"better-gh/internal/gqlfilter"
 	"better-gh/internal/nodecache"
+	"better-gh/internal/npm"
 	"better-gh/internal/policy"
 	"better-gh/internal/restfilter"
 	"better-gh/internal/store"
@@ -47,6 +48,7 @@ type Handler struct {
 	NodeCache    *nodecache.Cache
 	GQLFilter    *gqlfilter.Schema // schema-aware GraphQL response filter (read isolation)
 	UpstreamURL  string            // default "" → "https://api.github.com"
+	NpmUpstream  string            // npm registry upstream; default "" → npm.DefaultUpstream
 }
 
 // custodianToken is the GitHub token the proxy forwards with: the dynamic Custodian (the
@@ -180,6 +182,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Mode:             h.Mode.String(),
 		})
 		jsonError(w, http.StatusForbidden, "bgh: denied — no token provided")
+		return
+	}
+
+	// npm registry requests (npm.pkg.github.com) are routed to a SEPARATE upstream and use a
+	// SCOPE-owner `packages` authorization — none of the GitHub-API classification / node
+	// resolution / REST+GraphQL response filtering below applies, so branch off here. The
+	// discriminator is npm-only (an @scope segment, /-/, /download/), so it never captures a
+	// GitHub-API request.
+	if npm.IsRegistryPath(norm) {
+		h.serveNpm(w, r, start, norm, body, pol, proxyToken)
 		return
 	}
 
@@ -563,7 +575,71 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		go h.Store.TouchLastUsed(proxyToken.ID)
 	}
 
-	h.forward(w, r, start, norm, body, pol, proxyToken, &classified, respFilter, passScan)
+	h.forward(w, r, start, norm, body, pol, proxyToken, &classified, respFilter, passScan, h.apiRoute())
+}
+
+// serveNpm handles a request to GitHub's npm package registry. The scope owner (user or org) is
+// authorized as an org `packages` grant — `GET` reads, anything else writes — and the request is
+// forwarded to the npm upstream under Bearer auth. The packument (JSON metadata) response is
+// scrubbed: tarball URLs are rewritten back through the proxy so downloads are policy-checked,
+// and the backing-repo cross-reference is nulled when the policy denies reading that repo. A
+// tarball or publish-ack body has no repo cross-ref and streams untouched. A path that names no
+// package scope fails closed.
+func (h *Handler) serveNpm(w http.ResponseWriter, r *http.Request, start time.Time, norm string, body []byte, pol *policy.Policy, tok *store.ProxyToken) {
+	access := classifier.Read
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		access = classifier.Write
+	}
+
+	owner, ok := npm.Owner(norm)
+	if !ok {
+		h.auditNpmDenied(r, start, "", access, "npm path names no package scope", tok)
+		jsonError(w, http.StatusForbidden, "bgh: denied")
+		return
+	}
+
+	classified := classifier.Result{Org: owner, Resource: "packages", Access: access}
+	if res := evaluateScopes(pol, &classified); !res.Allowed {
+		h.auditNpmDenied(r, start, owner, access, res.Reason, tok)
+		jsonError(w, http.StatusForbidden, "bgh: "+res.Reason)
+		return
+	}
+
+	var respFilter func([]byte) ([]byte, bool)
+	if r.Method == http.MethodGet && npm.IsPackument(norm) {
+		host := r.Host
+		canRead := func(repo string) bool {
+			ownerOf := repo
+			if i := strings.IndexByte(repo, '/'); i > 0 {
+				ownerOf = repo[:i]
+			}
+			return pol.Evaluate(repo, ownerOf, classifier.Read, "metadata", "").Allowed
+		}
+		respFilter = func(resp []byte) ([]byte, bool) {
+			return npm.ScrubPackument(resp, host, canRead, restfilter.RepoFromWebURL)
+		}
+	}
+
+	h.forward(w, r, start, norm, body, pol, tok, &classified, respFilter, nil, h.npmRoute())
+}
+
+func (h *Handler) auditNpmDenied(r *http.Request, start time.Time, owner string, access classifier.AccessLevel, reason string, tok *store.ProxyToken) {
+	tokenName := ""
+	if tok != nil {
+		tokenName = tok.Name
+	}
+	h.Audit.Log(audit.Entry{
+		Timestamp:    time.Now(),
+		Method:       r.Method,
+		Path:         r.URL.Path,
+		Org:          owner,
+		Resource:     "packages",
+		Access:       access.String(),
+		PolicyResult: "denied: " + reason,
+		DurationMs:   time.Since(start).Milliseconds(),
+		Mode:         h.Mode.String(),
+		TokenName:    tokenName,
+	})
 }
 
 func (h *Handler) augmentGraphQL(body []byte) ([]byte, bool) {
@@ -1104,6 +1180,29 @@ func (h *Handler) upstreamBase() string {
 	return "https://api.github.com"
 }
 
+func (h *Handler) npmUpstreamBase() string {
+	if h.NpmUpstream != "" {
+		return h.NpmUpstream
+	}
+	return npm.DefaultUpstream
+}
+
+// upstreamRoute is where a request is forwarded: which upstream base URL and which Authorization
+// scheme the custodian token is presented under. The GitHub API takes `token <tok>`; npm's
+// registry takes `Bearer <tok>`.
+type upstreamRoute struct {
+	base       string
+	authScheme string // includes the trailing space, e.g. "token " or "Bearer "
+}
+
+func (h *Handler) apiRoute() upstreamRoute {
+	return upstreamRoute{base: h.upstreamBase(), authScheme: "token "}
+}
+
+func (h *Handler) npmRoute() upstreamRoute {
+	return upstreamRoute{base: h.npmUpstreamBase(), authScheme: "Bearer "}
+}
+
 type policyContextKey struct{}
 
 // EnforceRedirectPolicy is the upstream client's CheckRedirect. GitHub 301-redirects
@@ -1150,8 +1249,8 @@ func EnforceRedirectPolicy(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, pol *policy.Policy, tok *store.ProxyToken, classified *classifier.Result, respFilter func([]byte) ([]byte, bool), passScan func(string) bool) {
-	base := h.upstreamBase()
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Time, normPath string, body []byte, pol *policy.Policy, tok *store.ProxyToken, classified *classifier.Result, respFilter func([]byte) ([]byte, bool), passScan func(string) bool, route upstreamRoute) {
+	base := route.base
 	// Forward the path with the SAME percent-encoding the client sent (EscapedPath), not the
 	// decoded normPath. Reassembling the decoded path into a URL string lets an encoded '?'
 	// or '#' inside a segment re-split the URL: `/repos/o/r%3Fx/pulls` decodes to
@@ -1197,7 +1296,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, start time.Tim
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set("Authorization", "token "+h.custodianToken())
+	req.Header.Set("Authorization", route.authScheme+h.custodianToken())
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	if req.Header.Get("Accept") == "" {
 		req.Header.Set("Accept", "application/vnd.github+json")

@@ -20,6 +20,10 @@ type Config struct {
 	PolicyFile    string `toml:"policy_file"`
 	TLSDir        string `toml:"tls_dir"`
 	Mode          string `toml:"mode"`
+	// NpmUpstream overrides the npm package-registry upstream (npm.pkg.github.com). Requests for
+	// the npm registry (scoped `@owner/...`, `/-/`, `/download/...`) are proxied unconditionally;
+	// this only changes WHERE they go. Empty → the default GitHub npm registry.
+	NpmUpstream string `toml:"npm_upstream"`
 	// ExternalURL is the public base URL clients reach the GHE listener at (e.g.
 	// "https://vps.tailnet.ts.net"). Set it when fronting the proxy with a TLS terminator
 	// (tailscale serve, Caddy) so the `gh auth login` device-flow verification URL points at

@@ -12,7 +12,7 @@ The `gh` CLI's token model is coarse: `gh auth login` mints a token with `repo` 
 
 ## Architecture
 
-The proxy impersonates the GitHub API. Clients (`gh`, `curl`, libraries) connect to it as if it were GitHub Enterprise. The proxy classifies the request, evaluates policy, swaps in the real token, forwards to `api.github.com`, and streams the response back.
+The proxy impersonates the GitHub API. Clients (`gh`, `curl`, libraries) connect to it as if it were GitHub Enterprise. The proxy classifies the request, evaluates policy, swaps in the real token, forwards to `api.github.com`, and streams the response back. The **same host** additionally fronts GitHub's npm registry (`npm.pkg.github.com`): npm's scoped-only paths (`/@owner/...`, `/-/...`, `/download/...`) don't overlap the API path space, so they are routed to the npm upstream by path, authorized by the scope owner's `packages` permission, and the packument response is filtered (tarball-URL rewrite + backing-repo cross-ref redaction). Same custodian token, sent upstream as `Bearer` (`internal/npm`).
 
 ```
 ┌────────────┐  /api/v3/repos/o/r/pulls   ┌─────────── bgh-proxy ───────────┐   real token   ┌────────────┐
